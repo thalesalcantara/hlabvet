@@ -1,0 +1,53 @@
+<!doctype html>
+<html lang="pt-BR">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <meta name="theme-color" content="#64236f" />
+  <title>HLab Vet Resultados</title>
+  <link rel="icon" href="/assets/hlabvet-logo.png" />
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <div id="toast" class="toast"></div>
+  <div id="modal" class="modal-backdrop hidden"><div class="modal-card"><button class="modal-close" data-close-modal aria-label="Fechar">×</button><div id="modalContent"></div></div></div>
+
+  <main id="loginView" class="auth-shell hidden">
+    <section class="auth-card">
+      <div class="brand-lockup"><img src="/assets/hlabvet-logo.png" alt="HLabVet" /><div><h1>HLab Vet Resultados</h1><p>Exames, coletas, temperatura e resultados em um só lugar.</p></div></div>
+      <form id="loginForm" class="stack">
+        <label>Nome de usuário<input name="username" autocomplete="username" required placeholder="Ex.: João" /></label>
+        <label>Senha<input name="password" type="password" autocomplete="current-password" required /></label>
+        <button class="btn primary" type="submit">Entrar</button>
+      </form>
+      <details class="setup-details">
+        <summary>Configuração inicial do sistema</summary>
+        <form id="setupForm" class="stack compact">
+          <label>Chave SETUP_KEY<input name="setupKey" type="password" required /></label>
+          <label>Usuário administrador<input name="username" required /></label>
+          <label>Senha do administrador<input name="password" type="password" minlength="8" required /></label>
+          <button class="btn secondary" type="submit">Criar primeiro administrador</button>
+          <small>Use apenas uma vez, logo após criar o banco D1.</small>
+        </form>
+      </details>
+      <footer>HLabVet Diagnósticos Veterinários • acesso protegido</footer>
+    </section>
+  </main>
+
+  <main id="courierView" class="hidden"></main>
+
+  <div id="appView" class="app-shell hidden">
+    <aside class="sidebar">
+      <div class="side-brand"><img src="/assets/hlabvet-logo.png" alt="HLabVet"><strong>Resultados</strong></div>
+      <nav id="nav"></nav>
+      <div class="side-user"><div id="sideUser"></div><button id="logoutBtn" class="btn ghost small">Sair</button></div>
+    </aside>
+    <section class="workspace">
+      <header class="topbar"><button id="menuBtn" class="icon-btn">☰</button><div><h2 id="pageTitle">Painel</h2><p id="pageSubtitle"></p></div><div id="topActions" class="top-actions"></div></header>
+      <div id="content" class="content"></div>
+    </section>
+  </div>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>

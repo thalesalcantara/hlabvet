@@ -1,0 +1,29 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "hlab-vet-resultados",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-01",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application"
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_name": "hlab-vet-resultados-db",
+      "database_id": "bca827de-4493-40ad-a162-8dcfc3f3a6aa",
+      "migrations_dir": "migrations"
+    }
+  ],
+  "r2_buckets": [
+    {
+      "binding": "FILES",
+      "bucket_name": "hlab-vet-resultados-files"
+    }
+  ],
+  "vars": {
+    "APP_NAME": "HLab Vet Resultados",
+    "SESSION_DAYS": "14"
+  }
+}

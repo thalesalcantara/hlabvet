@@ -1,0 +1,18 @@
+{
+  "name": "hlab-vet-resultados",
+  "version": "1.0.0",
+  "private": true,
+  "description": "HLab Vet Resultados — gestão de requisições veterinárias, coletas, temperatura e resultados.",
+  "type": "module",
+  "scripts": {
+    "dev": "wrangler dev --local",
+    "deploy": "wrangler deploy",
+    "db:create": "wrangler d1 create hlab-vet-resultados-db",
+    "db:migrate:local": "wrangler d1 migrations apply hlab-vet-resultados-db --local",
+    "db:migrate:remote": "wrangler d1 migrations apply hlab-vet-resultados-db --remote",
+    "check": "node --check src/index.js && node --check src/auth.js && node --check src/utils.js && node --check public/app.js"
+  },
+  "devDependencies": {
+    "wrangler": "^4.34.0"
+  }
+}
