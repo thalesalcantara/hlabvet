@@ -46,34 +46,39 @@ async function api(request, env, url) {
   if (path === '/api/me' && method === 'GET') return me(env, user);
   if (path === '/api/change-password' && method === 'POST') return changePassword(request, env, user);
   if (path === '/api/dashboard' && method === 'GET') return dashboard(env, user);
+  if (path === '/api/alerts' && method === 'GET') return requireAdmin(user, () => pendingAlerts(env));
 
   if (path === '/api/clients' && method === 'GET') return requireAdmin(user, () => listClients(env, url));
-  if (path === '/api/clients' && method === 'POST') return requireAdmin(user, () => createClient(request, env, user));
+  if (path === '/api/clients' && method === 'POST') return requireAdminOnly(user, () => createClient(request, env, user));
   let m = path.match(/^\/api\/clients\/(\d+)$/);
-  if (m && method === 'PATCH') return requireAdmin(user, () => updateClient(request, env, user, Number(m[1])));
-  if (m && method === 'DELETE') return requireAdmin(user, () => deleteClient(env, user, Number(m[1])));
+  if (m && method === 'PATCH') return requireAdminOnly(user, () => updateClient(request, env, user, Number(m[1])));
+  if (m && method === 'DELETE') return requireAdminOnly(user, () => deleteClient(env, user, Number(m[1])));
   m = path.match(/^\/api\/clients\/(\d+)\/reset-password$/);
-  if (m && method === 'POST') return requireAdmin(user, () => resetClientPassword(request, env, user, Number(m[1])));
+  if (m && method === 'POST') return requireAdminOnly(user, () => resetClientPassword(request, env, user, Number(m[1])));
 
   if (path === '/api/my-client-profile' && method === 'GET') return getMyClientProfile(env, user);
   if (path === '/api/my-client-profile' && method === 'PATCH') return updateMyClientProfile(request, env, user);
 
   if (path === '/api/couriers' && method === 'GET') return requireAdmin(user, () => listCouriers(env));
-  if (path === '/api/couriers' && method === 'POST') return requireAdmin(user, () => createCourier(request, env, user, url));
+  if (path === '/api/couriers' && method === 'POST') return requireAdminOnly(user, () => createCourier(request, env, user, url));
   m = path.match(/^\/api\/couriers\/(\d+)$/);
-  if (m && method === 'PATCH') return requireAdmin(user, () => updateCourier(request, env, user, Number(m[1])));
+  if (m && method === 'PATCH') return requireAdminOnly(user, () => updateCourier(request, env, user, Number(m[1])));
   m = path.match(/^\/api\/couriers\/(\d+)\/regenerate-link$/);
-  if (m && method === 'POST') return requireAdmin(user, () => regenerateCourierLink(env, user, Number(m[1]), url));
+  if (m && method === 'POST') return requireAdminOnly(user, () => regenerateCourierLink(env, user, Number(m[1]), url));
 
-  if (path === '/api/receivers' && method === 'GET') return requireAdmin(user, () => listReceivers(env));
-  if (path === '/api/receivers' && method === 'POST') return requireAdmin(user, () => createReceiver(request, env, user));
-  m = path.match(/^\/api\/receivers\/(\d+)$/);
-  if (m && method === 'PATCH') return requireAdmin(user, () => updateReceiver(request, env, user, Number(m[1])));
+  if ((path === '/api/technicians' || path === '/api/receivers') && method === 'GET') return requireAdmin(user, () => listReceivers(env));
+  if ((path === '/api/technicians' || path === '/api/receivers') && method === 'POST') return requireAdminOnly(user, () => createReceiver(request, env, user));
+  m = path.match(/^\/api\/(?:technicians|receivers)\/(\d+)$/);
+  if (m && method === 'PATCH') return requireAdminOnly(user, () => updateReceiver(request, env, user, Number(m[1])));
+  m = path.match(/^\/api\/technicians\/(\d+)\/reset-password$/);
+  if (m && method === 'POST') return requireAdminOnly(user, () => resetTechnicianPassword(request, env, user, Number(m[1])));
 
   if (path === '/api/requisitions' && method === 'GET') return listRequisitions(env, user, url);
   if (path === '/api/requisitions' && method === 'POST') return createRequisition(request, env, user);
   m = path.match(/^\/api\/requisitions\/(\d+)$/);
   if (m && method === 'GET') return getRequisition(env, user, Number(m[1]));
+  m = path.match(/^\/api\/requisitions\/(\d+)\/accept$/);
+  if (m && method === 'POST') return requireAdmin(user, () => acceptRequisition(env, user, Number(m[1])));
   m = path.match(/^\/api\/requisitions\/(\d+)\/assign$/);
   if (m && method === 'POST') return requireAdmin(user, () => assignCourier(request, env, user, Number(m[1])));
   m = path.match(/^\/api\/requisitions\/(\d+)\/receive$/);
@@ -87,17 +92,20 @@ async function api(request, env, url) {
   m = path.match(/^\/api\/requisitions\/(\d+)\/results$/);
   if (m && method === 'POST') return requireAdmin(user, () => uploadResult(request, env, user, Number(m[1])));
 
-  m = path.match(/^\/api\/results\/(\d+)\/download$/);
-  if (m && method === 'GET') return downloadResult(env, user, Number(m[1]));
+  m = path.match(/^\/api\/results\/(\d+)\/(download|view)$/);
+  if (m && method === 'GET') return downloadResult(env, user, Number(m[1]), m[2] === 'view');
 
-  if (path === '/api/temperature-sheet' && method === 'GET') return temperatureSheet(env, user, url);
-  if (path === '/api/audit' && method === 'GET') return requireAdmin(user, () => listAudit(env, url));
+  if (path === '/api/temperature-sheet' && method === 'GET') return requireAdmin(user, () => temperatureSheet(env, user, url));
+  if (path === '/api/audit' && method === 'GET') return requireAdminOnly(user, () => listAudit(env, url));
 
   return err('Rota não encontrada.', 404);
 }
 
 function requireAdmin(user, fn) {
   return ADMIN_ROLES.has(user.role) ? fn() : err('Acesso permitido somente ao HLab Vet.', 403);
+}
+function requireAdminOnly(user, fn) {
+  return user.role === 'admin' ? fn() : err('Acesso permitido somente ao administrador central do HLab Vet.', 403);
 }
 
 async function audit(env, user, action, entityType = null, entityId = null, details = null) {
@@ -128,12 +136,16 @@ async function logout(request, env, url) {
 
 async function me(env, user) {
   let profile = null;
+  let technician = null;
   if (user.role === 'client') {
     profile = await env.DB.prepare(`SELECT id,name,legal_name,document,phone,email,address,city,state,zip_code,stamp_name,stamp_line2,stamp_line3,stamp_line4,stamp_color FROM clients WHERE user_id=?`).bind(user.id).first();
+  } else if (user.role === 'staff') {
+    technician = await env.DB.prepare(`SELECT id,name,location,active FROM receivers WHERE user_id=?`).bind(user.id).first();
   }
   return ok({ user: {
     id: user.id, role: user.role, username: user.username_display,
-    forcePasswordChange: !!user.force_password_change, clientId: user.client_id || null, clientName: user.client_name || null
+    forcePasswordChange: !!user.force_password_change, clientId: user.client_id || null, clientName: user.client_name || null,
+    technicianId: technician?.id || null, technicianName: technician?.name || null, technicianLocation: technician?.location || null
   }, profile });
 }
 
@@ -151,17 +163,32 @@ async function changePassword(request, env, user) {
 }
 
 async function dashboard(env, user) {
-  const where = user.role === 'client' ? ' WHERE client_id=?' : '';
-  const bind = user.role === 'client' ? [user.client_id] : [];
-  const rows = await env.DB.prepare(`SELECT status,COUNT(*) n FROM requisitions${where} GROUP BY status`).bind(...bind).all();
+  const p=[];
+  let where=` WHERE date(datetime(r.created_at,'-3 hours'))=date('now','-3 hours')`;
+  if(user.role==='client'){where+=' AND r.client_id=?';p.push(user.client_id);}
+  const rows = await env.DB.prepare(`SELECT r.status,COUNT(*) n FROM requisitions r${where} GROUP BY r.status`).bind(...p).all();
   const totals = Object.fromEntries((rows.results || []).map(r => [r.status, r.n]));
   const recent = await env.DB.prepare(`
-    SELECT r.id,r.protocol,r.patient_name,r.tutor_name,r.status,r.created_at,c.name client_name
+    SELECT r.id,r.protocol,r.patient_name,r.tutor_name,r.status,r.created_at,r.request_kind,r.scheduled_at,r.accepted_at,
+           (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) result_count,
+           c.name client_name
     FROM requisitions r JOIN clients c ON c.id=r.client_id
-    ${user.role === 'client' ? 'WHERE r.client_id=?' : ''}
-    ORDER BY r.created_at DESC LIMIT 8
-  `).bind(...bind).all();
-  return ok({ totals, recent: recent.results || [] });
+    ${where}
+    ORDER BY COALESCE(r.scheduled_at,r.created_at) DESC LIMIT 20
+  `).bind(...p).all();
+  return ok({ totals, recent: recent.results || [], day: new Date(Date.now()-3*3600000).toISOString().slice(0,10) });
+}
+
+async function pendingAlerts(env){
+  const rows=await env.DB.prepare(`
+    SELECT r.id,r.protocol,r.patient_name,r.request_kind,r.scheduled_at,r.created_at,c.name client_name
+    FROM requisitions r JOIN clients c ON c.id=r.client_id
+    WHERE r.status='solicitado' AND r.accepted_at IS NULL
+      AND (r.request_kind<>'scheduled' OR r.scheduled_at IS NULL OR r.scheduled_at<=?)
+    ORDER BY COALESCE(r.scheduled_at,r.created_at),r.id
+    LIMIT 50
+  `).bind(nowIso()).all();
+  return ok({alerts:rows.results||[]});
 }
 
 async function listClients(env, url) {
@@ -187,8 +214,8 @@ async function createClient(request, env, admin) {
   const u = await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('client',?,?,?,?,1,1)`)
     .bind(username, key, hash, salt).run();
   const userId = u.meta.last_row_id;
-  const c = await env.DB.prepare(`INSERT INTO clients(user_id,name,legal_name,document,phone,email,address,city,state,zip_code,stamp_color) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-    .bind(userId,name,clampString(b.legalName,200),clampString(b.document,50),clampString(b.phone,40),clampString(b.email,200),clampString(b.address,300),clampString(b.city,120),clampString(b.state,30)||'RN',clampString(b.zipCode,20),clampString(b.stampColor,20)||'#5c2a72').run();
+  const c = await env.DB.prepare(`INSERT INTO clients(user_id,name,legal_name,document,phone,email,address,city,state,zip_code,stamp_name,stamp_line2,stamp_line3,stamp_line4,stamp_color) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(userId,name,clampString(b.legalName,200),clampString(b.document,50),clampString(b.phone,40),clampString(b.email,200),clampString(b.address,300),clampString(b.city,120),clampString(b.state,30)||'RN',clampString(b.zipCode,20),clampString(b.stampName,120),clampString(b.stampLine2,120),clampString(b.stampLine3,120),clampString(b.stampLine4,120),clampString(b.stampColor,20)||'#5c2a72').run();
   await audit(env, admin, 'criou_cliente', 'client', c.meta.last_row_id, { name, username });
   return ok({ id: c.meta.last_row_id, userId, message: 'Cliente cadastrado. No primeiro acesso ele deverá trocar a senha.' });
 }
@@ -204,8 +231,8 @@ async function updateClient(request, env, admin, id) {
   const active = b.active == null ? current.active : boolInt(b.active);
   await env.DB.batch([
     env.DB.prepare(`UPDATE users SET username_display=?,username_key=?,active=?,updated_at=? WHERE id=?`).bind(username,key,active,nowIso(),current.user_id),
-    env.DB.prepare(`UPDATE clients SET name=?,legal_name=?,document=?,phone=?,email=?,address=?,city=?,state=?,zip_code=?,active=?,updated_at=? WHERE id=?`)
-      .bind(clampString(b.name ?? current.name,200),clampString(b.legalName ?? current.legal_name,200),clampString(b.document ?? current.document,50),clampString(b.phone ?? current.phone,40),clampString(b.email ?? current.email,200),clampString(b.address ?? current.address,300),clampString(b.city ?? current.city,120),clampString(b.state ?? current.state,30),clampString(b.zipCode ?? current.zip_code,20),active,nowIso(),id)
+    env.DB.prepare(`UPDATE clients SET name=?,legal_name=?,document=?,phone=?,email=?,address=?,city=?,state=?,zip_code=?,stamp_name=?,stamp_line2=?,stamp_line3=?,stamp_line4=?,stamp_color=?,active=?,updated_at=? WHERE id=?`)
+      .bind(clampString(b.name ?? current.name,200),clampString(b.legalName ?? current.legal_name,200),clampString(b.document ?? current.document,50),clampString(b.phone ?? current.phone,40),clampString(b.email ?? current.email,200),clampString(b.address ?? current.address,300),clampString(b.city ?? current.city,120),clampString(b.state ?? current.state,30),clampString(b.zipCode ?? current.zip_code,20),clampString(b.stampName ?? current.stamp_name,120),clampString(b.stampLine2 ?? current.stamp_line2,120),clampString(b.stampLine3 ?? current.stamp_line3,120),clampString(b.stampLine4 ?? current.stamp_line4,120),clampString(b.stampColor ?? current.stamp_color,20)||'#5c2a72',active,nowIso(),id)
   ]);
   await audit(env,admin,'editou_cliente','client',id,{ username, active:!!active });
   return ok({ message:'Cliente atualizado.' });
@@ -251,22 +278,36 @@ async function updateMyClientProfile(request,env,user){
 }
 
 async function listCouriers(env){
-  const rows=await env.DB.prepare('SELECT id,name,phone,token_last4,active,created_at,updated_at FROM couriers ORDER BY active DESC,name COLLATE NOCASE').all();
+  const rows=await env.DB.prepare('SELECT id,name,phone,token_last4,thermometer_code,active,created_at,updated_at FROM couriers ORDER BY active DESC,name COLLATE NOCASE').all();
   return ok({couriers:rows.results||[]});
+}
+
+function normalizeThermometer(v){
+  const raw=String(v||'').trim().toUpperCase().replace(/\s+/g,'');
+  if(!raw)return '';
+  const m=raw.match(/^TER-?(\d{1,4})$/);
+  return m ? `TER-${String(Number(m[1])).padStart(3,'0')}` : raw;
 }
 
 async function createCourier(request,env,user,url){
   const b=await safeBody(request); const name=clampString(b?.name,160); if(!name) return err('Informe o nome do entregador.');
+  const thermometer=normalizeThermometer(b?.thermometerCode);
+  if(!/^TER-\d{3,4}$/.test(thermometer)) return err('Informe o termômetro no padrão TER-001.');
+  const used=await env.DB.prepare(`SELECT id,name FROM couriers WHERE active=1 AND thermometer_code=?`).bind(thermometer).first();
+  if(used)return err(`O ${thermometer} já está vinculado a ${used.name}. Desative ou altere o entregador anterior antes de reutilizar o termômetro.`,409);
   const token=randomToken(30), hash=await sha256(token);
-  const r=await env.DB.prepare('INSERT INTO couriers(name,phone,token_hash,token_last4,active) VALUES(?,?,?,?,1)').bind(name,clampString(b.phone,40),hash,token.slice(-4)).run();
-  await audit(env,user,'criou_entregador','courier',r.meta.last_row_id,{name});
-  return ok({id:r.meta.last_row_id,link:courierLink(url,token),message:'Entregador cadastrado. Copie e guarde o link privado.'});
+  const r=await env.DB.prepare('INSERT INTO couriers(name,phone,token_hash,token_last4,thermometer_code,active) VALUES(?,?,?,?,?,1)').bind(name,clampString(b.phone,40),hash,token.slice(-4),thermometer).run();
+  await audit(env,user,'criou_entregador','courier',r.meta.last_row_id,{name,thermometer});
+  return ok({id:r.meta.last_row_id,link:courierLink(url,token),message:`Entregador cadastrado com o termômetro ${thermometer}. Copie e guarde o link privado.`});
 }
 
 async function updateCourier(request,env,user,id){
   const b=await safeBody(request); const c=await env.DB.prepare('SELECT * FROM couriers WHERE id=?').bind(id).first(); if(!c)return err('Entregador não encontrado.',404);
-  await env.DB.prepare('UPDATE couriers SET name=?,phone=?,active=?,updated_at=? WHERE id=?').bind(clampString(b.name??c.name,160),clampString(b.phone??c.phone,40),b.active==null?c.active:boolInt(b.active),nowIso(),id).run();
-  await audit(env,user,'editou_entregador','courier',id); return ok({message:'Entregador atualizado.'});
+  const active=b.active==null?c.active:boolInt(b.active), thermometer=normalizeThermometer(b.thermometerCode??c.thermometer_code);
+  if(active && !/^TER-\d{3,4}$/.test(thermometer)) return err('Informe o termômetro no padrão TER-001.');
+  if(active){const used=await env.DB.prepare(`SELECT id,name FROM couriers WHERE active=1 AND thermometer_code=? AND id<>?`).bind(thermometer,id).first();if(used)return err(`O ${thermometer} já está vinculado a ${used.name}.`,409);}
+  await env.DB.prepare('UPDATE couriers SET name=?,phone=?,thermometer_code=?,active=?,updated_at=? WHERE id=?').bind(clampString(b.name??c.name,160),clampString(b.phone??c.phone,40),thermometer||null,active,nowIso(),id).run();
+  await audit(env,user,'editou_entregador','courier',id,{thermometer}); return ok({message:'Entregador atualizado. O histórico anterior permanece com o nome e termômetro gravados no momento da coleta.'});
 }
 
 async function regenerateCourierLink(env,user,id,url){
@@ -278,24 +319,55 @@ async function regenerateCourierLink(env,user,id,url){
 }
 function courierLink(url,token){return `${url.origin}/?entregador=${encodeURIComponent(token)}`;}
 
-async function listReceivers(env){ const rows=await env.DB.prepare('SELECT * FROM receivers ORDER BY active DESC,name COLLATE NOCASE').all(); return ok({receivers:rows.results||[]}); }
-async function createReceiver(request,env,user){const b=await safeBody(request);const name=clampString(b?.name,160);if(!name)return err('Informe o nome de quem recebe.');const r=await env.DB.prepare('INSERT INTO receivers(name,location,active) VALUES(?,?,1)').bind(name,clampString(b.location,200)).run();await audit(env,user,'criou_recebedor','receiver',r.meta.last_row_id,{name});return ok({id:r.meta.last_row_id,message:'Recebedor cadastrado.'});}
-async function updateReceiver(request,env,user,id){const b=await safeBody(request),r=await env.DB.prepare('SELECT * FROM receivers WHERE id=?').bind(id).first();if(!r)return err('Recebedor não encontrado.',404);await env.DB.prepare('UPDATE receivers SET name=?,location=?,active=?,updated_at=? WHERE id=?').bind(clampString(b.name??r.name,160),clampString(b.location??r.location,200),b.active==null?r.active:boolInt(b.active),nowIso(),id).run();await audit(env,user,'editou_recebedor','receiver',id);return ok({message:'Recebedor atualizado.'});}
+async function listReceivers(env){
+  const rows=await env.DB.prepare(`SELECT r.*,u.username_display,u.force_password_change,u.active user_active FROM receivers r LEFT JOIN users u ON u.id=r.user_id ORDER BY r.active DESC,r.name COLLATE NOCASE`).all();
+  return ok({receivers:rows.results||[]});
+}
+async function createReceiver(request,env,user){
+  const b=await safeBody(request),name=clampString(b?.name,160),username=clampString(b?.username,120),password=String(b?.password||'');
+  if(!name||!username||password.length<8)return err('Nome, usuário e senha inicial do técnico (mínimo 8 caracteres) são obrigatórios.');
+  const key=normalizeUsername(username);if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse usuário já existe.',409);
+  const {hash,salt}=await hashPassword(password);
+  const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('staff',?,?,?,?,1,1)`).bind(username,key,hash,salt).run();
+  const r=await env.DB.prepare('INSERT INTO receivers(user_id,name,location,active) VALUES(?,?,?,1)').bind(u.meta.last_row_id,name,clampString(b.location,200)||'HLab Vet').run();
+  await audit(env,user,'criou_tecnico','technician',r.meta.last_row_id,{name,username});return ok({id:r.meta.last_row_id,message:'Técnico cadastrado. No primeiro login ele deverá trocar a senha.'});
+}
+async function updateReceiver(request,env,user,id){
+  const b=await safeBody(request),r=await env.DB.prepare(`SELECT r.*,u.username_display FROM receivers r LEFT JOIN users u ON u.id=r.user_id WHERE r.id=?`).bind(id).first();if(!r)return err('Técnico não encontrado.',404);
+  let userId=r.user_id,username=clampString(b.username??r.username_display,120),active=b.active==null?r.active:boolInt(b.active);
+  if(!userId){
+    const password=String(b.password||'');if(!username||password.length<8)return err('Para ativar o login deste técnico, informe usuário e senha temporária com pelo menos 8 caracteres.');
+    const key=normalizeUsername(username);if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse usuário já existe.',409);
+    const {hash,salt}=await hashPassword(password);const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('staff',?,?,?,?,1,?)`).bind(username,key,hash,salt,active).run();userId=u.meta.last_row_id;
+  }else{
+    const key=normalizeUsername(username);const dup=await env.DB.prepare('SELECT id FROM users WHERE username_key=? AND id<>?').bind(key,userId).first();if(dup)return err('Esse usuário já está em uso.',409);
+    await env.DB.prepare('UPDATE users SET username_display=?,username_key=?,active=?,updated_at=? WHERE id=?').bind(username,key,active,nowIso(),userId).run();
+    if(!active)await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(userId).run();
+  }
+  await env.DB.prepare('UPDATE receivers SET user_id=?,name=?,location=?,active=?,updated_at=? WHERE id=?').bind(userId,clampString(b.name??r.name,160),clampString(b.location??r.location,200)||'HLab Vet',active,nowIso(),id).run();
+  await audit(env,user,'editou_tecnico','technician',id);return ok({message:'Técnico atualizado.'});
+}
+async function resetTechnicianPassword(request,env,user,id){
+  const b=await safeBody(request),pwd=String(b?.password||'');if(pwd.length<8)return err('A senha temporária deve ter pelo menos 8 caracteres.');
+  const r=await env.DB.prepare('SELECT user_id,name FROM receivers WHERE id=?').bind(id).first();if(!r||!r.user_id)return err('Técnico sem login cadastrado.',404);
+  await setPassword(env,r.user_id,pwd,true);await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(r.user_id).run();await audit(env,user,'redefiniu_senha_tecnico','technician',id,{name:r.name});return ok({message:'Senha temporária definida. O técnico deverá trocá-la no próximo login.'});
+}
 
 async function listRequisitions(env,user,url){
   const filters={q:url.searchParams.get('q'),status:url.searchParams.get('status'),from:url.searchParams.get('from'),to:url.searchParams.get('to'),patient:url.searchParams.get('patient'),tutor:url.searchParams.get('tutor'),birth:url.searchParams.get('birth'),breed:url.searchParams.get('breed'),clientId:url.searchParams.get('clientId')};
-  let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.breed,r.birth_date,r.tutor_name,r.created_at,r.collection_date,r.assigned_at,r.collected_at,r.collection_temperature,r.lab_received_at,r.lab_received_temperature,r.analysis_started_at,r.completed_at,c.name client_name,co.name courier_name FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE 1=1`;
+  let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.breed,r.birth_date,r.tutor_name,r.created_at,r.collection_date,r.assigned_at,r.collected_at,r.collection_temperature,r.lab_received_at,r.lab_received_temperature,r.analysis_started_at,r.completed_at,r.request_kind,r.scheduled_at,r.accepted_at,r.accepted_by_name,c.name client_name,co.name courier_name,(SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) result_count FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE 1=1`;
   const p=[];
   if(user.role==='client'){sql+=' AND r.client_id=?';p.push(user.client_id);} else if(filters.clientId){sql+=' AND r.client_id=?';p.push(Number(filters.clientId));}
   if(filters.status){sql+=' AND r.status=?';p.push(filters.status);}
-  if(filters.from){sql+=' AND date(r.created_at)>=date(?)';p.push(filters.from);}
-  if(filters.to){sql+=' AND date(r.created_at)<=date(?)';p.push(filters.to);}
+  if(filters.from){sql+=` AND date(datetime(r.created_at,'-3 hours'))>=date(?)`;p.push(filters.from);}
+  if(filters.to){sql+=` AND date(datetime(r.created_at,'-3 hours'))<=date(?)`;p.push(filters.to);}
+  if(!filters.from&&!filters.to){sql+=` AND date(datetime(r.created_at,'-3 hours'))=date('now','-3 hours')`;}
   if(filters.patient){sql+=' AND r.patient_name LIKE ?';p.push(`%${filters.patient}%`);}
   if(filters.tutor){sql+=' AND r.tutor_name LIKE ?';p.push(`%${filters.tutor}%`);}
   if(filters.birth){sql+=' AND r.birth_date=?';p.push(filters.birth);}
   if(filters.breed){sql+=' AND r.breed LIKE ?';p.push(`%${filters.breed}%`);}
   if(filters.q){sql+=` AND (r.protocol LIKE ? OR r.patient_name LIKE ? OR r.tutor_name LIKE ? OR r.breed LIKE ? OR r.species LIKE ? OR r.sex LIKE ? OR r.clinic_name LIKE ? OR r.veterinarian_name LIKE ? OR r.crmv LIKE ? OR r.age_text LIKE ? OR r.clinical_info LIKE ? OR r.material_other LIKE ? OR c.name LIKE ? OR EXISTS(SELECT 1 FROM requisition_exams e WHERE e.requisition_id=r.id AND e.exam_name LIKE ?) OR EXISTS(SELECT 1 FROM requisition_materials m WHERE m.requisition_id=r.id AND m.material_name LIKE ?))`;p.push(...Array(15).fill(`%${filters.q}%`));}
-  sql+=' ORDER BY r.created_at DESC LIMIT 500';
+  sql+=' ORDER BY COALESCE(r.scheduled_at,r.created_at) DESC LIMIT 500';
   const rows=await env.DB.prepare(sql).bind(...p).all(); return ok({requisitions:rows.results||[]});
 }
 
@@ -311,16 +383,23 @@ async function createRequisition(request,env,user){
   const selected=[]; for(const code of exams){const e=catalog.get(String(code));if(e)selected.push(e);} if(!selected.length)return err('Nenhum exame válido foi selecionado.');
   const materials=Array.isArray(b.materials)?b.materials.filter(x=>MATERIALS.includes(x)):[];
   const stamp={name:client.stamp_name,line2:client.stamp_line2,line3:client.stamp_line3,line4:client.stamp_line4,color:client.stamp_color};
+  const requestKind=b.requestKind==='scheduled'?'scheduled':'immediate';
+  let scheduledAt=null;
+  if(requestKind==='scheduled'){
+    const dt=new Date(String(b.scheduledAt||''));if(!Number.isFinite(dt.getTime()))return err('Informe a data e hora do agendamento.');
+    if(dt.getTime()<Date.now()-60000)return err('O agendamento deve ser para um horário futuro.');scheduledAt=dt.toISOString();
+  }
   const tempProto=`TEMP-${crypto.randomUUID()}`;
-  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,clinic_name,veterinarian_name,crmv,tutor_name,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .bind(tempProto,clientId,clampString(b.clinicName,200)||client.name,clampString(b.veterinarianName,160),clampString(b.crmv,80),clampString(b.tutorName,160),patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),clampString(b.birthDate,20),clampString(b.ageText,60),clampString(b.collectionDate,20),clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),JSON.stringify(stamp),clampString(b.observations,2000)).run();
+  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,clinic_name,veterinarian_name,crmv,tutor_name,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(tempProto,clientId,clampString(b.clinicName,200)||client.name,clampString(b.veterinarianName,160),clampString(b.crmv,80),clampString(b.tutorName,160),patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),clampString(b.birthDate,20),clampString(b.ageText,60),clampString(b.collectionDate,20),clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),JSON.stringify(stamp),clampString(b.observations,2000),requestKind,scheduledAt).run();
   const id=ins.meta.last_row_id, proto=protocolCode(id,new Date());
   const statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,id)];
   for(const e of selected) statements.push(env.DB.prepare('INSERT INTO requisition_exams(requisition_id,category,exam_code,exam_name) VALUES(?,?,?,?)').bind(id,e.category,e.code,e.name));
   for(const m of materials) statements.push(env.DB.prepare('INSERT INTO requisition_materials(requisition_id,material_code,material_name) VALUES(?,?,?)').bind(id,m.toLowerCase().replace(/\s+/g,'_'),m));
-  statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json) VALUES(?,'solicitado',?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({message:'Requisição enviada ao HLab Vet'})));
-  await env.DB.batch(statements); await audit(env,user,'criou_requisicao','requisition',id,{protocol:proto,patient});
-  return ok({id,protocol:proto,message:'Solicitação enviada ao HLab Vet.'});
+  const message=requestKind==='scheduled'?`Coleta agendada para ${scheduledAt}`:'Requisição enviada ao HLab Vet';
+  statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json) VALUES(?,'solicitado',?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({message,requestKind,scheduledAt})));
+  await env.DB.batch(statements); await audit(env,user,'criou_requisicao','requisition',id,{protocol:proto,patient,requestKind,scheduledAt});
+  return ok({id,protocol:proto,message:requestKind==='scheduled'?'Solicitação agendada e enviada ao HLab Vet.':'Solicitação enviada ao HLab Vet.'});
 }
 
 async function canSeeReq(env,user,id){
@@ -340,28 +419,43 @@ async function getRequisition(env,user,id){
   return ok({requisition:r,exams:ex.results||[],materials:(mat.results||[]).map(x=>x.material_name),events:(events.results||[]).map(e=>({...e,details:parseJson(e.details_json)})),files:files.results||[]});
 }
 
+async function acceptRequisition(env,user,id){
+  const r=await env.DB.prepare('SELECT id,status,accepted_at,request_kind,scheduled_at FROM requisitions WHERE id=?').bind(id).first();if(!r)return err('Requisição não encontrada.',404);
+  if(r.status!=='solicitado')return err('Essa solicitação já avançou no fluxo.');
+  if(r.accepted_at)return ok({message:'Solicitação já aceita.'});
+  if(r.request_kind==='scheduled'&&r.scheduled_at&&new Date(r.scheduled_at).getTime()>Date.now())return err('Essa solicitação está agendada para um horário futuro.');
+  const ts=nowIso();await env.DB.batch([
+    env.DB.prepare('UPDATE requisitions SET accepted_at=?,accepted_by_user_id=?,accepted_by_name=?,updated_at=? WHERE id=?').bind(ts,user.id,user.username_display,ts,id),
+    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'solicitado',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({message:'Solicitação aceita pelo laboratório'}),ts)
+  ]);await audit(env,user,'aceitou_solicitacao','requisition',id);return ok({message:'Solicitação aceita. O alerta sonoro foi encerrado.'});
+}
+
 async function assignCourier(request,env,user,id){
   const b=await safeBody(request); const courierId=Number(b?.courierId); if(!courierId)return err('Selecione o entregador.');
   const [r,c]=await Promise.all([env.DB.prepare('SELECT * FROM requisitions WHERE id=?').bind(id).first(),env.DB.prepare('SELECT * FROM couriers WHERE id=? AND active=1').bind(courierId).first()]);
   if(!r)return err('Requisição não encontrada.',404); if(!c)return err('Entregador não encontrado ou inativo.',404); if(['recebido','em_analise','concluido','cancelado'].includes(r.status))return err('Não é possível atribuir entregador nesse status.');
+  if(!r.accepted_at)return err('Aceite a solicitação antes de atribuir o entregador.');
   const ts=nowIso(); await env.DB.batch([
     env.DB.prepare(`UPDATE requisitions SET assigned_courier_id=?,assigned_at=?,status='atribuido',updated_at=? WHERE id=?`).bind(courierId,ts,ts,id),
-    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({courier:c.name}),ts)
+    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({courier:c.name,thermometer:c.thermometer_code}),ts)
   ]);
-  await audit(env,user,'atribuiu_entregador','requisition',id,{courierId,courier:c.name});return ok({message:`${c.name} atribuído à coleta.`});
+  await audit(env,user,'atribuiu_entregador','requisition',id,{courierId,courier:c.name,thermometer:c.thermometer_code});return ok({message:`${c.name} atribuído à coleta (${c.thermometer_code||'sem termômetro'}).`});
 }
 
 async function receiveAtLab(request,env,user,id){
-  const b=await safeBody(request),temp=parseNumber(b?.temperature),receiverId=Number(b?.receiverId);
-  if(temp==null)return err('Informe a temperatura de recebimento.'); if(!receiverId)return err('Selecione quem recebeu.');
-  const [r,rec]=await Promise.all([env.DB.prepare('SELECT * FROM requisitions WHERE id=?').bind(id).first(),env.DB.prepare('SELECT * FROM receivers WHERE id=? AND active=1').bind(receiverId).first()]);
-  if(!r)return err('Requisição não encontrada.',404); if(!rec)return err('Recebedor não encontrado.',404); if(r.status!=='coletado')return err('A requisição precisa estar marcada como coletada pelo entregador antes do recebimento.');
-  const ts=nowIso(),loc=clampString(b.location,200)||rec.location||'HLab Vet';
+  const b=await safeBody(request),temp=parseNumber(b?.temperature);
+  if(temp==null)return err('Informe a temperatura de recebimento.');
+  const r=await env.DB.prepare('SELECT * FROM requisitions WHERE id=?').bind(id).first();if(!r)return err('Requisição não encontrada.',404);if(r.status!=='coletado')return err('A requisição precisa estar marcada como coletada pelo entregador antes do recebimento.');
+  let rec=null;
+  if(user.role==='staff')rec=await env.DB.prepare('SELECT * FROM receivers WHERE user_id=? AND active=1').bind(user.id).first();
+  else if(Number(b?.technicianId))rec=await env.DB.prepare('SELECT * FROM receivers WHERE id=? AND active=1').bind(Number(b.technicianId)).first();
+  if(!rec)return err(user.role==='staff'?'Seu login não está vinculado a um técnico ativo.':'Selecione o técnico que está recebendo.');
+  const ts=nowIso(),loc=clampString(b.location,200)||rec.location||'HLab Vet',obs=clampString(b.observation,1000);
   await env.DB.batch([
-    env.DB.prepare(`UPDATE requisitions SET status='recebido',lab_received_at=?,lab_received_temperature=?,receiver_id=?,receiver_name=?,received_location=?,updated_at=? WHERE id=?`).bind(ts,temp,receiverId,rec.name,loc,ts,id),
-    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'recebido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({temperature:temp,receiver:rec.name,location:loc}),ts)
+    env.DB.prepare(`UPDATE requisitions SET status='recebido',lab_received_at=?,lab_received_temperature=?,receiver_id=?,receiver_name=?,received_location=?,receiving_observation=?,updated_at=? WHERE id=?`).bind(ts,temp,rec.id,rec.name,loc,obs,ts,id),
+    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'recebido',?,?,?,?)`).bind(id,user.id,rec.name,JSON.stringify({temperature:temp,receiver:rec.name,location:loc,observation:obs}),ts)
   ]);
-  await audit(env,user,'recebeu_amostra','requisition',id,{temperature:temp,receiver:rec.name,location:loc});return ok({message:'Recebimento registrado com data e hora automáticas.'});
+  await audit(env,user,'recebeu_amostra','requisition',id,{temperature:temp,receiver:rec.name,location:loc,observation:obs});return ok({message:`Recebimento registrado por ${rec.name} com data e hora automáticas.`});
 }
 
 async function markAnalysis(env,user,id){
@@ -381,36 +475,36 @@ async function uploadResult(request,env,user,id){
   await audit(env,user,'enviou_resultado','requisition',id,{file:safe,fileId:ins.meta.last_row_id});return ok({id:ins.meta.last_row_id,message:'Resultado enviado. O cliente já pode visualizar e baixar.'});
 }
 
-async function downloadResult(env,user,fileId){
+async function downloadResult(env,user,fileId,inline=false){
   const f=await env.DB.prepare(`SELECT f.*,r.client_id FROM result_files f JOIN requisitions r ON r.id=f.requisition_id WHERE f.id=?`).bind(fileId).first(); if(!f)return err('Arquivo não encontrado.',404);
   if(!ADMIN_ROLES.has(user.role)&&!(user.role==='client'&&f.client_id===user.client_id))return err('Sem acesso a esse arquivo.',403);
   const obj=await env.FILES.get(f.r2_key); if(!obj)return err('Arquivo não encontrado no armazenamento.',404);
-  const h=new Headers(); obj.writeHttpMetadata(h); h.set('content-disposition',`attachment; filename*=UTF-8''${encodeURIComponent(f.original_name)}`); h.set('cache-control','private, no-store'); return new Response(obj.body,{headers:h});
+  const h=new Headers(); obj.writeHttpMetadata(h); h.set('content-disposition',`${inline?'inline':'attachment'}; filename*=UTF-8''${encodeURIComponent(f.original_name)}`); h.set('cache-control','private, no-store'); return new Response(obj.body,{headers:h});
 }
 
 async function temperatureSheet(env,user,url){
-  const month=url.searchParams.get('month')||new Date().toISOString().slice(0,7); const clientId=user.role==='client'?user.client_id:Number(url.searchParams.get('clientId')||0); const courierId=Number(url.searchParams.get('courierId')||0);
-  let sql=`SELECT r.id,r.protocol,r.created_at,r.collection_date,r.collected_at,r.collection_temperature,r.sent_from_location,r.sent_by_name,r.lab_received_at,r.lab_received_temperature,r.received_location,r.receiver_name,r.observations,r.patient_name,c.name client_name,co.name courier_name FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE COALESCE(substr(r.collected_at,1,7),substr(r.created_at,1,7))=?`;
-  const p=[month]; if(clientId){sql+=' AND r.client_id=?';p.push(clientId);} if(courierId&&ADMIN_ROLES.has(user.role)){sql+=' AND r.assigned_courier_id=?';p.push(courierId);} sql+=' ORDER BY COALESCE(r.collected_at,r.created_at),r.id';
-  const rows=await env.DB.prepare(sql).bind(...p).all(); return ok({month,entries:rows.results||[]});
+  const month=url.searchParams.get('month')||new Date().toISOString().slice(0,7),courierId=Number(url.searchParams.get('courierId')||0);
+  let sql=`SELECT r.id,r.protocol,r.created_at,r.collected_at,r.collection_temperature,r.sent_from_location,r.sent_by_name,r.lab_received_at,r.lab_received_temperature,r.received_location,r.receiver_name,r.receiving_observation,r.patient_name,c.name client_name,COALESCE(r.transport_courier_name,co.name) courier_name,COALESCE(r.transport_thermometer_code,co.thermometer_code) thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE strftime('%Y-%m', datetime(r.collected_at,'-3 hours'))=?`;
+  const p=[month];if(courierId){sql+=' AND r.assigned_courier_id=?';p.push(courierId);}sql+=' ORDER BY COALESCE(r.transport_thermometer_code,co.thermometer_code),r.collected_at,r.id';
+  const rows=await env.DB.prepare(sql).bind(...p).all();return ok({month,entries:rows.results||[]});
 }
 
 async function listAudit(env,url){const limit=Math.min(500,Math.max(1,Number(url.searchParams.get('limit')||200)));const rows=await env.DB.prepare('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?').bind(limit).all();return ok({events:(rows.results||[]).map(x=>({...x,details:parseJson(x.details_json)}))});}
 
 async function courierApi(request,env,url,token,rest){
-  const hash=await sha256(token), courier=await env.DB.prepare('SELECT id,name,phone,active FROM couriers WHERE token_hash=?').bind(hash).first(); if(!courier||!courier.active)return err('Link de entregador inválido ou desativado.',403);
+  const hash=await sha256(token), courier=await env.DB.prepare('SELECT id,name,phone,thermometer_code,active FROM couriers WHERE token_hash=?').bind(hash).first(); if(!courier||!courier.active)return err('Link de entregador inválido ou desativado.',403);
   const method=request.method.toUpperCase();
   if((rest===''||rest==='tasks')&&method==='GET'){
     const from=url.searchParams.get('from'),to=url.searchParams.get('to'),tab=url.searchParams.get('tab')||'pending';
-    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,c.name client_name,c.address,c.city,c.state,c.phone FROM requisitions r JOIN clients c ON c.id=r.client_id WHERE r.assigned_courier_id=?`;
+    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,c.name client_name,c.address,c.city,c.state,c.phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
     const p=[courier.id]; if(tab==='collected')sql+=` AND r.status IN ('coletado','recebido','em_analise','concluido')`; else sql+=` AND r.status='atribuido'`; if(from){sql+=' AND date(COALESCE(r.collected_at,r.assigned_at,r.created_at))>=date(?)';p.push(from);} if(to){sql+=' AND date(COALESCE(r.collected_at,r.assigned_at,r.created_at))<=date(?)';p.push(to);} sql+=' ORDER BY COALESCE(r.assigned_at,r.created_at) DESC';
     const rows=await env.DB.prepare(sql).bind(...p).all(); return ok({courier,tasks:rows.results||[]});
   }
   const m=rest.match(/^requisitions\/(\d+)\/collect$/); if(m&&method==='POST'){
     const id=Number(m[1]),b=await safeBody(request),temp=parseNumber(b?.temperature); if(temp==null)return err('Informe a temperatura da coleta.');
-    const r=await env.DB.prepare(`SELECT r.*,c.name client_name,c.address,c.city,c.state FROM requisitions r JOIN clients c ON c.id=r.client_id WHERE r.id=? AND r.assigned_courier_id=?`).bind(id,courier.id).first(); if(!r)return err('Coleta não encontrada para este entregador.',404);if(r.status!=='atribuido')return err('Essa coleta já foi movimentada ou não está pendente.');
-    const ts=nowIso(),sentBy=clampString(b.sentByName,160)||'Responsável no local',loc=clampString(b.sentFromLocation,250)||[r.address,r.city,r.state].filter(Boolean).join(', ');
-    await env.DB.batch([env.DB.prepare(`UPDATE requisitions SET status='coletado',collected_at=?,collection_temperature=?,sent_by_name=?,sent_from_location=?,updated_at=? WHERE id=?`).bind(ts,temp,sentBy,loc,ts,id),env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'coletado',NULL,?,?,?)`).bind(id,courier.name,JSON.stringify({temperature:temp,sentBy,location:loc}),ts)]);
+    const r=await env.DB.prepare(`SELECT r.*,c.name client_name,c.address,c.city,c.state,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=? AND r.assigned_courier_id=?`).bind(id,courier.id).first(); if(!r)return err('Coleta não encontrada para este entregador.',404);if(r.status!=='atribuido')return err('Essa coleta já foi movimentada ou não está pendente.');
+    const ts=nowIso(),sentBy=clampString(b.sentByName,160)||'Responsável no local',loc=clampString(b.sentFromLocation,250)||r.client_name;
+    await env.DB.batch([env.DB.prepare(`UPDATE requisitions SET status='coletado',collected_at=?,collection_temperature=?,sent_by_name=?,sent_from_location=?,transport_courier_name=?,transport_thermometer_code=?,updated_at=? WHERE id=?`).bind(ts,temp,sentBy,loc,courier.name,r.thermometer_code||null,ts,id),env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'coletado',NULL,?,?,?)`).bind(id,courier.name,JSON.stringify({temperature:temp,sentBy,location:loc}),ts)]);
     await audit(env,{name:courier.name},'coletou_amostra','requisition',id,{temperature:temp,sentBy,location:loc}); return ok({message:'Coleta registrada. O item foi movido para o histórico de coletados.',collectedAt:ts});
   }
   return err('Rota de entregador não encontrada.',404);
