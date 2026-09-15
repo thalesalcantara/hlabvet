@@ -442,25 +442,145 @@ function temperatureSheetInner(month,rows,page,total){
 }
 
 async function renderCourierPortal(token){
-  $('#loginView').classList.add('hidden');$('#appView').classList.add('hidden');$('#courierView').classList.remove('hidden');document.body.classList.add('courier-mobile-mode');let tab='pending';
+  $('#loginView').classList.add('hidden');
+  $('#appView').classList.add('hidden');
+  $('#courierView').classList.remove('hidden');
+  document.body.classList.add('courier-mobile-mode');
+
+  let tab='pending';
+  let currentUnaccepted=0;
+  let audioBlocked=false;
+  let lastPendingSignature='';
+  let pollTimer=null;
+  const ringAudio=new Audio('/assets/toque_cooperado_triiiim.wav');
+  ringAudio.loop=true;
+  ringAudio.preload='auto';
+  ringAudio.volume=1;
+
+  const stopRing=()=>{
+    try{ringAudio.pause();ringAudio.currentTime=0}catch{}
+  };
+
+  const unlockCourierAudio=async()=>{
+    try{
+      const volume=ringAudio.volume;
+      ringAudio.volume=0;
+      await ringAudio.play();
+      ringAudio.pause();
+      ringAudio.currentTime=0;
+      ringAudio.volume=volume;
+      audioBlocked=false;
+      if(currentUnaccepted) await ringAudio.play();
+      updateSoundGate();
+      return true;
+    }catch{
+      ringAudio.volume=1;
+      audioBlocked=true;
+      updateSoundGate();
+      return false;
+    }
+  };
+
+  const updateSoundGate=()=>{
+    const gate=$('#courierSoundGate');
+    if(!gate)return;
+    if(currentUnaccepted>0&&audioBlocked){
+      gate.classList.remove('hidden');
+      gate.innerHTML=`<div><strong>🔔 NOVA COLETA</strong><small>O celular bloqueou o toque automático. Toque abaixo uma vez para liberar o som.</small></div><button type="button" class="courier-sound-button" data-enable-courier-sound>ATIVAR SOM</button>`;
+      $('[data-enable-courier-sound]',gate)?.addEventListener('click',unlockCourierAudio);
+    }else{
+      gate.classList.add('hidden');
+      gate.innerHTML='';
+    }
+  };
+
+  const syncRing=async tasks=>{
+    currentUnaccepted=(tasks||[]).filter(t=>t.status==='atribuido'&&!t.courier_accepted_at).length;
+    if(!currentUnaccepted){audioBlocked=false;stopRing();updateSoundGate();return;}
+    try{
+      await ringAudio.play();
+      audioBlocked=false;
+    }catch{
+      audioBlocked=true;
+    }
+    updateSoundGate();
+  };
+
+  const pendingSignature=tasks=>(tasks||[]).map(t=>`${t.id}:${t.status}:${t.courier_accepted_at||''}`).sort().join('|');
+
+  const fetchTasks=async wantedTab=>{
+    const oldFrom=$('#courierFrom')?.value||'',oldTo=$('#courierTo')?.value||'';
+    const qs=new URLSearchParams({tab:wantedTab});
+    if(wantedTab==='collected'&&oldFrom)qs.set('from',oldFrom);
+    if(wantedTab==='collected'&&oldTo)qs.set('to',oldTo);
+    return api(`/api/courier/${encodeURIComponent(token)}/tasks?${qs}`);
+  };
+
   const render=async()=>{try{
     const oldFrom=$('#courierFrom')?.value||'',oldTo=$('#courierTo')?.value||'';
-    const qs=new URLSearchParams({tab});if(oldFrom)qs.set('from',oldFrom);if(oldTo)qs.set('to',oldTo);
+    const qs=new URLSearchParams({tab});if(tab==='collected'&&oldFrom)qs.set('from',oldFrom);if(tab==='collected'&&oldTo)qs.set('to',oldTo);
     const d=await api(`/api/courier/${encodeURIComponent(token)}/tasks?${qs}`);
-    $('#courierView').innerHTML=`<div class="courier-shell"><header class="courier-head"><div class="inner"><img src="/assets/hlabvet-logo.png" alt="HLabVet"><div class="courier-ident"><strong>${esc(d.courier.name)}</strong><small>Entregador HLabVet • ${esc(d.courier.thermometer_code||'Sem termômetro')}</small></div></div></header><main class="courier-main"><div class="courier-tabs"><button class="courier-tab ${tab==='pending'?'active':''}" data-tab="pending"><span>Pendentes</span></button><button class="courier-tab ${tab==='collected'?'active':''}" data-tab="collected"><span>Histórico</span></button></div>${tab==='collected'?`<details class="courier-filter-box"><summary>Filtrar período</summary><div class="courier-filter-grid"><label>De<input id="courierFrom" type="date" value="${esc(oldFrom)}"></label><label>Até<input id="courierTo" type="date" value="${esc(oldTo)}"></label><button class="btn ghost" id="courierFilter">Aplicar filtro</button></div></details>`:''}<div class="courier-task-list">${d.tasks.length?d.tasks.map(t=>courierTask(t,tab)).join(''):`<div class="courier-empty">${tab==='pending'?'Nenhuma coleta pendente agora.':'Nenhuma coleta encontrada neste período.'}</div>`}</div></main></div>`;
+    $('#courierView').innerHTML=`<div class="courier-shell"><header class="courier-head"><div class="inner"><img src="/assets/hlabvet-logo.png" alt="HLabVet"><div class="courier-ident"><strong>${esc(d.courier.name)}</strong><small>Entregador HLabVet • ${esc(d.courier.thermometer_code||'Sem termômetro')}</small></div></div></header><div id="courierSoundGate" class="courier-sound-gate hidden"></div><main class="courier-main"><div class="courier-tabs"><button class="courier-tab ${tab==='pending'?'active':''}" data-tab="pending"><span>Pendentes</span></button><button class="courier-tab ${tab==='collected'?'active':''}" data-tab="collected"><span>Histórico</span></button></div>${tab==='collected'?`<details class="courier-filter-box"><summary>Filtrar período</summary><div class="courier-filter-grid"><label>De<input id="courierFrom" type="date" value="${esc(oldFrom)}"></label><label>Até<input id="courierTo" type="date" value="${esc(oldTo)}"></label><button class="btn ghost" id="courierFilter">Aplicar filtro</button></div></details>`:''}<div class="courier-task-list">${d.tasks.length?d.tasks.map(t=>courierTask(t,tab)).join(''):`<div class="courier-empty">${tab==='pending'?'Nenhuma coleta pendente agora.':'Nenhuma coleta encontrada neste período.'}</div>`}</div></main></div>`;
     $$('[data-tab]').forEach(b=>b.addEventListener('click',()=>{tab=b.dataset.tab;render()}));
     $('#courierFilter')?.addEventListener('click',render);
-    $$('[data-collect]').forEach(b=>b.addEventListener('click',()=>collectTask(token,Number(b.dataset.collect))));
-  }catch(e){$('#courierView').innerHTML=`<div class="courier-shell"><div class="courier-error"><img src="/assets/hlabvet-logo.png"><h2>Link inválido</h2><p>${esc(e.message)}</p></div></div>`}};
+    $$('[data-accept-courier]').forEach(b=>b.addEventListener('click',()=>acceptCourierTask(token,Number(b.dataset.acceptCourier),render,pollPending)));
+    $$('[data-collect]').forEach(b=>b.addEventListener('click',()=>collectTask(token,Number(b.dataset.collect),render,pollPending)));
+    if(tab==='pending'){
+      lastPendingSignature=pendingSignature(d.tasks);
+      await syncRing(d.tasks);
+    }else{
+      updateSoundGate();
+    }
+  }catch(e){stopRing();$('#courierView').innerHTML=`<div class="courier-shell"><div class="courier-error"><img src="/assets/hlabvet-logo.png"><h2>Link inválido</h2><p>${esc(e.message)}</p></div></div>`}};
+
+  const pollPending=async()=>{
+    try{
+      const d=await api(`/api/courier/${encodeURIComponent(token)}/tasks?tab=pending`);
+      await syncRing(d.tasks);
+      const sig=pendingSignature(d.tasks);
+      if(sig!==lastPendingSignature){
+        lastPendingSignature=sig;
+        const editing=document.activeElement?.closest?.('.courier-collect-form');
+        if(tab==='pending'&&!editing)await render();
+      }
+    }catch{}
+  };
+
+  document.addEventListener('pointerdown',unlockCourierAudio,{once:true});
+  document.addEventListener('keydown',unlockCourierAudio,{once:true});
+  window.addEventListener('pagehide',()=>{clearInterval(pollTimer);stopRing()},{once:true});
   await render();
-}
-function courierTask(t,tab){
-  const phoneDigits=String(t.phone||'').replace(/\D/g,'');
-  const address=[t.address,t.city,t.state].filter(Boolean).join(', ');
-  return `<article class="courier-task-card"><div class="courier-task-top"><div><small>${esc(t.protocol)}</small><h3>${esc(t.client_name)}</h3><p>${esc(t.patient_name)}${t.species?` • ${esc(t.species)}`:''}</p></div><span class="badge ${t.status}">${esc(STATUS[t.status]||t.status)}</span></div><div class="courier-info-row"><span>📍</span><div><small>LOCAL DA COLETA</small><strong>${esc(address||t.client_name)}</strong></div></div><div class="courier-info-grid"><div><small>TERMÔMETRO</small><strong>${esc(t.thermometer_code||'—')}</strong></div><div><small>CONTATO</small><strong>${esc(t.phone||'—')}</strong></div></div>${phoneDigits?`<a class="courier-call" href="tel:${phoneDigits}">Ligar para o local</a>`:''}${tab==='pending'?`<form class="courier-collect-form" data-collect-form="${t.id}"><label>Temperatura da amostra (°C)<input name="temperature" inputmode="decimal" type="number" step="0.1" required placeholder="Ex.: 4,0"></label><label>Quem entregou a amostra?<input name="sentByName" required placeholder="Nome do responsável"></label><label>Local de envio<input name="sentFromLocation" value="${esc(t.client_name)}" readonly></label><button class="courier-primary-action" type="button" data-collect="${t.id}">CONFIRMAR COLETA</button></form>`:`<div class="courier-history-data"><div><small>COLETADO EM</small><strong>${fmtDateTime(t.collected_at)}</strong></div><div><small>TEMPERATURA</small><strong>${t.collection_temperature!=null?`${esc(t.collection_temperature)} °C`:'—'}</strong></div><div><small>RESPONSÁVEL</small><strong>${esc(t.sent_by_name||'—')}</strong></div><div><small>LOCAL</small><strong>${esc(t.sent_from_location||t.client_name)}</strong></div></div>`}</article>`;
+  await pollPending();
+  pollTimer=setInterval(pollPending,6000);
 }
 
-async function collectTask(token,id){const form=$(`[data-collect-form="${id}"]`);if(!form.reportValidity())return;const body=Object.fromEntries(new FormData(form));try{const r=await api(`/api/courier/${encodeURIComponent(token)}/requisitions/${id}/collect`,{json:body});toast(r.message);const btn=$(`[data-tab="pending"]`);if(btn)btn.click();else location.reload()}catch(e){toast(e.message,'error')}}
+function courierTask(t,tab){
+  const address=[t.address,t.city,t.state].filter(Boolean).join(', ');
+  const routeDestination=address||t.client_name||'';
+  const mapsUrl=`https://www.google.com/maps/dir/?api=1&destination=${encodeURIComponent(routeDestination)}`;
+  const accepted=Boolean(t.courier_accepted_at);
+  return `<article class="courier-task-card"><div class="courier-task-top"><div><small>${esc(t.protocol)}</small><h3>${esc(t.client_name)}</h3><p>${esc(t.patient_name)}${t.species?` • ${esc(t.species)}`:''}</p></div><span class="badge ${t.status}">${esc(STATUS[t.status]||t.status)}</span></div><div class="courier-info-row"><span>📍</span><div><small>LOCAL DA COLETA</small><strong>${esc(address||t.client_name)}</strong></div></div><div class="courier-info-grid"><div><small>TERMÔMETRO</small><strong>${esc(t.thermometer_code||'—')}</strong></div><div><small>CONTATO</small><strong>${esc(t.phone||'—')}</strong></div></div><a class="courier-route" href="${esc(mapsUrl)}" target="_blank" rel="noopener noreferrer">🗺️ ABRIR ROTA NO GOOGLE MAPS</a>${tab==='pending'&&!accepted?`<div class="courier-accept-box"><strong>Nova coleta atribuída a você</strong><small>O toque continuará até você aceitar esta coleta.</small><button class="courier-accept-action" type="button" data-accept-courier="${t.id}">ACEITAR COLETA</button></div>`:tab==='pending'?`<div class="courier-accepted">✓ Coleta aceita ${t.courier_accepted_at?`em ${fmtDateTime(t.courier_accepted_at)}`:''}</div><form class="courier-collect-form" data-collect-form="${t.id}"><label>Temperatura da amostra (°C)<input name="temperature" inputmode="decimal" type="number" step="0.1" required placeholder="Ex.: 4,0"></label><label>Quem entregou a amostra?<input name="sentByName" required placeholder="Nome do responsável"></label><label>Local de envio<input name="sentFromLocation" value="${esc(t.client_name)}" readonly></label><button class="courier-primary-action" type="button" data-collect="${t.id}">CONFIRMAR COLETA</button></form>`:`<div class="courier-history-data"><div><small>COLETADO EM</small><strong>${fmtDateTime(t.collected_at)}</strong></div><div><small>TEMPERATURA</small><strong>${t.collection_temperature!=null?`${esc(t.collection_temperature)} °C`:'—'}</strong></div><div><small>RESPONSÁVEL</small><strong>${esc(t.sent_by_name||'—')}</strong></div><div><small>LOCAL</small><strong>${esc(t.sent_from_location||t.client_name)}</strong></div></div>`}</article>`;
+}
+
+async function acceptCourierTask(token,id,render,pollPending){
+  try{
+    const r=await api(`/api/courier/${encodeURIComponent(token)}/requisitions/${id}/accept`,{method:'POST'});
+    toast(r.message);
+    await pollPending();
+    await render();
+  }catch(e){toast(e.message,'error')}
+}
+
+async function collectTask(token,id,render,pollPending){
+  const form=$(`[data-collect-form="${id}"]`);if(!form?.reportValidity())return;
+  const body=Object.fromEntries(new FormData(form));
+  try{
+    const r=await api(`/api/courier/${encodeURIComponent(token)}/requisitions/${id}/collect`,{json:body});
+    toast(r.message);
+    await pollPending();
+    await render();
+  }catch(e){toast(e.message,'error')}
+}
 
 function printRequisition(data){printManyRequisitions([data])}
 function printManyRequisitions(items){if(!items.length)return;const html=items.map(d=>requisitionPrintHtml(d)).join('<div style="page-break-after:always"></div>');printWindow('Requisições HLabVet',html,printCss())}
