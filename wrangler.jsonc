@@ -12,7 +12,7 @@
     {
       "binding": "DB",
       "database_name": "hlab-vet-resultados-db",
-      "database_id": "bca827de-4493-40ad-a162-8dcfc3f3a6aa",
+      "database_id": "478c2f5a-e950-4521-874b-7c0fc3a4615c",
       "migrations_dir": "migrations"
     }
   ],
