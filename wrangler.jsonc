@@ -21,13 +21,7 @@
     }
   ],
 
-  "r2_buckets": [
-    {
-      "binding": "FILES",
-      "bucket_name": "hlab-vet-resultados-files"
-    }
-  ],
-
+ 
   "vars": {
     "APP_NAME": "HLab Vet Resultados",
     "SESSION_DAYS": "14"
