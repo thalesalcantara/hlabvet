@@ -226,3 +226,4 @@ hlab-vet-resultados/
 - Guarde links de entregadores como informação reservada. Se um link vazar, use **Gerar novo link**.
 - O botão de “Excluir” cliente desativa o acesso e preserva o histórico, o que evita perda de rastreabilidade.
 - Antes do uso definitivo, valide internamente os campos obrigatórios, a política de retenção e o tratamento de dados pessoais conforme a rotina do laboratório.
+Atualização de deploy
