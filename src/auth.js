@@ -66,23 +66,29 @@ export async function getUser(request, env) {
            COALESCE(cm.is_technician,0) AS client_is_technician,
            cm.function_title,cm.council_name,cm.council_number,cm.council_state,cm.stamp_color AS member_stamp_color,
            t.id AS tutor_id,t.client_id AS tutor_client_id,t.name AS tutor_name,t.document AS tutor_document,
-           t.phone AS tutor_phone,t.email AS tutor_email,t.active AS tutor_active
+           t.phone AS tutor_phone,t.email AS tutor_email,t.active AS tutor_active,
+           cr.id AS courier_id,cr.name AS courier_name,cr.phone AS courier_phone,
+           cr.thermometer_code AS courier_thermometer_code,cr.active AS courier_active
     FROM sessions s
     JOIN users u ON u.id=s.user_id
     LEFT JOIN client_members cm ON cm.user_id=u.id AND cm.active=1
     LEFT JOIN clients c ON c.id=COALESCE(cm.client_id,(SELECT c2.id FROM clients c2 WHERE c2.user_id=u.id LIMIT 1))
     LEFT JOIN tutors t ON t.user_id=u.id
+    LEFT JOIN couriers cr ON cr.user_id=u.id
     WHERE s.token_hash=?
   `).bind(tokenHash).first();
   if (!row) return null;
   const isTutor = !!row.tutor_id;
+  const isCourier = !!row.courier_id;
   const invalidClient = row.role === 'client' && !isTutor && (!row.client_id || Number(row.client_active) !== 1);
   const invalidTutor = isTutor && Number(row.tutor_active) !== 1;
-  if (!row.active || invalidClient || invalidTutor || new Date(row.expires_at).getTime() <= Date.now()) {
+  const invalidCourier = isCourier && Number(row.courier_active) !== 1;
+  if (!row.active || invalidClient || invalidTutor || invalidCourier || new Date(row.expires_at).getTime() <= Date.now()) {
     await env.DB.prepare('DELETE FROM sessions WHERE token_hash=?').bind(tokenHash).run();
     return null;
   }
   if (isTutor) row.role = 'tutor';
+  else if (isCourier) row.role = 'courier';
   return row;
 }
 
