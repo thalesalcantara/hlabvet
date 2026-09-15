@@ -60,13 +60,18 @@ export async function getUser(request, env) {
   const tokenHash = await sha256(token);
   const row = await env.DB.prepare(`
     SELECT u.id,u.role,u.username_display,u.username_key,u.force_password_change,u.active,s.expires_at,
-           c.id AS client_id,c.name AS client_name
+           c.id AS client_id,c.name AS client_name,c.active AS client_active,
+           cm.id AS client_member_id,cm.name AS client_member_name,
+           COALESCE(cm.can_manage_users,0) AS can_manage_client_users,
+           COALESCE(cm.is_technician,0) AS client_is_technician,
+           cm.function_title,cm.council_name,cm.council_number,cm.council_state,cm.stamp_color AS member_stamp_color
     FROM sessions s
     JOIN users u ON u.id=s.user_id
-    LEFT JOIN clients c ON c.user_id=u.id
+    LEFT JOIN client_members cm ON cm.user_id=u.id AND cm.active=1
+    LEFT JOIN clients c ON c.id=COALESCE(cm.client_id,(SELECT c2.id FROM clients c2 WHERE c2.user_id=u.id LIMIT 1))
     WHERE s.token_hash=?
   `).bind(tokenHash).first();
-  if (!row || !row.active || new Date(row.expires_at).getTime() <= Date.now()) {
+  if (!row || !row.active || (row.role === 'client' && row.client_id && Number(row.client_active) !== 1) || new Date(row.expires_at).getTime() <= Date.now()) {
     if (row) await env.DB.prepare('DELETE FROM sessions WHERE token_hash=?').bind(tokenHash).run();
     return null;
   }
