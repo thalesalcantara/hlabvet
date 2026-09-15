@@ -50,14 +50,20 @@ async function resultFileAction(fileId, mode, filename='resultado'){
     setTimeout(()=>URL.revokeObjectURL(url),120000);
   }catch(e){toast(e.message,'error')}
 }
-function bindResultFileButtons(root=document){
+function bindResultFileButtons(root=document,onDeleted=null){
   $$('[data-result-view]',root).forEach(b=>b.addEventListener('click',()=>resultFileAction(Number(b.dataset.resultView),'view',b.dataset.filename||'resultado')));
   $$('[data-result-download]',root).forEach(b=>b.addEventListener('click',()=>resultFileAction(Number(b.dataset.resultDownload),'download',b.dataset.filename||'resultado')));
   $$('[data-print-result]',root).forEach(b=>b.addEventListener('click',()=>resultFileAction(Number(b.dataset.printResult),'print',b.dataset.filename||'resultado')));
+  $$('[data-result-delete]',root).forEach(b=>b.addEventListener('click',async()=>{
+    const filename=b.dataset.filename||'resultado';
+    if(!confirm(`Excluir o resultado “${filename}”? O arquivo será removido do sistema e do armazenamento.`))return;
+    try{const r=await api(`/api/results/${Number(b.dataset.resultDelete)}`,{method:'DELETE'});toast(r.message);await onDeleted?.();}
+    catch(e){toast(e.message,'error')}
+  }));
 }
-function resultFilesHtml(files,allowPrint=true){
+function resultFilesHtml(files,allowPrint=true,allowDelete=false){
   if(!files?.length)return '<div class="empty-state">Resultado ainda não disponível.</div>';
-  return files.map(f=>`<div class="file-card"><div><strong>${esc(f.original_name)}</strong><small>${fmtBytes(f.size_bytes)} • ${fmtDateTime(f.created_at)}</small></div><div class="actions"><button class="btn soft small" data-result-view="${f.id}" data-filename="${esc(f.original_name)}">Visualizar</button><button class="btn secondary small" data-result-download="${f.id}" data-filename="${esc(f.original_name)}">Baixar</button>${allowPrint?`<button class="btn ghost small" data-print-result="${f.id}" data-filename="${esc(f.original_name)}">Imprimir</button>`:''}</div></div>`).join('');
+  return files.map(f=>`<div class="file-card"><div><strong>${esc(f.original_name)}</strong><small>${fmtBytes(f.size_bytes)} • ${fmtDateTime(f.created_at)}</small></div><div class="actions"><button class="btn soft small" data-result-view="${f.id}" data-filename="${esc(f.original_name)}">Visualizar</button><button class="btn secondary small" data-result-download="${f.id}" data-filename="${esc(f.original_name)}">Baixar</button>${allowPrint?`<button class="btn ghost small" data-print-result="${f.id}" data-filename="${esc(f.original_name)}">Imprimir</button>`:''}${allowDelete?`<button class="btn danger small" data-result-delete="${f.id}" data-filename="${esc(f.original_name)}">Excluir</button>`:''}</div></div>`).join('');
 }
 function toast(msg,type='ok'){const el=$('#toast');el.textContent=msg;el.className=`toast show ${type}`;clearTimeout(toast.t);toast.t=setTimeout(()=>el.className='toast',3300)}
 function modal(html){$('#modalContent').innerHTML=html;$('#modal').classList.remove('hidden')}
@@ -108,7 +114,7 @@ function renderAlertDock(){
   $('[data-go-prices]',dock)?.addEventListener('click',()=>navigate('prices'));
 }
 async function pollLabAlerts(){
-  if(!state.me||state.me.role==='client')return;
+  if(!state.me||!['admin','staff'].includes(state.me.role))return;
   try{
     const d=await api('/api/alerts');state.alerts=d.alerts||[];state.cancelAlerts=d.cancelAlerts||[];state.missingPrices=d.missingPrices||[];renderAlertDock();
     const soundCount=state.alerts.length+state.cancelAlerts.length;
@@ -121,7 +127,7 @@ async function pollLabAlerts(){
 }
 
 function startLabAlerts(){
-  stopLabAlerts();if(!state.me||state.me.role==='client')return;document.addEventListener('pointerdown',()=>{unlockAudio();if(labAudioBlocked)enableLabSound()},{once:true});pollLabAlerts();alertPollTimer=setInterval(pollLabAlerts,5000);
+  stopLabAlerts();if(!state.me||!['admin','staff'].includes(state.me.role))return;document.addEventListener('pointerdown',()=>{unlockAudio();if(labAudioBlocked)enableLabSound()},{once:true});pollLabAlerts();alertPollTimer=setInterval(pollLabAlerts,5000);
 }
 document.addEventListener('click',e=>{if(e.target.matches('[data-close-modal]'))closeModal()});
 
@@ -135,24 +141,26 @@ async function boot(){
 function showLogin(){ $('#loginView').classList.remove('hidden'); $('#appView').classList.add('hidden'); $('#courierView').classList.add('hidden'); }
 async function showApp(){
   $('#loginView').classList.add('hidden');$('#courierView').classList.add('hidden');$('#appView').classList.remove('hidden');
-  const roleLabel=state.me.role==='client'?'Cliente HLabVet':state.me.role==='staff'?'Técnico HLabVet':'Administrador HLab Vet';
-  $('#sideUser').innerHTML=`<strong>${esc(state.me.technicianName||state.me.clientName||state.me.username)}</strong><small>${roleLabel}</small>`;
+  const roleLabel=state.me.role==='client'?'Cliente HLabVet':state.me.role==='staff'?'Técnico HLabVet':state.me.role==='tutor'?'Tutor / Cliente Final':'Administrador HLab Vet';
+  $('#sideUser').innerHTML=`<strong>${esc(state.me.tutorName||state.me.technicianName||state.me.clientName||state.me.username)}</strong><small>${roleLabel}</small>`;
   renderNav();startLabAlerts();
   if(state.me.forcePasswordChange) return showPasswordChange(true);
-  navigate('dashboard');
+  navigate(state.me.role==='tutor'?'tutor-results':'dashboard');
 }
 
 $('#loginForm').addEventListener('submit',async e=>{e.preventDefault();unlockAudio();const f=new FormData(e.currentTarget);try{await api('/api/login',{json:Object.fromEntries(f)});const m=await api('/api/me');state.me=m.user;state.profile=m.profile;showApp();toast('Acesso realizado.');}catch(err){toast(err.message,'error')}});
 $('#logoutBtn').addEventListener('click',async()=>{try{await api('/api/logout',{method:'POST'})}catch{} stopLabAlerts();state.me=null;showLogin();});
-$('#menuBtn').addEventListener('click',()=>$('.sidebar').classList.toggle('open'));
 
 function renderNav(){
   let items;
   if(state.me.role==='client'){
-    items=[['dashboard','⌂','Painel'],['new-request','＋','Nova solicitação'],['requests','▣','Meus exames']];
+    items=[['dashboard','⌂','Painel'],['new-request','＋','Nova solicitação'],['requests','▣','Meus exames'],['tutors','🐾','Tutores / clientes finais']];
     if(state.me.canManageClientUsers)items.push(['client-users','♙','Usuários / técnicos']);
     items.push(['password','⚿','Alterar senha']);
   }
+  else if(state.me.role==='tutor') items=[
+    ['tutor-results','▣','Meus resultados'],['password','⚿','Alterar senha']
+  ];
   else if(state.me.role==='staff') items=[
     ['dashboard','⌂','Painel'],['requests','▣','Solicitações'],['cancellations','×','Cancelamentos'],['clients','♙','Clientes'],['couriers','➜','Entregadores'],['receivers','✓','Técnicos'],['temperature','▤','Temperaturas'],['password','⚿','Alterar senha']
   ];
@@ -165,13 +173,14 @@ function renderNav(){
 
 async function navigate(page){
   state.page=page; $$('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('#topActions').innerHTML='';
-  const map={dashboard:['Painel','Visão geral do atendimento'],requests:[state.me.role==='client'?'Meus exames':'Solicitações','Pesquise por período, animal, tutor, raça e outros dados'],cancellations:['Cancelamentos','Solicitações canceladas e motivo'],clients:['Clientes','Cadastros e acessos dos clientes'],couriers:['Entregadores','Painel móvel, links privados e termômetros'],receivers:['Técnicos','Técnicos do laboratório com login próprio'],prices:['Preços dos exames','Tabela geral e valores específicos por cliente'],finance:['Financeiro','Ranking de clientes e espelho detalhado para cobrança'],temperature:['Controle de temperatura','Fichas mensais de envio e recebimento'],password:['Alterar senha','A senha diferencia maiúsculas e minúsculas'],audit:['Auditoria','Registro de ações importantes'],'client-users':['Usuários / técnicos','Cadastre acessos da clínica; carimbo é opcional e automático para técnicos'],'new-request':['Nova solicitação','Requisição de exames veterinários']};
+  const map={dashboard:['Painel','Visão geral do atendimento'],requests:[state.me.role==='client'?'Meus exames':'Solicitações','Pesquise por período, animal, tutor, raça e outros dados'],cancellations:['Cancelamentos','Solicitações canceladas e motivo'],clients:['Clientes','Cadastros e acessos dos clientes'],couriers:['Entregadores','Painel móvel, links privados e termômetros'],receivers:['Técnicos','Técnicos do laboratório com login próprio'],prices:['Preços dos exames','Tabela geral e valores específicos por cliente'],finance:['Financeiro','Ranking de clientes e espelho detalhado para cobrança'],temperature:['Controle de temperatura','Fichas mensais de envio e recebimento'],password:['Alterar senha','A senha diferencia maiúsculas e minúsculas'],audit:['Auditoria','Registro de ações importantes'],'client-users':['Usuários / técnicos','Cadastre acessos da clínica; carimbo é opcional e automático para técnicos'],tutors:['Tutores / clientes finais','Cadastre quem poderá acessar somente os próprios resultados'],'tutor-results':['Meus resultados','Visualize, baixe ou imprima somente os seus exames liberados'],'new-request':['Nova solicitação','Requisição de exames veterinários']};
   $('#pageTitle').textContent=map[page]?.[0]||'HLab Vet';$('#pageSubtitle').textContent=map[page]?.[1]||'';
-  const fn={dashboard:renderDashboard,requests:renderRequests,cancellations:renderCancellations,clients:renderClients,couriers:renderCouriers,receivers:renderReceivers,prices:renderPrices,finance:renderFinance,temperature:renderTemperature,'client-users':renderClientUsers,password:()=>showPasswordChange(false),audit:renderAudit,'new-request':renderNewRequest}[page];
+  const fn={dashboard:renderDashboard,requests:renderRequests,cancellations:renderCancellations,clients:renderClients,couriers:renderCouriers,receivers:renderReceivers,prices:renderPrices,finance:renderFinance,temperature:renderTemperature,'client-users':renderClientUsers,tutors:renderTutors,'tutor-results':renderTutorResults,password:()=>showPasswordChange(false),audit:renderAudit,'new-request':renderNewRequest}[page];
   try{await fn?.()}catch(e){if(e.status===428)return showPasswordChange(true);$('#content').innerHTML=`<div class="card empty-state">${esc(e.message)}</div>`;toast(e.message,'error')}
 }
 
 async function renderDashboard(){
+  if(state.me.role==='tutor')return navigate('tutor-results');
   const d=await api('/api/dashboard'),t=d.totals||{};
   $('#content').innerHTML=`<div class="grid cards">
     ${metric('Solicitados hoje',t.solicitado||0)}${metric('Em coleta hoje',(t.atribuido||0)+(t.coletado||0))}${metric('Em análise hoje',(t.recebido||0)+(t.em_analise||0))}${metric('Concluídos hoje',t.concluido||0)}
@@ -225,7 +234,7 @@ async function openClientResults(id){
   try{
     const d=await api(`/api/requisitions/${id}`),r=d.requisition;
     modal(`<div class="detail-head"><div><h3>Resultado • ${esc(r.patient_name)}</h3><p class="muted">${esc(r.protocol)} • ${esc(r.client_name)}</p></div></div><h4>Exames solicitados</h4><div>${d.exams.map(x=>`<span class="badge" style="margin:2px">${esc(x.exam_name)}</span>`).join('')}</div><h4 style="margin-top:18px">Arquivos de resultado</h4>${resultFilesHtml(d.files,true)}<div class="actions" style="margin-top:16px"><button class="btn ghost" data-close-modal>Fechar</button></div>`);
-    bindResultFileButtons($('#modalContent'));
+    bindResultFileButtons($('#modalContent'),async()=>{closeModal();await openRequest(id)});
   }catch(e){toast(e.message,'error')}
 }
 
@@ -233,6 +242,8 @@ async function renderNewRequest(){
   if(!state.catalog)state.catalog=(await api('/api/catalog')).exams;
   if(state.me.role!=='client')await loadAdminLists();
   const profile = state.me.role==='client' ? (await api('/api/my-client-profile')).profile : null;
+  const tutorData = state.me.role==='client' ? await api('/api/tutors') : {tutors:[]};
+  const tutors=tutorData.tutors||[];
   const loggedClientTech=state.me.role==='client'&&state.me.clientIsTechnician;
   const vetDefault=loggedClientTech?(state.me.clientMemberName||state.me.username):'';
   const crmvDefault=loggedClientTech?[state.me.clientCouncil||'CRMV',state.me.clientCouncilState,state.me.clientCouncilNumber].filter(Boolean).join(' '):'';
@@ -242,7 +253,8 @@ async function renderNewRequest(){
     <div class="form-card"><h4>Dados da requisição</h4><div class="form-grid">
       <label class="field span2">Clínica / estabelecimento<input name="clinicName" value="${esc(profile?.name||'')}" placeholder="Nome da clínica"></label>
       <label class="field">Veterinário / técnico responsável<input name="veterinarianName" value="${esc(vetDefault)}" ${loggedClientTech?'readonly':''}></label><label class="field">CRMV / registro<input name="crmv" value="${esc(crmvDefault)}" ${loggedClientTech?'readonly':''}></label>
-      <label class="field span2">Tutor<input name="tutorName"></label><label class="field span2">Paciente / animal<input name="patientName" required></label>
+      ${state.me.role==='client'?`<label class="field span2">Tutor com acesso ao resultado<select name="tutorAccountId" id="tutorAccountId"><option value="">Sem login vinculado</option>${tutors.filter(t=>t.active).map(t=>`<option value="${t.id}" data-name="${esc(t.name)}">${esc(t.name)}${t.phone?` • ${esc(t.phone)}`:''}</option>`).join('')}</select><small>Se vincular um tutor cadastrado, ele verá somente os resultados desta solicitação.</small></label>`:''}
+      <label class="field span2">Nome do tutor<input name="tutorName" id="tutorName"></label><label class="field span2">Paciente / animal<input name="patientName" required></label>
       <label class="field">Espécie<input name="species" placeholder="Canina, felina..."></label><label class="field">Raça<input name="breed"></label>
       <label class="field">Sexo<select name="sex"><option value="">—</option><option>M</option><option>F</option></select></label><label class="field">Data de nascimento<input name="birthDate" type="date"></label>
       <label class="field">Idade<input name="ageText" placeholder="Ex.: 4 anos"></label><label class="field">Data prevista da coleta<input name="collectionDate" type="date" value="${today()}"></label>
@@ -255,15 +267,17 @@ async function renderNewRequest(){
   </form>`;
   const kind=$('#requestKind'),wrap=$('#scheduledWrap'),scheduled=$('#scheduledAtLocal');
   const syncSchedule=()=>{const on=kind.value==='scheduled';wrap.classList.toggle('hidden',!on);scheduled.required=on;if(!on)scheduled.value=''};kind.addEventListener('change',syncSchedule);syncSchedule();
+  const tutorSelect=$('#tutorAccountId'),tutorName=$('#tutorName');
+  tutorSelect?.addEventListener('change',()=>{const opt=tutorSelect.selectedOptions[0];if(tutorSelect.value&&opt?.dataset.name){tutorName.value=opt.dataset.name;tutorName.readOnly=true}else tutorName.readOnly=false});
   $('#newReqForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget),body=Object.fromEntries(f);body.exams=f.getAll('exams');body.materials=f.getAll('materials');body.requestKind=f.get('requestKind')||'immediate';if(body.requestKind==='scheduled'){const local=f.get('scheduledAtLocal');if(!local)return toast('Informe a data e hora do agendamento.','error');body.scheduledAt=new Date(local).toISOString()}delete body.scheduledAtLocal;try{const r=await api('/api/requisitions',{json:body});toast(`${r.message} Protocolo ${r.protocol}`);navigate('requests')}catch(err){toast(err.message,'error')}});
 }
 
 async function openRequest(id){
   const d=await api(`/api/requisitions/${id}`),r=d.requisition;
-  const lab=state.me.role!=='client'; if(lab) await loadAdminLists();
+  const lab=['admin','staff'].includes(state.me.role); if(lab) await loadAdminLists();
   const actions=lab?adminRequestActions(r):'';
   const clientCanCancel=state.me.role==='client'&&!r.collected_at&&['solicitado','atribuido'].includes(r.status);
-  const resultHtml=resultFilesHtml(d.files,true);
+  const resultHtml=resultFilesHtml(d.files,true,lab);
   const clientCanDeleteExam=state.me.role==='client'&&r.status==='solicitado'&&!r.accepted_at;
   const labCanDeleteExam=state.me.role!=='client'&&!['concluido','cancelado'].includes(r.status);
   const canDeleteExam=clientCanDeleteExam||labCanDeleteExam;
@@ -279,7 +293,7 @@ async function openRequest(id){
     <div class="actions" style="margin-top:18px">${state.me.role==='admin'?'<button class="btn ghost" id="printThis">Imprimir / Salvar em PDF</button>':''}${clientCanCancel?'<button class="btn danger" id="clientCancelBtn">Cancelar solicitação</button>':''}<button class="btn ghost" data-close-modal>Fechar</button></div>`);
   $('#printThis')?.addEventListener('click',()=>printRequisition(d));
   $('#clientCancelBtn')?.addEventListener('click',async()=>{const reason=prompt('Motivo do cancelamento:','Desistência da solicitação');if(reason===null)return;if(!confirm('Confirmar o cancelamento? O laboratório será avisado imediatamente.'))return;try{const x=await api(`/api/requisitions/${id}/cancel`,{json:{reason}});toast(x.message);closeModal();navigate('requests')}catch(e){toast(e.message,'error')}});
-  bindResultFileButtons($('#modalContent'));
+  bindResultFileButtons($('#modalContent'),async()=>{closeModal();await openRequest(id)});
   $$('[data-delete-exam]').forEach(b=>b.addEventListener('click',async()=>{
     const examId=Number(b.dataset.deleteExam);
     if(!confirm('Excluir este exame da solicitação?'))return;
@@ -295,9 +309,9 @@ function adminRequestActions(r){
   ${['solicitado','atribuido','coletado'].includes(r.status)&&r.accepted_at?`<label>Entregador<select id="assignCourier"><option value="">Selecione</option>${state.couriers.filter(c=>c.active).map(c=>`<option value="${c.id}" ${r.assigned_courier_id===c.id?'selected':''}>${esc(c.name)}${c.thermometer_code?` • ${esc(c.thermometer_code)}`:''}</option>`).join('')}</select></label><button class="btn secondary" id="assignBtn">Atribuir entregador</button>`:''}
   ${r.status==='coletado'?`${technicianField}<label>Temperatura no recebimento (°C)<input id="receiveTemp" type="number" step="0.1"></label><label>Local do recebimento<input id="receiveLocation" value="${esc(state.me.technicianLocation||'HLab Vet')}"></label><label>Observação<textarea id="receiveObservation" placeholder="Observação do recebimento, se houver"></textarea></label><button class="btn secondary" id="receiveBtn">Dar recebimento</button>`:''}
   ${['recebido','em_analise'].includes(r.status)?`<button class="btn soft" id="analysisBtn">Marcar Em análise</button>`:''}
-  ${['recebido','em_analise','concluido'].includes(r.status)?`<label>Enviar resultado<input id="resultFile" type="file"></label><button class="btn secondary" id="uploadBtn">Enviar arquivo</button>`:''}
+  ${['recebido','em_analise','concluido'].includes(r.status)?`<label>Enviar resultado(s)<input id="resultFile" type="file" multiple></label><small class="muted">Você pode selecionar mais de um arquivo de uma vez.</small><button class="btn secondary" id="uploadBtn">Enviar arquivo(s)</button>`:''}
   ${['recebido','em_analise'].includes(r.status)?`<button class="btn primary" id="completeBtn">Marcar Concluído</button>`:''}
-  ${!['concluido','cancelado'].includes(r.status)?`<button class="btn danger" id="cancelBtn">Cancelar requisição</button>`:''}
+  ${r.status!=='cancelado'?`<button class="btn danger" id="cancelBtn">Cancelar requisição</button>`:''}
   </div></div>`
 }
 function bindAdminRequestActions(id,r){
@@ -307,7 +321,20 @@ function bindAdminRequestActions(id,r){
   $('#analysisBtn')?.addEventListener('click',async()=>{try{await api(`/api/requisitions/${id}/analysis`,{method:'POST'});toast('Exame em análise.');closeModal();openRequest(id)}catch(e){toast(e.message,'error')}});
   $('#completeBtn')?.addEventListener('click',async()=>{try{await api(`/api/requisitions/${id}/complete`,{method:'POST'});toast('Exame concluído.');closeModal();openRequest(id)}catch(e){toast(e.message,'error')}});
   $('#cancelBtn')?.addEventListener('click',async()=>{const reason=prompt('Motivo do cancelamento:');if(reason===null)return;try{await api(`/api/requisitions/${id}/cancel`,{json:{reason}});toast('Requisição cancelada.');closeModal();openRequest(id)}catch(e){toast(e.message,'error')}});
-  $('#uploadBtn')?.addEventListener('click',async()=>{const file=$('#resultFile').files[0];if(!file)return toast('Selecione um arquivo.','error');const fd=new FormData();fd.append('file',file);try{const res=await fetch(`/api/requisitions/${id}/results`,{method:'POST',body:fd,credentials:'include'});const x=await res.json();if(!res.ok)throw new Error(x.error||'Falha no envio');toast(x.message);closeModal();openRequest(id)}catch(e){toast(e.message,'error')}});
+  $('#uploadBtn')?.addEventListener('click',async()=>{
+    const files=[...($('#resultFile')?.files||[])];if(!files.length)return toast('Selecione pelo menos um arquivo.','error');
+    try{
+      let enviados=0;
+      for(const file of files){
+        const fd=new FormData();fd.append('file',file);
+        const res=await fetch(`/api/requisitions/${id}/results`,{method:'POST',body:fd,credentials:'include'});
+        const x=await res.json();if(!res.ok)throw new Error(x.error||`Falha no envio de ${file.name}`);
+        enviados++;
+      }
+      toast(`${enviados} resultado${enviados>1?'s':''} enviado${enviados>1?'s':''} com sucesso.`);
+      closeModal();openRequest(id);
+    }catch(e){toast(e.message,'error')}
+  });
 }
 
 async function loadAdminLists(){
@@ -377,6 +404,43 @@ function clientUserForm(u=null){
 async function resetClientUser(id){const password=prompt('Digite a nova senha temporária (mínimo 8 caracteres):');if(password===null)return;try{const r=await api(`/api/client-users/${id}/reset-password`,{json:{password}});toast(r.message)}catch(e){toast(e.message,'error')}}
 async function disableClientUser(id){if(!confirm('Desativar este usuário? O histórico será mantido.'))return;try{const r=await api(`/api/client-users/${id}`,{method:'DELETE'});toast(r.message);renderClientUsers()}catch(e){toast(e.message,'error')}}
 
+
+async function renderTutors(){
+  if(state.me.role!=='client')return navigate(state.me.role==='tutor'?'tutor-results':'dashboard');
+  const d=await api('/api/tutors'),tutors=d.tutors||[],manager=!!state.me.canManageClientUsers;
+  $('#topActions').innerHTML=`<button class="btn primary" id="addTutor">＋ Cadastrar tutor</button>`;
+  $('#content').innerHTML=`<div class="card"><div class="section-title"><div><h3>Tutores / clientes finais</h3><p>O tutor terá um login próprio e verá somente os resultados das solicitações vinculadas a ele.</p></div></div>${tutors.length?`<div class="table-wrap"><table><thead><tr><th>Nome</th><th>Contato</th>${manager?'<th>Usuário</th>':''}<th>Status</th>${manager?'<th>Ações</th>':''}</tr></thead><tbody>${tutors.map(t=>`<tr><td><strong>${esc(t.name)}</strong><br><small>${esc(t.document||'')}</small></td><td>${esc(t.phone||'—')}<br><small>${esc(t.email||'')}</small></td>${manager?`<td>${esc(t.username_display||'')}</td>`:''}<td><span class="badge ${t.active?'concluido':'cancelado'}">${t.active?'Ativo':'Inativo'}</span></td>${manager?`<td><div class="actions"><button class="btn soft small" data-edit-tutor="${t.id}">Editar</button><button class="btn ghost small" data-reset-tutor="${t.id}">Senha</button>${t.active?`<button class="btn danger small" data-disable-tutor="${t.id}">Desativar</button>`:''}</div></td>`:''}</tr>`).join('')}</tbody></table></div>`:'<div class="empty-state">Nenhum tutor cadastrado.</div>'}</div>`;
+  $('#addTutor')?.addEventListener('click',()=>tutorForm());
+  if(manager){
+    $$('[data-edit-tutor]').forEach(b=>b.addEventListener('click',()=>tutorForm(tutors.find(x=>x.id===Number(b.dataset.editTutor)))));
+    $$('[data-reset-tutor]').forEach(b=>b.addEventListener('click',()=>resetTutor(Number(b.dataset.resetTutor))));
+    $$('[data-disable-tutor]').forEach(b=>b.addEventListener('click',()=>disableTutor(Number(b.dataset.disableTutor))));
+  }
+}
+
+function tutorForm(t=null){
+  modal(`<h3>${t?'Editar tutor / cliente final':'Cadastrar tutor / cliente final'}</h3><p class="muted">Esse acesso é exclusivo para o dono do animal. Ele não verá preços, coleta, ficha de temperatura, técnicos ou dados internos.</p><form id="tutorForm" class="stack"><div class="form-grid"><label class="field span2">Nome completo<input name="name" value="${esc(t?.name||'')}" required></label><label class="field">CPF / documento<input name="document" value="${esc(t?.document||'')}"></label><label class="field">Telefone<input name="phone" value="${esc(t?.phone||'')}"></label><label class="field span2">E-mail<input name="email" type="email" value="${esc(t?.email||'')}"></label><label class="field">Usuário de login<input name="username" value="${esc(t?.username_display||'')}" required></label>${t?'':`<label class="field">Senha inicial<input name="password" type="password" minlength="8" required><small>Será trocada no primeiro acesso.</small></label>`}${t?`<label class="field">Ativo<select name="active"><option value="1" ${t.active?'selected':''}>Sim</option><option value="0" ${!t.active?'selected':''}>Não</option></select></label>`:''}</div><div class="actions"><button class="btn primary">Salvar tutor</button><button type="button" class="btn ghost" data-close-modal>Cancelar</button></div></form>`);
+  $('#tutorForm').addEventListener('submit',async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));if('active'in b)b.active=b.active==='1';try{const r=await api(t?`/api/tutors/${t.id}`:'/api/tutors',{method:t?'PATCH':'POST',json:b});toast(r.message);closeModal();renderTutors()}catch(er){toast(er.message,'error')}})
+}
+async function resetTutor(id){const password=prompt('Digite a nova senha temporária do tutor (mínimo 8 caracteres):');if(password===null)return;try{const r=await api(`/api/tutors/${id}/reset-password`,{json:{password}});toast(r.message)}catch(e){toast(e.message,'error')}}
+async function disableTutor(id){if(!confirm('Desativar este tutor? O histórico de resultados continuará preservado.'))return;try{const r=await api(`/api/tutors/${id}`,{method:'DELETE'});toast(r.message);renderTutors()}catch(e){toast(e.message,'error')}}
+
+async function renderTutorResults(){
+  if(state.me.role!=='tutor')return navigate('dashboard');
+  $('#topActions').innerHTML='';
+  const d=await api('/api/tutor/results'),rows=d.results||[];
+  $('#content').innerHTML=`<div class="tutor-portal"><div class="card tutor-welcome"><div><h3>Olá, ${esc(state.me.tutorName||state.me.username)}</h3><p>Aqui aparecem somente os resultados liberados para os seus animais.</p></div></div>${rows.length?`<div class="tutor-results-grid">${rows.map(r=>`<article class="card tutor-result-card"><div class="tutor-result-head"><div><small>${esc(r.protocol)}</small><h3>${esc(r.patient_name)}</h3><p>${esc([r.species,r.breed].filter(Boolean).join(' • '))}</p></div><span class="result-ready-pill">RESULTADO DISPONÍVEL</span></div><dl class="kv compact-kv"><dt>Clínica</dt><dd>${esc(r.client_name)}</dd><dt>Resultado liberado</dt><dd>${fmtDateTime(r.latest_result_at)}</dd><dt>Arquivos</dt><dd>${Number(r.result_count)}</dd></dl><button class="btn primary tutor-open-result" data-tutor-result="${r.id}">Visualizar resultado</button></article>`).join('')}</div>`:'<div class="card empty-state">Ainda não há resultados liberados para este acesso.</div>'}</div>`;
+  $$('[data-tutor-result]').forEach(b=>b.addEventListener('click',()=>openTutorResult(Number(b.dataset.tutorResult))));
+}
+
+async function openTutorResult(id){
+  try{
+    const d=await api(`/api/tutor/results/${id}`),r=d.requisition;
+    modal(`<div class="detail-head"><div><h3>${esc(r.patient_name)}</h3><p class="muted">${esc(r.protocol)} • ${esc(r.client_name)}</p></div><span class="result-ready-pill">RESULTADO DISPONÍVEL</span></div><dl class="kv"><dt>Paciente</dt><dd>${esc(r.patient_name)}</dd><dt>Espécie / raça</dt><dd>${esc([r.species,r.breed].filter(Boolean).join(' • '))||'—'}</dd><dt>Data</dt><dd>${fmtDate(r.created_at)}</dd></dl><h4>Exames</h4><div>${(d.exams||[]).map(x=>`<span class="badge" style="margin:2px">${esc(x)}</span>`).join('')}</div><h4 style="margin-top:18px">Resultados</h4>${resultFilesHtml(d.files,true,false)}<div class="actions" style="margin-top:16px"><button class="btn ghost" data-close-modal>Fechar</button></div>`);
+    bindResultFileButtons($('#modalContent'));
+  }catch(e){toast(e.message,'error')}
+}
+
 async function renderStamp(){
   const r=await api('/api/my-client-profile'),p=r.profile;$('#content').innerHTML=`<div class="grid two"><form id="stampForm" class="card stack"><div class="section-title"><div><h3>Dados do carimbo</h3><p>Digite exatamente o que existe no carimbo do técnico, veterinário ou estabelecimento.</p></div></div><label>Linha principal<input name="stampName" value="${esc(p.stamp_name||p.name||'')}"></label><label>Linha 2<input name="stampLine2" value="${esc(p.stamp_line2||'')}"></label><label>Linha 3<input name="stampLine3" value="${esc(p.stamp_line3||'')}"></label><label>Linha 4<input name="stampLine4" value="${esc(p.stamp_line4||'')}"></label><label>Cor da tinta<input name="stampColor" type="color" value="${esc(p.stamp_color||'#5c2a72')}"></label><label>Telefone<input name="phone" value="${esc(p.phone||'')}"></label><label>E-mail<input name="email" value="${esc(p.email||'')}"></label><button class="btn primary">Salvar carimbo</button></form><div class="card"><h3>Prévia</h3><div class="stamp-preview" id="stampPreview"></div><p class="muted">A visualização usa textura e leve inclinação para se aproximar da aparência de tinta de carimbo. O conteúdo é salvo junto à requisição enviada.</p></div></div>`;
   const form=$('#stampForm'),draw=()=>{const f=new FormData(form);$('#stampPreview').innerHTML=stampHtml({name:f.get('stampName'),line2:f.get('stampLine2'),line3:f.get('stampLine3'),line4:f.get('stampLine4'),color:f.get('stampColor')})};form.addEventListener('input',draw);draw();form.addEventListener('submit',async e=>{e.preventDefault();try{const x=await api('/api/my-client-profile',{method:'PATCH',json:Object.fromEntries(new FormData(form))});toast(x.message)}catch(er){toast(er.message,'error')}})
@@ -386,7 +450,7 @@ function stampHtml(s){return `<div class="stamp" style="color:${esc(s.color||'#5
 function showPasswordChange(forced=false){
   $('#pageTitle').textContent='Alterar senha';$('#pageSubtitle').textContent=forced?'Obrigatório no primeiro acesso':'Mantenha seu acesso protegido';
   $('#content').innerHTML=`<div class="card" style="max-width:560px"><div class="section-title"><div><h3>${forced?'Primeiro acesso: crie sua senha':'Alterar sua senha'}</h3><p>O nome de usuário ignora maiúsculas/minúsculas e acentos. A senha, por segurança, é exata.</p></div></div><form id="passwordForm" class="stack"><label>Senha atual<input name="currentPassword" type="password" required></label><label>Nova senha<input name="newPassword" type="password" minlength="8" required></label><label>Confirmar nova senha<input name="confirm" type="password" minlength="8" required></label><button class="btn primary">Salvar nova senha</button></form></div>`;
-  $('#passwordForm').addEventListener('submit',async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));if(b.newPassword!==b.confirm)return toast('A confirmação não confere.','error');delete b.confirm;try{const x=await api('/api/change-password',{json:b});toast(x.message);const m=await api('/api/me');state.me=m.user;state.profile=m.profile;renderNav();navigate('dashboard')}catch(er){toast(er.message,'error')}})
+  $('#passwordForm').addEventListener('submit',async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));if(b.newPassword!==b.confirm)return toast('A confirmação não confere.','error');delete b.confirm;try{const x=await api('/api/change-password',{json:b});toast(x.message);const m=await api('/api/me');state.me=m.user;state.profile=m.profile;renderNav();navigate(state.me.role==='tutor'?'tutor-results':'dashboard')}catch(er){toast(er.message,'error')}})
 }
 
 
