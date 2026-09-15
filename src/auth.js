@@ -17,7 +17,7 @@ export async function hashPassword(password, saltB64 = null) {
   const salt = saltB64 ? fromB64Url(saltB64) : crypto.getRandomValues(new Uint8Array(16));
   const key = await crypto.subtle.importKey('raw', enc.encode(password), 'PBKDF2', false, ['deriveBits']);
   const bits = await crypto.subtle.deriveBits(
-    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 210000 },
+    { name: 'PBKDF2', hash: 'SHA-256', salt, iterations: 100000 },
     key,
     256,
   );
