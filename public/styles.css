@@ -17,3 +17,31 @@
 @media(max-width:1000px){.app-shell{grid-template-columns:1fr}.sidebar{position:fixed;z-index:50;left:-270px;width:250px;transition:.2s}.sidebar.open{left:0}.grid.cards{grid-template-columns:repeat(2,1fr)}.filters{grid-template-columns:repeat(2,1fr)}.form-grid{grid-template-columns:repeat(2,1fr)}.checks{grid-template-columns:repeat(2,1fr)}.detail-cols{grid-template-columns:1fr}.task-meta{grid-template-columns:repeat(2,1fr)}.collect-form{grid-template-columns:1fr 1fr}.content{padding:16px}.topbar{padding:12px 16px}}
 @media(max-width:620px){.grid.cards,.grid.two,.grid.three,.form-grid,.checks{grid-template-columns:1fr}.form-grid .span2,.form-grid .span4{grid-column:auto}.filters{grid-template-columns:1fr}.filters .span2,.filters .span3{grid-column:auto}.auth-card{padding:23px}.brand-lockup{display:block}.brand-lockup img{margin-bottom:12px}.top-actions{display:none}.task-meta,.collect-form{grid-template-columns:1fr}.kv{grid-template-columns:1fr}.modal-backdrop{padding:7px}.modal-card{padding:16px}.grid.cards{grid-template-columns:1fr 1fr}.metric .number{font-size:25px}}
 @media print{.no-print{display:none!important}body{background:#fff}.temp-sheet-screen{border:0}.temp-sheet{padding:0}.page-break{break-after:page}}
+
+/* Ajustes operacionais HLabVet 2026-09-15 */
+.link-btn{border:0;background:transparent;padding:0;color:var(--purple);cursor:pointer;text-align:left}
+.link-btn:hover{text-decoration:underline}
+.badge.scheduled{background:#fff3dc;color:#8a5700}
+.pending-accept{display:inline-block;margin-top:4px;color:#9b5d00;font-weight:800}
+.result-cell{text-align:center;vertical-align:middle}
+.result-eye{width:36px;height:36px;border-radius:50%;border:0;font-size:21px;font-weight:900;cursor:pointer;display:inline-grid;place-items:center;box-shadow:0 2px 8px rgba(0,0,0,.10)}
+.result-eye.pending{background:#fff0b8;color:#c28b00}
+.result-eye.ready{background:#dff5e8;color:#16824f}
+.result-eye:hover{transform:translateY(-1px)}
+.logged-tech{border:1px solid #d8e1e2;border-radius:10px;padding:10px 12px;background:#f7fafb}
+.logged-tech small{display:block;color:var(--muted);margin-bottom:2px}
+.logged-tech strong{color:var(--purple)}
+.lab-alert-dock{position:fixed;right:20px;top:18px;z-index:500;width:min(430px,calc(100vw - 28px));background:#fff;border:2px solid #d5a000;border-radius:14px;box-shadow:0 12px 40px rgba(36,44,46,.22);overflow:hidden}
+.lab-alert-head{background:#fff2bd;color:#6d4b00;font-weight:850;padding:11px 13px;border-bottom:1px solid #ecd98b}
+.lab-alert-item{display:flex;align-items:center;justify-content:space-between;gap:10px;padding:10px 12px;border-bottom:1px solid #edf0f0}
+.lab-alert-item:last-child{border-bottom:0}
+.lab-alert-item strong,.lab-alert-item small{display:block}
+.lab-alert-item small{color:var(--muted);margin-top:2px}
+.temp-sheet{min-width:1320px}
+.temp-table{table-layout:fixed}
+.temp-table th:nth-child(5),.temp-table td:nth-child(5){width:17%}
+.temp-table th:nth-child(6),.temp-table td:nth-child(6){width:12%}
+.temp-table th:nth-child(9),.temp-table td:nth-child(9){width:11%}
+.temp-table th:nth-child(10),.temp-table td:nth-child(10){width:11%}
+.temp-table th:nth-child(11),.temp-table td:nth-child(11){width:13%}
+@media(max-width:620px){.lab-alert-dock{right:7px;top:7px}.result-eye{width:32px;height:32px}}
