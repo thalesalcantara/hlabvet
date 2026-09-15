@@ -4,6 +4,42 @@ import { boolInt, clampString, corsHeaders, err, escapeFilename, json, normalize
 
 const ADMIN_ROLES = new Set(['admin','staff']);
 
+function parseCalendarDate(value){
+  const m=String(value||'').match(/^(\d{4})-(\d{2})-(\d{2})$/);
+  if(!m)return null;
+  const y=Number(m[1]),mo=Number(m[2]),d=Number(m[3]);
+  const test=new Date(Date.UTC(y,mo-1,d));
+  if(test.getUTCFullYear()!==y||test.getUTCMonth()!==mo-1||test.getUTCDate()!==d)return null;
+  return {y,m:mo,d};
+}
+function daysInMonth(y,m){return new Date(Date.UTC(y,m,0)).getUTCDate();}
+function fortalezaToday(){
+  const parts=new Intl.DateTimeFormat('en-US',{timeZone:'America/Fortaleza',year:'numeric',month:'2-digit',day:'2-digit'}).formatToParts(new Date());
+  const get=t=>parts.find(p=>p.type===t)?.value||'';
+  return `${get('year')}-${get('month')}-${get('day')}`;
+}
+function exactAgeText(birthDate,referenceDate){
+  const b=parseCalendarDate(birthDate),r=parseCalendarDate(referenceDate||fortalezaToday());
+  if(!b||!r)return '';
+  const bKey=b.y*10000+b.m*100+b.d,rKey=r.y*10000+r.m*100+r.d;
+  if(bKey>rKey)return '';
+  let years=r.y-b.y,months=r.m-b.m,days=r.d-b.d;
+  if(days<0){
+    months--;
+    const prevMonth=r.m===1?12:r.m-1;
+    const prevYear=r.m===1?r.y-1:r.y;
+    days+=daysInMonth(prevYear,prevMonth);
+  }
+  if(months<0){years--;months+=12;}
+  const parts=[];
+  if(years)parts.push(`${years} ${years===1?'ano':'anos'}`);
+  if(months)parts.push(`${months} ${months===1?'mês':'meses'}`);
+  if(days||!parts.length)parts.push(`${days} ${days===1?'dia':'dias'}`);
+  if(parts.length===1)return parts[0];
+  if(parts.length===2)return `${parts[0]} e ${parts[1]}`;
+  return `${parts[0]}, ${parts[1]} e ${parts[2]}`;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -35,7 +71,9 @@ async function api(request, env, url) {
   if (path === '/api/logout' && method === 'POST') return logout(request, env, url);
 
   const courierMatch = path.match(/^\/api\/courier\/([^/]+)(?:\/(.*))?$/);
-  if (courierMatch) return courierApi(request, env, url, decodeURIComponent(courierMatch[1]), courierMatch[2] || '');
+  if (courierMatch && !['tasks','requisitions'].includes(courierMatch[1])) {
+    return courierApi(request, env, url, decodeURIComponent(courierMatch[1]), courierMatch[2] || '');
+  }
 
   const user = await getUser(request, env);
   if (!user) return err('Sessão expirada ou acesso não autorizado.', 401);
@@ -46,6 +84,7 @@ async function api(request, env, url) {
   let m;
   if (path === '/api/me' && method === 'GET') return me(env, user);
   if (path === '/api/change-password' && method === 'POST') return changePassword(request, env, user);
+  if (user.role === 'courier') return courierSessionApi(request, env, url, user, path);
   if (path === '/api/dashboard' && method === 'GET') return dashboard(env, user);
   if (path === '/api/alerts' && method === 'GET') return requireAdmin(user, () => pendingAlerts(env, user));
   m = path.match(/^\/api\/alerts\/(\d+)\/ack$/);
@@ -83,9 +122,11 @@ async function api(request, env, url) {
   if (m && method === 'GET') return requireTutor(user, () => tutorResultDetail(env, user, Number(m[1])));
 
   if (path === '/api/couriers' && method === 'GET') return requireAdmin(user, () => listCouriers(env));
-  if (path === '/api/couriers' && method === 'POST') return requireAdminOnly(user, () => createCourier(request, env, user, url));
+  if (path === '/api/couriers' && method === 'POST') return requireAdminOnly(user, () => createCourier(request, env, user));
   m = path.match(/^\/api\/couriers\/(\d+)$/);
   if (m && method === 'PATCH') return requireAdminOnly(user, () => updateCourier(request, env, user, Number(m[1])));
+  m = path.match(/^\/api\/couriers\/(\d+)\/reset-password$/);
+  if (m && method === 'POST') return requireAdminOnly(user, () => resetCourierPassword(request, env, user, Number(m[1])));
   m = path.match(/^\/api\/couriers\/(\d+)\/regenerate-link$/);
   if (m && method === 'POST') return requireAdminOnly(user, () => regenerateCourierLink(env, user, Number(m[1]), url));
 
@@ -184,6 +225,7 @@ async function me(env, user) {
   let technician = null;
   let clientMember = null;
   let tutorProfile = null;
+  let courierProfile = null;
   if (user.role === 'client') {
     profile = await env.DB.prepare(`SELECT id,name,legal_name,document,phone,email,address,city,state,zip_code,active FROM clients WHERE id=?`).bind(user.client_id).first();
     clientMember = await env.DB.prepare(`SELECT id,name,can_manage_users,is_technician,function_title,council_name,council_number,council_state,stamp_color,active FROM client_members WHERE user_id=?`).bind(user.id).first();
@@ -191,6 +233,8 @@ async function me(env, user) {
     technician = await env.DB.prepare(`SELECT id,name,location,active FROM receivers WHERE user_id=?`).bind(user.id).first();
   } else if (user.role === 'tutor') {
     tutorProfile = await env.DB.prepare(`SELECT t.id,t.client_id,t.name,t.document,t.phone,t.email,t.active,c.name AS client_name FROM tutors t JOIN clients c ON c.id=t.client_id WHERE t.id=?`).bind(user.tutor_id).first();
+  } else if (user.role === 'courier') {
+    courierProfile = await env.DB.prepare(`SELECT id,name,phone,thermometer_code,active FROM couriers WHERE id=? AND user_id=?`).bind(user.courier_id,user.id).first();
   }
   return ok({ user: {
     id: user.id, role: user.role, username: user.username_display,
@@ -204,8 +248,10 @@ async function me(env, user) {
     clientCouncilState: clientMember?.council_state || user.council_state || null,
     technicianId: technician?.id || null, technicianName: technician?.name || null, technicianLocation: technician?.location || null,
     tutorId: tutorProfile?.id || user.tutor_id || null, tutorName: tutorProfile?.name || user.tutor_name || null,
-    tutorClientId: tutorProfile?.client_id || user.tutor_client_id || null, tutorClientName: tutorProfile?.client_name || null
-  }, profile, clientMember, tutorProfile });
+    tutorClientId: tutorProfile?.client_id || user.tutor_client_id || null, tutorClientName: tutorProfile?.client_name || null,
+    courierId: courierProfile?.id || user.courier_id || null, courierName: courierProfile?.name || user.courier_name || null,
+    courierPhone: courierProfile?.phone || user.courier_phone || null, courierThermometer: courierProfile?.thermometer_code || user.courier_thermometer_code || null
+  }, profile, clientMember, tutorProfile, courierProfile });
 }
 
 async function changePassword(request, env, user) {
@@ -557,7 +603,13 @@ async function tutorResultDetail(env,user,id){
 }
 
 async function listCouriers(env){
-  const rows=await env.DB.prepare('SELECT id,name,phone,token_last4,thermometer_code,active,created_at,updated_at FROM couriers ORDER BY active DESC,name COLLATE NOCASE').all();
+  const rows=await env.DB.prepare(`
+    SELECT c.id,c.name,c.phone,c.token_last4,c.thermometer_code,c.active,c.user_id,c.created_at,c.updated_at,
+           u.username_display,u.force_password_change,u.active AS user_active
+    FROM couriers c
+    LEFT JOIN users u ON u.id=c.user_id
+    ORDER BY c.active DESC,c.name COLLATE NOCASE
+  `).all();
   return ok({couriers:rows.results||[]});
 }
 
@@ -568,25 +620,79 @@ function normalizeThermometer(v){
   return m ? `TER-${String(Number(m[1])).padStart(3,'0')}` : raw;
 }
 
-async function createCourier(request,env,user,url){
-  const b=await safeBody(request); const name=clampString(b?.name,160); if(!name) return err('Informe o nome do entregador.');
+async function createCourier(request,env,user){
+  const b=await safeBody(request);
+  const name=clampString(b?.name,160), username=clampString(b?.username,120), password=String(b?.password||'');
+  if(!name||!username||password.length<8)return err('Nome, usuário e senha inicial do entregador (mínimo 8 caracteres) são obrigatórios.');
   const thermometer=normalizeThermometer(b?.thermometerCode);
-  if(!/^TER-\d{3,4}$/.test(thermometer)) return err('Informe o termômetro no padrão TER-001.');
+  if(!/^TER-\d{3,4}$/.test(thermometer))return err('Informe o termômetro no padrão TER-001.');
   const used=await env.DB.prepare(`SELECT id,name FROM couriers WHERE active=1 AND thermometer_code=?`).bind(thermometer).first();
   if(used)return err(`O ${thermometer} já está vinculado a ${used.name}. Desative ou altere o entregador anterior antes de reutilizar o termômetro.`,409);
-  const token=randomToken(30), hash=await sha256(token);
-  const r=await env.DB.prepare('INSERT INTO couriers(name,phone,token_hash,token_last4,thermometer_code,active) VALUES(?,?,?,?,?,1)').bind(name,clampString(b.phone,40),hash,token.slice(-4),thermometer).run();
-  await audit(env,user,'criou_entregador','courier',r.meta.last_row_id,{name,thermometer});
-  return ok({id:r.meta.last_row_id,link:courierLink(url,token),message:`Entregador cadastrado com o termômetro ${thermometer}. Copie e guarde o link privado.`});
+  const key=normalizeUsername(username);
+  if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse usuário já existe.',409);
+  const {hash:passwordHash,salt}=await hashPassword(password);
+  const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('staff',?,?,?,?,1,1)`).bind(username,key,passwordHash,salt).run();
+  const userId=u.meta.last_row_id;
+  try{
+    // Mantemos um token legado aleatório apenas por compatibilidade com a estrutura antiga do banco.
+    // O acesso principal do entregador passa a ser usuário e senha.
+    const legacyToken=randomToken(30), legacyHash=await sha256(legacyToken);
+    const r=await env.DB.prepare('INSERT INTO couriers(user_id,name,phone,token_hash,token_last4,thermometer_code,active) VALUES(?,?,?,?,?,?,1)')
+      .bind(userId,name,clampString(b.phone,40),legacyHash,legacyToken.slice(-4),thermometer).run();
+    await audit(env,user,'criou_entregador','courier',r.meta.last_row_id,{name,username,thermometer});
+    return ok({id:r.meta.last_row_id,message:`Entregador cadastrado. Login: ${username}. No primeiro acesso ele deverá trocar a senha.`});
+  }catch(e){
+    await env.DB.prepare('DELETE FROM users WHERE id=?').bind(userId).run();
+    throw e;
+  }
 }
 
 async function updateCourier(request,env,user,id){
-  const b=await safeBody(request); const c=await env.DB.prepare('SELECT * FROM couriers WHERE id=?').bind(id).first(); if(!c)return err('Entregador não encontrado.',404);
-  const active=b.active==null?c.active:boolInt(b.active), thermometer=normalizeThermometer(b.thermometerCode??c.thermometer_code);
-  if(active && !/^TER-\d{3,4}$/.test(thermometer)) return err('Informe o termômetro no padrão TER-001.');
-  if(active){const used=await env.DB.prepare(`SELECT id,name FROM couriers WHERE active=1 AND thermometer_code=? AND id<>?`).bind(thermometer,id).first();if(used)return err(`O ${thermometer} já está vinculado a ${used.name}.`,409);}
-  await env.DB.prepare('UPDATE couriers SET name=?,phone=?,thermometer_code=?,active=?,updated_at=? WHERE id=?').bind(clampString(b.name??c.name,160),clampString(b.phone??c.phone,40),thermometer||null,active,nowIso(),id).run();
-  await audit(env,user,'editou_entregador','courier',id,{thermometer}); return ok({message:'Entregador atualizado. O histórico anterior permanece com o nome e termômetro gravados no momento da coleta.'});
+  const b=await safeBody(request);
+  const c=await env.DB.prepare(`SELECT c.*,u.username_display FROM couriers c LEFT JOIN users u ON u.id=c.user_id WHERE c.id=?`).bind(id).first();
+  if(!c)return err('Entregador não encontrado.',404);
+  const active=b.active==null?c.active:boolInt(b.active);
+  const thermometer=normalizeThermometer(b.thermometerCode??c.thermometer_code);
+  if(active&&!/^TER-\d{3,4}$/.test(thermometer))return err('Informe o termômetro no padrão TER-001.');
+  if(active){
+    const used=await env.DB.prepare(`SELECT id,name FROM couriers WHERE active=1 AND thermometer_code=? AND id<>?`).bind(thermometer,id).first();
+    if(used)return err(`O ${thermometer} já está vinculado a ${used.name}.`,409);
+  }
+
+  let userId=c.user_id;
+  const username=clampString(b.username??c.username_display,120);
+  if(!userId){
+    const password=String(b.password||'');
+    if(!username||password.length<8)return err('Este entregador ainda usa o acesso antigo. Informe usuário e uma senha temporária com pelo menos 8 caracteres para ativar o login.');
+    const key=normalizeUsername(username);
+    if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse usuário já existe.',409);
+    const {hash,salt}=await hashPassword(password);
+    const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('staff',?,?,?,?,1,?)`).bind(username,key,hash,salt,active).run();
+    userId=u.meta.last_row_id;
+  }else{
+    if(!username)return err('Informe o usuário de login.');
+    const key=normalizeUsername(username);
+    const dup=await env.DB.prepare('SELECT id FROM users WHERE username_key=? AND id<>?').bind(key,userId).first();
+    if(dup)return err('Esse usuário já está em uso.',409);
+    await env.DB.prepare('UPDATE users SET username_display=?,username_key=?,active=?,updated_at=? WHERE id=?').bind(username,key,active,nowIso(),userId).run();
+    if(!active)await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(userId).run();
+  }
+
+  await env.DB.prepare('UPDATE couriers SET user_id=?,name=?,phone=?,thermometer_code=?,active=?,updated_at=? WHERE id=?')
+    .bind(userId,clampString(b.name??c.name,160),clampString(b.phone??c.phone,40),thermometer||null,active,nowIso(),id).run();
+  await audit(env,user,'editou_entregador','courier',id,{username,thermometer,active});
+  return ok({message:'Entregador atualizado. O acesso principal agora é por usuário e senha; o histórico anterior foi preservado.'});
+}
+
+async function resetCourierPassword(request,env,user,id){
+  const b=await safeBody(request),pwd=String(b?.password||'');
+  if(pwd.length<8)return err('A senha temporária deve ter pelo menos 8 caracteres.');
+  const c=await env.DB.prepare('SELECT user_id,name FROM couriers WHERE id=?').bind(id).first();
+  if(!c||!c.user_id)return err('Este entregador ainda não possui login. Edite o cadastro e informe usuário e senha inicial.',404);
+  await setPassword(env,c.user_id,pwd,true);
+  await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(c.user_id).run();
+  await audit(env,user,'redefiniu_senha_entregador','courier',id,{name:c.name});
+  return ok({message:'Senha temporária definida. O entregador deverá trocá-la no próximo login.'});
 }
 
 async function regenerateCourierLink(env,user,id,url){
@@ -594,7 +700,7 @@ async function regenerateCourierLink(env,user,id,url){
   const token=randomToken(30), hash=await sha256(token);
   await env.DB.prepare('UPDATE couriers SET token_hash=?,token_last4=?,updated_at=? WHERE id=?').bind(hash,token.slice(-4),nowIso(),id).run();
   await audit(env,user,'regenerou_link_entregador','courier',id);
-  return ok({link:courierLink(url,token),message:'Novo link criado. O link anterior deixou de funcionar.'});
+  return ok({link:courierLink(url,token),message:'Link legado regenerado. O login por usuário e senha continua sendo o acesso principal.'});
 }
 function courierLink(url,token){return `${url.origin}/?entregador=${encodeURIComponent(token)}`;}
 
@@ -685,10 +791,15 @@ async function createRequisition(request,env,user){
     const dt=new Date(String(b.scheduledAt||''));if(!Number.isFinite(dt.getTime()))return err('Informe a data e hora do agendamento.');
     if(dt.getTime()<Date.now()-60000)return err('O agendamento deve ser para um horário futuro.');scheduledAt=dt.toISOString();
   }
+  const birthDate=clampString(b.birthDate,20);
+  const collectionDate=clampString(b.collectionDate,20);
+  if(birthDate&&collectionDate&&!exactAgeText(birthDate,collectionDate))return err('A data de nascimento não pode ser posterior à data prevista da coleta.');
+  const ageText=clampString(b.ageText,60)||exactAgeText(birthDate,collectionDate||fortalezaToday());
+
   const tempProto=`TEMP-${crypto.randomUUID()}`;
   const requesterName=member?.name||user.username_display;
   const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,clinic_name,veterinarian_name,crmv,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at,requested_by_user_id,requested_by_name) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .bind(tempProto,clientId,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),clampString(b.birthDate,20),clampString(b.ageText,60),clampString(b.collectionDate,20),clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
+    .bind(tempProto,clientId,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),birthDate,ageText,collectionDate,clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
   const id=ins.meta.last_row_id, proto=protocolCode(id,new Date());
   const statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,id)];
   let missingPriceCount=0;
@@ -1009,7 +1120,20 @@ async function listCancellations(env,url){
 async function listAudit(env,url){const limit=Math.min(500,Math.max(1,Number(url.searchParams.get('limit')||200)));const rows=await env.DB.prepare('SELECT * FROM audit_log ORDER BY created_at DESC LIMIT ?').bind(limit).all();return ok({events:(rows.results||[]).map(x=>({...x,details:parseJson(x.details_json)}))});}
 
 async function courierApi(request,env,url,token,rest){
-  const hash=await sha256(token), courier=await env.DB.prepare('SELECT id,name,phone,thermometer_code,active FROM couriers WHERE token_hash=?').bind(hash).first(); if(!courier||!courier.active)return err('Link de entregador inválido ou desativado.',403);
+  const hash=await sha256(token);
+  const courier=await env.DB.prepare('SELECT id,user_id,name,phone,thermometer_code,active FROM couriers WHERE token_hash=?').bind(hash).first();
+  if(!courier||!courier.active)return err('Link de entregador inválido ou desativado.',403);
+  return courierOperations(request,env,url,courier,rest);
+}
+
+async function courierSessionApi(request,env,url,user,path){
+  const courier=await env.DB.prepare('SELECT id,user_id,name,phone,thermometer_code,active FROM couriers WHERE id=? AND user_id=?').bind(user.courier_id,user.id).first();
+  if(!courier||!courier.active)return err('Acesso do entregador desativado.',403);
+  const rest=path.replace(/^\/api\/courier\/?/,'');
+  return courierOperations(request,env,url,courier,rest);
+}
+
+async function courierOperations(request,env,url,courier,rest){
   const method=request.method.toUpperCase();
   if((rest===''||rest==='tasks')&&method==='GET'){
     const from=url.searchParams.get('from'),to=url.searchParams.get('to'),tab=url.searchParams.get('tab')||'pending';
@@ -1028,7 +1152,7 @@ async function courierApi(request,env,url,token,rest){
       env.DB.prepare(`UPDATE requisitions SET courier_accepted_at=?,courier_accepted_name=?,updated_at=? WHERE id=?`).bind(ts,courier.name,ts,id),
       env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',NULL,?,?,?)`).bind(id,courier.name,JSON.stringify({message:'Coleta aceita pelo entregador',courier:courier.name}),ts)
     ]);
-    await audit(env,{name:courier.name},'aceitou_coleta','requisition',id,{protocol:r.protocol,client:r.client_name});
+    await audit(env,{id:courier.user_id||null,username_display:courier.name,name:courier.name},'aceitou_coleta','requisition',id,{protocol:r.protocol,client:r.client_name});
     return ok({message:'Coleta aceita. O toque foi encerrado para esta solicitação.',acceptedAt:ts});
   }
 
@@ -1037,10 +1161,9 @@ async function courierApi(request,env,url,token,rest){
     const r=await env.DB.prepare(`SELECT r.*,c.name client_name,c.address,c.city,c.state,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=? AND r.assigned_courier_id=?`).bind(id,courier.id).first(); if(!r)return err('Coleta não encontrada para este entregador.',404);if(r.status!=='atribuido')return err('Essa coleta já foi movimentada ou não está pendente.');if(!r.courier_accepted_at)return err('Aceite a coleta antes de registrar a retirada.',409);
     const ts=nowIso(),sentBy=clampString(b.sentByName,160)||'Responsável no local',loc=clampString(b.sentFromLocation,250)||r.client_name;
     await env.DB.batch([env.DB.prepare(`UPDATE requisitions SET status='coletado',collected_at=?,collection_temperature=?,sent_by_name=?,sent_from_location=?,transport_courier_name=?,transport_thermometer_code=?,updated_at=? WHERE id=?`).bind(ts,temp,sentBy,loc,courier.name,r.thermometer_code||null,ts,id),env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'coletado',NULL,?,?,?)`).bind(id,courier.name,JSON.stringify({temperature:temp,sentBy,location:loc}),ts)]);
-    await audit(env,{name:courier.name},'coletou_amostra','requisition',id,{temperature:temp,sentBy,location:loc}); return ok({message:'Coleta registrada. O item foi movido para o histórico de coletados.',collectedAt:ts});
+    await audit(env,{id:courier.user_id||null,username_display:courier.name,name:courier.name},'coletou_amostra','requisition',id,{temperature:temp,sentBy,location:loc}); return ok({message:'Coleta registrada. O item foi movido para o histórico de coletados.',collectedAt:ts});
   }
   return err('Rota de entregador não encontrada.',404);
 }
 
-async function safeBody(request){try{return await request.json();}catch{return null;}}
 function parseJson(s){try{return s?JSON.parse(s):null;}catch{return null;}}
