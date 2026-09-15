@@ -48,7 +48,6 @@ async function showApp(){
 }
 
 $('#loginForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget);try{await api('/api/login',{json:Object.fromEntries(f)});const m=await api('/api/me');state.me=m.user;state.profile=m.profile;showApp();toast('Acesso realizado.');}catch(err){toast(err.message,'error')}});
-$('#setupForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget);try{const r=await api('/api/setup',{json:Object.fromEntries(f)});toast(r.message);e.currentTarget.reset();}catch(err){toast(err.message,'error')}});
 $('#logoutBtn').addEventListener('click',async()=>{try{await api('/api/logout',{method:'POST'})}catch{} state.me=null;showLogin();});
 $('#menuBtn').addEventListener('click',()=>$('.sidebar').classList.toggle('open'));
 
