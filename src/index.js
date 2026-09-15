@@ -630,7 +630,7 @@ async function assignCourier(request,env,user,id){
   if(!r)return err('Requisição não encontrada.',404); if(!c)return err('Entregador não encontrado ou inativo.',404); if(['recebido','em_analise','concluido','cancelado'].includes(r.status))return err('Não é possível atribuir entregador nesse status.');
   if(!r.accepted_at)return err('Aceite a solicitação antes de atribuir o entregador.');
   const ts=nowIso(); await env.DB.batch([
-    env.DB.prepare(`UPDATE requisitions SET assigned_courier_id=?,assigned_at=?,status='atribuido',updated_at=? WHERE id=?`).bind(courierId,ts,ts,id),
+    env.DB.prepare(`UPDATE requisitions SET assigned_courier_id=?,assigned_at=?,courier_accepted_at=NULL,courier_accepted_name=NULL,status='atribuido',updated_at=? WHERE id=?`).bind(courierId,ts,ts,id),
     env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({courier:c.name,thermometer:c.thermometer_code}),ts)
   ]);
   await audit(env,user,'atribuiu_entregador','requisition',id,{courierId,courier:c.name,thermometer:c.thermometer_code});return ok({message:`${c.name} atribuído à coleta (${c.thermometer_code||'sem termômetro'}).`});
@@ -848,13 +848,28 @@ async function courierApi(request,env,url,token,rest){
   const method=request.method.toUpperCase();
   if((rest===''||rest==='tasks')&&method==='GET'){
     const from=url.searchParams.get('from'),to=url.searchParams.get('to'),tab=url.searchParams.get('tab')||'pending';
-    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,c.name client_name,c.address,c.city,c.state,c.phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
+    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.courier_accepted_at,r.courier_accepted_name,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,c.name client_name,c.address,c.city,c.state,c.phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
     const p=[courier.id]; if(tab==='collected')sql+=` AND r.status IN ('coletado','recebido','em_analise','concluido')`; else sql+=` AND r.status='atribuido'`; if(from){sql+=' AND date(COALESCE(r.collected_at,r.assigned_at,r.created_at))>=date(?)';p.push(from);} if(to){sql+=' AND date(COALESCE(r.collected_at,r.assigned_at,r.created_at))<=date(?)';p.push(to);} sql+=' ORDER BY COALESCE(r.assigned_at,r.created_at) DESC';
     const rows=await env.DB.prepare(sql).bind(...p).all(); return ok({courier,tasks:rows.results||[]});
   }
+  const acceptMatch=rest.match(/^requisitions\/(\d+)\/accept$/); if(acceptMatch&&method==='POST'){
+    const id=Number(acceptMatch[1]);
+    const r=await env.DB.prepare(`SELECT r.id,r.protocol,r.status,r.courier_accepted_at,c.name client_name FROM requisitions r JOIN clients c ON c.id=r.client_id WHERE r.id=? AND r.assigned_courier_id=?`).bind(id,courier.id).first();
+    if(!r)return err('Coleta não encontrada para este entregador.',404);
+    if(r.status!=='atribuido')return err('Essa coleta já foi movimentada ou não está mais pendente.',409);
+    if(r.courier_accepted_at)return ok({message:'Coleta já aceita.',acceptedAt:r.courier_accepted_at});
+    const ts=nowIso();
+    await env.DB.batch([
+      env.DB.prepare(`UPDATE requisitions SET courier_accepted_at=?,courier_accepted_name=?,updated_at=? WHERE id=?`).bind(ts,courier.name,ts,id),
+      env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',NULL,?,?,?)`).bind(id,courier.name,JSON.stringify({message:'Coleta aceita pelo entregador',courier:courier.name}),ts)
+    ]);
+    await audit(env,{name:courier.name},'aceitou_coleta','requisition',id,{protocol:r.protocol,client:r.client_name});
+    return ok({message:'Coleta aceita. O toque foi encerrado para esta solicitação.',acceptedAt:ts});
+  }
+
   const m=rest.match(/^requisitions\/(\d+)\/collect$/); if(m&&method==='POST'){
     const id=Number(m[1]),b=await safeBody(request),temp=parseNumber(b?.temperature); if(temp==null)return err('Informe a temperatura da coleta.');
-    const r=await env.DB.prepare(`SELECT r.*,c.name client_name,c.address,c.city,c.state,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=? AND r.assigned_courier_id=?`).bind(id,courier.id).first(); if(!r)return err('Coleta não encontrada para este entregador.',404);if(r.status!=='atribuido')return err('Essa coleta já foi movimentada ou não está pendente.');
+    const r=await env.DB.prepare(`SELECT r.*,c.name client_name,c.address,c.city,c.state,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=? AND r.assigned_courier_id=?`).bind(id,courier.id).first(); if(!r)return err('Coleta não encontrada para este entregador.',404);if(r.status!=='atribuido')return err('Essa coleta já foi movimentada ou não está pendente.');if(!r.courier_accepted_at)return err('Aceite a coleta antes de registrar a retirada.',409);
     const ts=nowIso(),sentBy=clampString(b.sentByName,160)||'Responsável no local',loc=clampString(b.sentFromLocation,250)||r.client_name;
     await env.DB.batch([env.DB.prepare(`UPDATE requisitions SET status='coletado',collected_at=?,collection_temperature=?,sent_by_name=?,sent_from_location=?,transport_courier_name=?,transport_thermometer_code=?,updated_at=? WHERE id=?`).bind(ts,temp,sentBy,loc,courier.name,r.thermometer_code||null,ts,id),env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'coletado',NULL,?,?,?)`).bind(id,courier.name,JSON.stringify({temperature:temp,sentBy,location:loc}),ts)]);
     await audit(env,{name:courier.name},'coletou_amostra','requisition',id,{temperature:temp,sentBy,location:loc}); return ok({message:'Coleta registrada. O item foi movido para o histórico de coletados.',collectedAt:ts});
