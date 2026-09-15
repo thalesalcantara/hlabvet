@@ -70,6 +70,18 @@ async function api(request, env, url) {
   m = path.match(/^\/api\/client-users\/(\d+)\/reset-password$/);
   if (m && method === 'POST') return requireClientManager(user, () => resetClientUserPassword(request, env, user, Number(m[1])));
 
+  if (path === '/api/tutors' && method === 'GET') return requireClient(user, () => listTutors(env, user));
+  if (path === '/api/tutors' && method === 'POST') return requireClient(user, () => createTutor(request, env, user));
+  m = path.match(/^\/api\/tutors\/(\d+)$/);
+  if (m && method === 'PATCH') return requireClientManager(user, () => updateTutor(request, env, user, Number(m[1])));
+  if (m && method === 'DELETE') return requireClientManager(user, () => deleteTutor(env, user, Number(m[1])));
+  m = path.match(/^\/api\/tutors\/(\d+)\/reset-password$/);
+  if (m && method === 'POST') return requireClientManager(user, () => resetTutorPassword(request, env, user, Number(m[1])));
+
+  if (path === '/api/tutor/results' && method === 'GET') return requireTutor(user, () => tutorResults(env, user));
+  m = path.match(/^\/api\/tutor\/results\/(\d+)$/);
+  if (m && method === 'GET') return requireTutor(user, () => tutorResultDetail(env, user, Number(m[1])));
+
   if (path === '/api/couriers' && method === 'GET') return requireAdmin(user, () => listCouriers(env));
   if (path === '/api/couriers' && method === 'POST') return requireAdminOnly(user, () => createCourier(request, env, user, url));
   m = path.match(/^\/api\/couriers\/(\d+)$/);
@@ -107,6 +119,8 @@ async function api(request, env, url) {
 
   m = path.match(/^\/api\/results\/(\d+)\/(download|view)$/);
   if (m && method === 'GET') return downloadResult(env, user, Number(m[1]), m[2] === 'view');
+  m = path.match(/^\/api\/results\/(\d+)$/);
+  if (m && method === 'DELETE') return requireAdmin(user, () => deleteResult(env, user, Number(m[1])));
 
   if (path === '/api/temperature-sheet' && method === 'GET') return requireAdmin(user, () => temperatureSheet(env, user, url));
   if (path === '/api/cancellations' && method === 'GET') return requireAdmin(user, () => listCancellations(env, url));
@@ -133,7 +147,10 @@ function requireClient(user, fn) {
 function requireClientManager(user, fn) {
   return user.role === 'client' && Number(user.can_manage_client_users) === 1
     ? fn()
-    : err('Somente o usuário principal do cliente pode administrar usuários e técnicos.', 403);
+    : err('Somente o usuário principal do cliente pode administrar usuários, técnicos e tutores.', 403);
+}
+function requireTutor(user, fn) {
+  return user.role === 'tutor' ? fn() : err('Acesso permitido somente ao tutor / cliente final.', 403);
 }
 
 async function audit(env, user, action, entityType = null, entityId = null, details = null) {
@@ -166,11 +183,14 @@ async function me(env, user) {
   let profile = null;
   let technician = null;
   let clientMember = null;
+  let tutorProfile = null;
   if (user.role === 'client') {
     profile = await env.DB.prepare(`SELECT id,name,legal_name,document,phone,email,address,city,state,zip_code,active FROM clients WHERE id=?`).bind(user.client_id).first();
     clientMember = await env.DB.prepare(`SELECT id,name,can_manage_users,is_technician,function_title,council_name,council_number,council_state,stamp_color,active FROM client_members WHERE user_id=?`).bind(user.id).first();
   } else if (user.role === 'staff') {
     technician = await env.DB.prepare(`SELECT id,name,location,active FROM receivers WHERE user_id=?`).bind(user.id).first();
+  } else if (user.role === 'tutor') {
+    tutorProfile = await env.DB.prepare(`SELECT t.id,t.client_id,t.name,t.document,t.phone,t.email,t.active,c.name AS client_name FROM tutors t JOIN clients c ON c.id=t.client_id WHERE t.id=?`).bind(user.tutor_id).first();
   }
   return ok({ user: {
     id: user.id, role: user.role, username: user.username_display,
@@ -182,8 +202,10 @@ async function me(env, user) {
     clientCouncil: clientMember?.council_name || user.council_name || null,
     clientCouncilNumber: clientMember?.council_number || user.council_number || null,
     clientCouncilState: clientMember?.council_state || user.council_state || null,
-    technicianId: technician?.id || null, technicianName: technician?.name || null, technicianLocation: technician?.location || null
-  }, profile, clientMember });
+    technicianId: technician?.id || null, technicianName: technician?.name || null, technicianLocation: technician?.location || null,
+    tutorId: tutorProfile?.id || user.tutor_id || null, tutorName: tutorProfile?.name || user.tutor_name || null,
+    tutorClientId: tutorProfile?.client_id || user.tutor_client_id || null, tutorClientName: tutorProfile?.client_name || null
+  }, profile, clientMember, tutorProfile });
 }
 
 async function changePassword(request, env, user) {
@@ -200,6 +222,7 @@ async function changePassword(request, env, user) {
 }
 
 async function dashboard(env, user) {
+  if(user.role==='tutor') return tutorDashboard(env,user);
   const p=[];
   let where=` WHERE date(datetime(r.created_at,'-3 hours'))=date('now','-3 hours')`;
   if(user.role==='client'){where+=' AND r.client_id=?';p.push(user.client_id);}
@@ -207,13 +230,23 @@ async function dashboard(env, user) {
   const totals = Object.fromEntries((rows.results || []).map(r => [r.status, r.n]));
   const recent = await env.DB.prepare(`
     SELECT r.id,r.protocol,r.patient_name,r.tutor_name,r.status,r.created_at,r.request_kind,r.scheduled_at,r.accepted_at,
-           (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) result_count,
+           CASE WHEN r.status='cancelado' THEN 0 ELSE (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) END result_count,
            c.name client_name
     FROM requisitions r JOIN clients c ON c.id=r.client_id
     ${where}
     ORDER BY COALESCE(r.scheduled_at,r.created_at) DESC LIMIT 20
   `).bind(...p).all();
   return ok({ totals, recent: recent.results || [], day: new Date(Date.now()-3*3600000).toISOString().slice(0,10) });
+}
+
+async function tutorDashboard(env,user){
+  const row=await env.DB.prepare(`
+    SELECT COUNT(DISTINCT r.id) total_results
+    FROM requisitions r
+    JOIN result_files rf ON rf.requisition_id=r.id
+    WHERE r.tutor_account_id=? AND r.status<>'cancelado'
+  `).bind(user.tutor_id).first();
+  return ok({ tutor:true, totalResults:Number(row?.total_results||0) });
 }
 
 async function pendingAlerts(env,user){
@@ -424,6 +457,105 @@ async function resetClientUserPassword(request,env,user,id){
   await audit(env,user,'redefiniu_senha_usuario_cliente','client_member',id,{name:row.name});return ok({message:'Senha temporária definida. O usuário deverá trocá-la no próximo login.'});
 }
 
+
+async function listTutors(env,user){
+  let sql=`SELECT t.id,t.client_id,t.user_id,t.name,t.document,t.phone,t.email,t.active,t.created_at,t.updated_at,u.username_display,u.force_password_change,u.active AS user_active
+           FROM tutors t JOIN users u ON u.id=t.user_id WHERE t.client_id=?`;
+  const params=[user.client_id];
+  if(!Number(user.can_manage_client_users)) sql+=' AND t.active=1';
+  sql+=' ORDER BY t.active DESC,t.name COLLATE NOCASE';
+  const rows=await env.DB.prepare(sql).bind(...params).all();
+  return ok({tutors:rows.results||[]});
+}
+
+async function createTutor(request,env,user){
+  const b=await safeBody(request);
+  const name=clampString(b?.name,160),username=clampString(b?.username,120),password=String(b?.password||'');
+  if(!name||!username||password.length<8)return err('Nome, usuário e senha inicial com pelo menos 8 caracteres são obrigatórios.');
+  const key=normalizeUsername(username);
+  if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse nome de usuário já existe.',409);
+  const {hash,salt}=await hashPassword(password);
+  const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('client',?,?,?,?,1,1)`)
+    .bind(username,key,hash,salt).run();
+  const t=await env.DB.prepare(`INSERT INTO tutors(client_id,user_id,name,document,phone,email,active) VALUES(?,?,?,?,?,?,1)`)
+    .bind(user.client_id,u.meta.last_row_id,name,clampString(b?.document,60),clampString(b?.phone,40),clampString(b?.email,200)).run();
+  await audit(env,user,'criou_tutor_cliente_final','tutor',t.meta.last_row_id,{name,username,clientId:user.client_id});
+  return ok({id:t.meta.last_row_id,message:'Tutor / cliente final cadastrado. Ele verá somente os resultados vinculados a ele.'});
+}
+
+async function updateTutor(request,env,user,id){
+  const b=await safeBody(request);
+  const row=await env.DB.prepare(`SELECT t.*,u.username_display FROM tutors t JOIN users u ON u.id=t.user_id WHERE t.id=? AND t.client_id=?`).bind(id,user.client_id).first();
+  if(!row)return err('Tutor não encontrado.',404);
+  const name=clampString(b?.name??row.name,160),username=clampString(b?.username??row.username_display,120),key=normalizeUsername(username);
+  if(!name||!username)return err('Nome e usuário são obrigatórios.');
+  const dup=await env.DB.prepare('SELECT id FROM users WHERE username_key=? AND id<>?').bind(key,row.user_id).first();
+  if(dup)return err('Esse nome de usuário já está em uso.',409);
+  const active=b.active==null?row.active:boolInt(b.active);
+  const ts=nowIso();
+  await env.DB.batch([
+    env.DB.prepare('UPDATE users SET username_display=?,username_key=?,active=?,updated_at=? WHERE id=?').bind(username,key,active,ts,row.user_id),
+    env.DB.prepare('UPDATE tutors SET name=?,document=?,phone=?,email=?,active=?,updated_at=? WHERE id=?')
+      .bind(name,clampString(b?.document??row.document,60),clampString(b?.phone??row.phone,40),clampString(b?.email??row.email,200),active,ts,id)
+  ]);
+  if(!active)await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(row.user_id).run();
+  await audit(env,user,'editou_tutor_cliente_final','tutor',id,{name,username,active:!!active});
+  return ok({message:'Tutor / cliente final atualizado.'});
+}
+
+async function deleteTutor(env,user,id){
+  const row=await env.DB.prepare('SELECT id,user_id,name FROM tutors WHERE id=? AND client_id=?').bind(id,user.client_id).first();
+  if(!row)return err('Tutor não encontrado.',404);
+  const ts=nowIso();
+  await env.DB.batch([
+    env.DB.prepare('UPDATE tutors SET active=0,updated_at=? WHERE id=?').bind(ts,id),
+    env.DB.prepare('UPDATE users SET active=0,updated_at=? WHERE id=?').bind(ts,row.user_id),
+    env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(row.user_id)
+  ]);
+  await audit(env,user,'desativou_tutor_cliente_final','tutor',id,{name:row.name});
+  return ok({message:'Tutor desativado. Os resultados antigos continuam vinculados ao histórico.'});
+}
+
+async function resetTutorPassword(request,env,user,id){
+  const b=await safeBody(request),pwd=String(b?.password||'');
+  if(pwd.length<8)return err('A senha temporária deve ter pelo menos 8 caracteres.');
+  const row=await env.DB.prepare('SELECT user_id,name FROM tutors WHERE id=? AND client_id=?').bind(id,user.client_id).first();
+  if(!row)return err('Tutor não encontrado.',404);
+  await setPassword(env,row.user_id,pwd,true);
+  await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(row.user_id).run();
+  await audit(env,user,'redefiniu_senha_tutor','tutor',id,{name:row.name});
+  return ok({message:'Senha temporária definida. O tutor deverá trocá-la no próximo login.'});
+}
+
+async function tutorResults(env,user){
+  const rows=await env.DB.prepare(`
+    SELECT r.id,r.protocol,r.patient_name,r.species,r.breed,r.sex,r.birth_date,r.created_at,r.completed_at,
+           c.name client_name,COUNT(rf.id) result_count,MAX(rf.created_at) latest_result_at
+    FROM requisitions r
+    JOIN clients c ON c.id=r.client_id
+    JOIN result_files rf ON rf.requisition_id=r.id
+    WHERE r.tutor_account_id=? AND r.status<>'cancelado'
+    GROUP BY r.id,r.protocol,r.patient_name,r.species,r.breed,r.sex,r.birth_date,r.created_at,r.completed_at,c.name
+    ORDER BY latest_result_at DESC,r.id DESC
+  `).bind(user.tutor_id).all();
+  return ok({results:rows.results||[]});
+}
+
+async function tutorResultDetail(env,user,id){
+  const r=await env.DB.prepare(`
+    SELECT r.id,r.protocol,r.patient_name,r.species,r.breed,r.sex,r.birth_date,r.created_at,r.completed_at,c.name client_name
+    FROM requisitions r JOIN clients c ON c.id=r.client_id
+    WHERE r.id=? AND r.tutor_account_id=? AND r.status<>'cancelado'
+      AND EXISTS(SELECT 1 FROM result_files rf WHERE rf.requisition_id=r.id)
+  `).bind(id,user.tutor_id).first();
+  if(!r)return err('Resultado não encontrado para este acesso.',404);
+  const [ex,files]=await Promise.all([
+    env.DB.prepare('SELECT exam_name FROM requisition_exams WHERE requisition_id=? ORDER BY id').bind(id).all(),
+    env.DB.prepare('SELECT id,original_name,mime_type,size_bytes,created_at FROM result_files WHERE requisition_id=? ORDER BY created_at DESC,id DESC').bind(id).all()
+  ]);
+  return ok({requisition:r,exams:(ex.results||[]).map(x=>x.exam_name),files:files.results||[]});
+}
+
 async function listCouriers(env){
   const rows=await env.DB.prepare('SELECT id,name,phone,token_last4,thermometer_code,active,created_at,updated_at FROM couriers ORDER BY active DESC,name COLLATE NOCASE').all();
   return ok({couriers:rows.results||[]});
@@ -501,8 +633,9 @@ async function resetTechnicianPassword(request,env,user,id){
 }
 
 async function listRequisitions(env,user,url){
+  if(user.role==='tutor')return err('O tutor acessa somente os resultados liberados.',403);
   const filters={q:url.searchParams.get('q'),status:url.searchParams.get('status'),from:url.searchParams.get('from'),to:url.searchParams.get('to'),patient:url.searchParams.get('patient'),tutor:url.searchParams.get('tutor'),birth:url.searchParams.get('birth'),breed:url.searchParams.get('breed'),clientId:url.searchParams.get('clientId')};
-  let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.breed,r.birth_date,r.tutor_name,r.created_at,r.collection_date,r.assigned_at,r.collected_at,r.collection_temperature,r.lab_received_at,r.lab_received_temperature,r.analysis_started_at,r.completed_at,r.request_kind,r.scheduled_at,r.accepted_at,r.accepted_by_name,c.name client_name,co.name courier_name,(SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) result_count FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE 1=1`;
+  let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.breed,r.birth_date,r.tutor_name,r.created_at,r.collection_date,r.assigned_at,r.collected_at,r.collection_temperature,r.lab_received_at,r.lab_received_temperature,r.analysis_started_at,r.completed_at,r.request_kind,r.scheduled_at,r.accepted_at,r.accepted_by_name,c.name client_name,co.name courier_name,CASE WHEN r.status='cancelado' THEN 0 ELSE (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) END result_count FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE 1=1`;
   const p=[];
   if(user.role==='client'){sql+=' AND r.client_id=?';p.push(user.client_id);} else if(filters.clientId){sql+=' AND r.client_id=?';p.push(Number(filters.clientId));}
   if(filters.status){sql+=' AND r.status=?';p.push(filters.status);}
@@ -530,8 +663,13 @@ async function createRequisition(request,env,user){
   const selected=[]; for(const code of exams){const e=catalog.get(String(code));if(e)selected.push(e);} if(!selected.length)return err('Nenhum exame válido foi selecionado.');
   const materials=Array.isArray(b.materials)?b.materials.filter(x=>MATERIALS.includes(x)):[];
 
-  let member=null,stamp={};
+  let member=null,stamp={},tutorAccount=null;
   if(user.role==='client') member=await env.DB.prepare('SELECT * FROM client_members WHERE user_id=? AND client_id=? AND active=1').bind(user.id,clientId).first();
+  const tutorAccountId=Number(b.tutorAccountId||0);
+  if(tutorAccountId){
+    tutorAccount=await env.DB.prepare('SELECT id,name FROM tutors WHERE id=? AND client_id=? AND active=1').bind(tutorAccountId,clientId).first();
+    if(!tutorAccount)return err('Tutor / cliente final não encontrado ou não pertence a este cliente.',404);
+  }
   if(member?.is_technician){
     const council=[member.council_name||'CRMV',member.council_state].filter(Boolean).join('-');
     const registration=[council,member.council_number].filter(Boolean).join(' ');
@@ -539,6 +677,7 @@ async function createRequisition(request,env,user){
   }
   const veterinarianName=clampString(b.veterinarianName,160)||(member?.is_technician?member.name:null);
   const crmv=clampString(b.crmv,80)||(member?.is_technician?[member.council_name||'CRMV',member.council_state,member.council_number].filter(Boolean).join(' '):null);
+  const tutorName=tutorAccount?.name||clampString(b.tutorName,160);
 
   const requestKind=b.requestKind==='scheduled'?'scheduled':'immediate';
   let scheduledAt=null;
@@ -548,8 +687,8 @@ async function createRequisition(request,env,user){
   }
   const tempProto=`TEMP-${crypto.randomUUID()}`;
   const requesterName=member?.name||user.username_display;
-  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,clinic_name,veterinarian_name,crmv,tutor_name,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at,requested_by_user_id,requested_by_name) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .bind(tempProto,clientId,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,clampString(b.tutorName,160),patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),clampString(b.birthDate,20),clampString(b.ageText,60),clampString(b.collectionDate,20),clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
+  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,clinic_name,veterinarian_name,crmv,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at,requested_by_user_id,requested_by_name) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(tempProto,clientId,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),clampString(b.birthDate,20),clampString(b.ageText,60),clampString(b.collectionDate,20),clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
   const id=ins.meta.last_row_id, proto=protocolCode(id,new Date());
   const statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,id)];
   let missingPriceCount=0;
@@ -579,7 +718,8 @@ async function getRequisition(env,user,id){
     env.DB.prepare('SELECT status,actor_name,details_json,created_at FROM status_events WHERE requisition_id=? ORDER BY created_at,id').bind(id).all(),
     env.DB.prepare('SELECT id,original_name,mime_type,size_bytes,created_at FROM result_files WHERE requisition_id=? ORDER BY created_at DESC').bind(id).all()
   ]);
-  return ok({requisition:r,exams:ex.results||[],materials:(mat.results||[]).map(x=>x.material_name),events:(events.results||[]).map(e=>({...e,details:parseJson(e.details_json)})),files:files.results||[]});
+  const visibleFiles=(user.role==='client'&&r.status==='cancelado')?[]:(files.results||[]);
+  return ok({requisition:r,exams:ex.results||[],materials:(mat.results||[]).map(x=>x.material_name),events:(events.results||[]).map(e=>({...e,details:parseJson(e.details_json)})),files:visibleFiles});
 }
 
 async function deleteRequisitionExam(env,user,requisitionId,examId){
@@ -662,7 +802,6 @@ async function cancelRequisition(request,env,user,id){
   const r=await env.DB.prepare(`SELECT r.*,c.name client_name FROM requisitions r JOIN clients c ON c.id=r.client_id WHERE r.id=?`).bind(id).first();
   if(!r)return err('Requisição não encontrada.',404);
   if(r.status==='cancelado')return ok({message:'Essa solicitação já está cancelada.'});
-  if(r.status==='concluido')return err('Exame concluído não pode ser cancelado.');
 
   const isLab=ADMIN_ROLES.has(user.role);
   const isOwnClient=user.role==='client'&&Number(r.client_id)===Number(user.client_id);
@@ -691,7 +830,8 @@ async function cancelRequisition(request,env,user,id){
 
 
 async function uploadResult(request,env,user,id){
-  const r=await env.DB.prepare('SELECT id,protocol FROM requisitions WHERE id=?').bind(id).first(); if(!r)return err('Requisição não encontrada.',404);
+  const r=await env.DB.prepare('SELECT id,protocol,status FROM requisitions WHERE id=?').bind(id).first(); if(!r)return err('Requisição não encontrada.',404);
+  if(r.status==='cancelado')return err('Não é possível enviar resultado para uma solicitação cancelada.',409);
   const form=await request.formData(); const file=form.get('file'); if(!(file instanceof File)||file.size===0)return err('Selecione um arquivo.');
   if(file.size>25*1024*1024)return err('O arquivo excede o limite de 25 MB.');
   const safe=escapeFilename(file.name), key=`results/${id}/${Date.now()}-${crypto.randomUUID()}-${safe}`;
@@ -700,9 +840,34 @@ async function uploadResult(request,env,user,id){
   await audit(env,user,'enviou_resultado','requisition',id,{file:safe,fileId:ins.meta.last_row_id});return ok({id:ins.meta.last_row_id,message:'Resultado enviado. O cliente já pode visualizar e baixar.'});
 }
 
+async function deleteResult(env,user,fileId){
+  const f=await env.DB.prepare(`SELECT f.*,r.id requisition_id,r.protocol,r.status FROM result_files f JOIN requisitions r ON r.id=f.requisition_id WHERE f.id=?`).bind(fileId).first();
+  if(!f)return err('Resultado não encontrado.',404);
+  await env.FILES.delete(f.r2_key);
+  const ts=nowIso();
+  const count=await env.DB.prepare('SELECT COUNT(*) total FROM result_files WHERE requisition_id=? AND id<>?').bind(f.requisition_id,fileId).first();
+  const remaining=Number(count?.total||0);
+  const statements=[
+    env.DB.prepare('DELETE FROM result_files WHERE id=?').bind(fileId),
+    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,?,?,?,?,?)`)
+      .bind(f.requisition_id,f.status,user.id,user.username_display,JSON.stringify({message:`Resultado excluído: ${f.original_name}`,fileId}),ts)
+  ];
+  if(remaining===0 && f.status==='concluido'){
+    statements.push(env.DB.prepare(`UPDATE requisitions SET status='em_analise',completed_at=NULL,updated_at=? WHERE id=?`).bind(ts,f.requisition_id));
+    statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'em_analise',?,?,?,?)`)
+      .bind(f.requisition_id,user.id,user.username_display,JSON.stringify({message:'Solicitação voltou para Em análise porque todos os resultados foram excluídos.'}),ts));
+  }
+  await env.DB.batch(statements);
+  await audit(env,user,'excluiu_resultado','requisition',f.requisition_id,{fileId,filename:f.original_name,protocol:f.protocol,remaining});
+  return ok({message:remaining?'Resultado excluído. Os demais arquivos continuam disponíveis.':'Resultado excluído. Não há outro arquivo liberado para esta solicitação.',remaining});
+}
+
 async function downloadResult(env,user,fileId,inline=false){
-  const f=await env.DB.prepare(`SELECT f.*,r.client_id FROM result_files f JOIN requisitions r ON r.id=f.requisition_id WHERE f.id=?`).bind(fileId).first(); if(!f)return err('Arquivo não encontrado.',404);
-  if(!ADMIN_ROLES.has(user.role)&&!(user.role==='client'&&f.client_id===user.client_id))return err('Sem acesso a esse arquivo.',403);
+  const f=await env.DB.prepare(`SELECT f.*,r.client_id,r.tutor_account_id,r.status FROM result_files f JOIN requisitions r ON r.id=f.requisition_id WHERE f.id=?`).bind(fileId).first(); if(!f)return err('Arquivo não encontrado.',404);
+  const allowedLab=ADMIN_ROLES.has(user.role);
+  const allowedClient=user.role==='client'&&Number(f.client_id)===Number(user.client_id)&&f.status!=='cancelado';
+  const allowedTutor=user.role==='tutor'&&Number(f.tutor_account_id)===Number(user.tutor_id)&&f.status!=='cancelado';
+  if(!allowedLab&&!allowedClient&&!allowedTutor)return err('Sem acesso a esse arquivo.',403);
   const obj=await env.FILES.get(f.r2_key); if(!obj)return err('Arquivo não encontrado no armazenamento.',404);
   const h=new Headers(); obj.writeHttpMetadata(h);
   if(!h.get('content-type')) h.set('content-type',f.mime_type||'application/octet-stream');
@@ -714,7 +879,7 @@ async function downloadResult(env,user,fileId,inline=false){
 
 async function temperatureSheet(env,user,url){
   const month=url.searchParams.get('month')||new Date().toISOString().slice(0,7),courierId=Number(url.searchParams.get('courierId')||0);
-  let sql=`SELECT r.id,r.protocol,r.created_at,r.collected_at,r.collection_temperature,r.sent_from_location,r.sent_by_name,r.lab_received_at,r.lab_received_temperature,r.received_location,r.receiver_name,r.receiving_observation,r.patient_name,c.name client_name,COALESCE(r.transport_courier_name,co.name) courier_name,COALESCE(r.transport_thermometer_code,co.thermometer_code) thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE strftime('%Y-%m', datetime(r.collected_at,'-3 hours'))=?`;
+  let sql=`SELECT r.id,r.protocol,r.created_at,r.collected_at,r.collection_temperature,r.sent_from_location,r.sent_by_name,r.lab_received_at,r.lab_received_temperature,r.received_location,r.receiver_name,r.receiving_observation,r.patient_name,c.name client_name,COALESCE(r.transport_courier_name,co.name) courier_name,COALESCE(r.transport_thermometer_code,co.thermometer_code) thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.status<>'cancelado' AND r.collected_at IS NOT NULL AND strftime('%Y-%m', datetime(r.collected_at,'-3 hours'))=?`;
   const p=[month];if(courierId){sql+=' AND r.assigned_courier_id=?';p.push(courierId);}sql+=' ORDER BY COALESCE(r.transport_thermometer_code,co.thermometer_code),r.collected_at,r.id';
   const rows=await env.DB.prepare(sql).bind(...p).all();return ok({month,entries:rows.results||[]});
 }
