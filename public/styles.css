@@ -72,3 +72,18 @@ body.courier-mobile-mode #courierView{min-height:100dvh}
 .courier-collect-form{display:grid;grid-template-columns:1fr;gap:10px;border-top:1px solid #edf1f2;padding-top:12px}.courier-collect-form label{display:grid;gap:5px;font-size:11px;font-weight:800;color:#50666b}.courier-collect-form input{width:100%;min-height:46px;border:1px solid #c7d2d5;border-radius:11px;padding:11px 12px;background:#fff;font-size:16px}.courier-collect-form input:focus{outline:0;border-color:var(--purple2);box-shadow:0 0 0 3px rgba(100,35,111,.10)}.courier-primary-action{border:0;border-radius:12px;background:var(--purple);color:#fff;min-height:52px;font-size:15px;font-weight:900;letter-spacing:.02em;margin-top:2px}.courier-primary-action:active{transform:scale(.99)}.courier-history-data{display:grid;grid-template-columns:1fr 1fr;gap:8px;border-top:1px solid #edf1f2;padding-top:12px}.courier-empty{background:#fff;border:1px dashed #cbd6d8;border-radius:16px;padding:40px 20px;text-align:center;color:var(--muted)}.courier-error{min-height:100dvh;display:grid;place-items:center;align-content:center;text-align:center;padding:24px}.courier-error img{width:140px;margin-bottom:15px}.courier-error h2{margin:0 0 6px;color:var(--purple)}
 @media(min-width:481px){body.courier-mobile-mode{padding:0}.courier-shell{border-left:1px solid #dde5e6;border-right:1px solid #dde5e6}}
 @media(max-width:380px){.courier-info-grid,.courier-history-data,.courier-filter-grid{grid-template-columns:1fr}.courier-filter-grid .btn{grid-column:auto}.courier-head img{width:72px}.courier-task-top h3{font-size:16px}}
+
+/* Aceite do entregador + rota Google Maps + alerta sonoro */
+.courier-route{display:flex;align-items:center;justify-content:center;gap:8px;min-height:48px;border-radius:11px;background:#e7f2f2;color:#174f53;font-weight:900;text-decoration:none;margin:4px 0 12px;border:1px solid #c9dede;padding:10px 12px;text-align:center}
+.courier-route:active{transform:scale(.99)}
+.courier-accept-box{border:2px solid #6a236f;background:#faf4fb;border-radius:14px;padding:13px;margin-top:10px;display:grid;gap:6px}
+.courier-accept-box>strong{font-size:15px;color:#64236f}
+.courier-accept-box>small{font-size:11px;color:#596d71;line-height:1.35}
+.courier-accept-action{border:0;border-radius:12px;background:#6a236f;color:#fff;min-height:54px;font-size:16px;font-weight:950;margin-top:4px;box-shadow:0 7px 16px rgba(106,35,111,.18)}
+.courier-accept-action:active{transform:scale(.99)}
+.courier-accepted{margin:8px 0 10px;background:#e9f7ee;border:1px solid #bfe0c9;color:#176536;border-radius:10px;padding:9px 11px;font-size:12px;font-weight:850;text-align:center}
+.courier-sound-gate{position:sticky;top:76px;z-index:30;margin:0 auto;width:min(456px,calc(100% - 24px));background:#fff1cf;border:2px solid #e0ae34;border-radius:12px;padding:10px 11px;box-shadow:0 8px 22px rgba(86,69,20,.18);display:grid;gap:8px}
+.courier-sound-gate.hidden{display:none}
+.courier-sound-gate strong{display:block;color:#6c4c00;font-size:13px}
+.courier-sound-gate small{display:block;color:#725f2a;font-size:11px;line-height:1.35;margin-top:2px}
+.courier-sound-button{border:0;border-radius:9px;background:#6a236f;color:#fff;min-height:42px;font-weight:900}
