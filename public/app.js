@@ -63,20 +63,32 @@ function toast(msg,type='ok'){const el=$('#toast');el.textContent=msg;el.classNa
 function modal(html){$('#modalContent').innerHTML=html;$('#modal').classList.remove('hidden')}
 function closeModal(){$('#modal').classList.add('hidden');$('#modalContent').innerHTML=''}
 
-let alertPollTimer=null, alertBeepTimer=null, audioCtx=null, alertSoundMode=null, sirenFlip=false;
+let alertPollTimer=null, audioCtx=null, alertSoundMode=null, labAudioBlocked=false;
+const labRequestAudio=new Audio('/assets/alerta_nova_solicitacao.wav');
+const labCancelAudio=new Audio('/assets/alerta_cancelamento_sirene.wav');
+labRequestAudio.loop=true;labRequestAudio.preload='auto';labRequestAudio.volume=1;
+labCancelAudio.loop=true;labCancelAudio.preload='auto';labCancelAudio.volume=1;
 function unlockAudio(){
   try{audioCtx ||= new (window.AudioContext||window.webkitAudioContext)(); if(audioCtx.state==='suspended')audioCtx.resume();}catch{}
 }
-function beep(){
-  if(!audioCtx||audioCtx.state!=='running')return;
-  try{const o=audioCtx.createOscillator(),g=audioCtx.createGain();o.frequency.value=880;g.gain.value=.055;o.connect(g);g.connect(audioCtx.destination);o.start();g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.22);o.stop(audioCtx.currentTime+.23);}catch{}
+function stopMedia(a){try{a.pause();a.currentTime=0}catch{}}
+function stopLabSound(){stopMedia(labRequestAudio);stopMedia(labCancelAudio);alertSoundMode=null;}
+async function playLabSound(mode){
+  const next=mode==='siren'?labCancelAudio:mode==='request'?labRequestAudio:null;
+  const other=mode==='siren'?labRequestAudio:labCancelAudio;
+  if(!next){stopLabSound();labAudioBlocked=false;return;}
+  stopMedia(other);alertSoundMode=mode;
+  try{if(next.paused)await next.play();labAudioBlocked=false;}
+  catch{labAudioBlocked=true;}
 }
-function siren(){
-  if(!audioCtx||audioCtx.state!=='running')return;
-  try{const o=audioCtx.createOscillator(),g=audioCtx.createGain();sirenFlip=!sirenFlip;o.frequency.value=sirenFlip?720:1040;g.gain.value=.07;o.connect(g);g.connect(audioCtx.destination);o.start();g.gain.exponentialRampToValueAtTime(.001,audioCtx.currentTime+.32);o.stop(audioCtx.currentTime+.33);}catch{}
+async function enableLabSound(){
+  unlockAudio();
+  const mode=(state.cancelAlerts?.length||0)?'siren':(state.alerts?.length||0)?'request':null;
+  if(mode)await playLabSound(mode);
+  renderAlertDock();
 }
 function stopLabAlerts(){
-  clearInterval(alertPollTimer);clearInterval(alertBeepTimer);alertPollTimer=null;alertBeepTimer=null;alertSoundMode=null;
+  clearInterval(alertPollTimer);alertPollTimer=null;stopLabSound();labAudioBlocked=false;
   state.alerts=[];state.cancelAlerts=[];state.missingPrices=[];$('#labAlertDock')?.remove();
 }
 function renderAlertDock(){
@@ -88,9 +100,11 @@ function renderAlertDock(){
   const cancellationHtml=(state.cancelAlerts||[]).map(a=>`<div class="lab-alert-item cancellation"><div><strong>🚨 ${esc(a.title||'SOLICITAÇÃO CANCELADA')}</strong><small>${esc(a.message||`${a.client_name||''} • ${a.protocol||''}`)}</small></div><button class="btn danger small" data-ack-alert="${a.alert_id}">Confirmar</button></div>`).join('');
   const newHtml=(state.alerts||[]).map(a=>`<div class="lab-alert-item"><div><strong>${esc(a.client_name)}</strong><small>${esc(a.protocol)} • ${esc(a.patient_name)}${a.request_kind==='scheduled'?` • agendada ${fmtDateTime(a.scheduled_at)}`:''}</small></div><button class="btn primary small" data-accept-alert="${a.id}">Aceitar</button></div>`).join('');
   const priceHtml=pricing?`<div class="lab-alert-price"><strong>⚠ ${pricing} exame${pricing>1?'s':''} sem preço cadastrado</strong><small>Cadastre os valores para o financeiro ficar completo.</small><button class="btn soft small" data-go-prices>Ir para preços</button></div>`:'';
-  dock.innerHTML=`<div class="lab-alert-head">Central de avisos HLabVet</div>${cancellationHtml}${newHtml}${priceHtml}`;
+  const soundGate=operational&&labAudioBlocked?`<div class="lab-alert-item"><div><strong>🔊 Som bloqueado pelo navegador</strong><small>Toque uma vez para liberar os alertas sonoros nesta sessão.</small></div><button class="btn primary small" data-enable-lab-sound>ATIVAR SOM</button></div>`:'';
+  dock.innerHTML=`<div class="lab-alert-head">Central de avisos HLabVet</div>${soundGate}${cancellationHtml}${newHtml}${priceHtml}`;
   $$('[data-accept-alert]',dock).forEach(b=>b.addEventListener('click',async()=>{unlockAudio();try{const r=await api(`/api/requisitions/${b.dataset.acceptAlert}/accept`,{method:'POST'});toast(r.message);await pollLabAlerts();if(state.page==='requests'||state.page==='dashboard')navigate(state.page)}catch(e){toast(e.message,'error')}}));
   $$('[data-ack-alert]',dock).forEach(b=>b.addEventListener('click',async()=>{unlockAudio();try{await api(`/api/alerts/${b.dataset.ackAlert}/ack`,{method:'POST'});toast('Cancelamento confirmado.');await pollLabAlerts();if(state.page==='cancellations')navigate('cancellations')}catch(e){toast(e.message,'error')}}));
+  $('[data-enable-lab-sound]',dock)?.addEventListener('click',enableLabSound);
   $('[data-go-prices]',dock)?.addEventListener('click',()=>navigate('prices'));
 }
 async function pollLabAlerts(){
@@ -98,14 +112,16 @@ async function pollLabAlerts(){
   try{
     const d=await api('/api/alerts');state.alerts=d.alerts||[];state.cancelAlerts=d.cancelAlerts||[];state.missingPrices=d.missingPrices||[];renderAlertDock();
     const soundCount=state.alerts.length+state.cancelAlerts.length;
-    const wantedMode=state.cancelAlerts.length?'siren':state.alerts.length?'beep':null;
-    if(wantedMode!==alertSoundMode){clearInterval(alertBeepTimer);alertBeepTimer=null;alertSoundMode=wantedMode;if(wantedMode==='siren'){siren();alertBeepTimer=setInterval(siren,700)}else if(wantedMode==='beep'){beep();alertBeepTimer=setInterval(beep,1800)}}
-    if(!soundCount){clearInterval(alertBeepTimer);alertBeepTimer=null;alertSoundMode=null}
+    const wantedMode=state.cancelAlerts.length?'siren':state.alerts.length?'request':null;
+    if(!soundCount){stopLabSound();labAudioBlocked=false;}
+    else if(wantedMode!==alertSoundMode || (wantedMode==='request'&&labRequestAudio.paused) || (wantedMode==='siren'&&labCancelAudio.paused)){
+      await playLabSound(wantedMode);renderAlertDock();
+    }
   }catch{}
 }
 
 function startLabAlerts(){
-  stopLabAlerts();if(!state.me||state.me.role==='client')return;document.addEventListener('pointerdown',unlockAudio,{once:true});pollLabAlerts();alertPollTimer=setInterval(pollLabAlerts,5000);
+  stopLabAlerts();if(!state.me||state.me.role==='client')return;document.addEventListener('pointerdown',()=>{unlockAudio();if(labAudioBlocked)enableLabSound()},{once:true});pollLabAlerts();alertPollTimer=setInterval(pollLabAlerts,5000);
 }
 document.addEventListener('click',e=>{if(e.target.matches('[data-close-modal]'))closeModal()});
 
