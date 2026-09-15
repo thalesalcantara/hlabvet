@@ -31,7 +31,6 @@ async function api(request, env, url) {
 
   if (path === '/api/health') return ok({ app: env.APP_NAME || 'HLab Vet Resultados', time: nowIso() });
   if (path === '/api/catalog' && method === 'GET') return ok({ exams: catalogWithCodes(), materials: MATERIALS });
-  if (path === '/api/setup' && method === 'POST') return setup(request, env);
   if (path === '/api/login' && method === 'POST') return login(request, env, url);
   if (path === '/api/logout' && method === 'POST') return logout(request, env, url);
 
@@ -106,21 +105,6 @@ async function audit(env, user, action, entityType = null, entityId = null, deta
     await env.DB.prepare(`INSERT INTO audit_log(actor_user_id,actor_name,action,entity_type,entity_id,details_json) VALUES(?,?,?,?,?,?)`)
       .bind(user?.id || null, user?.username_display || user?.name || 'Sistema', action, entityType, entityId == null ? null : String(entityId), details ? JSON.stringify(details) : null).run();
   } catch (e) { console.error('audit', e); }
-}
-
-async function setup(request, env) {
-  const count = await env.DB.prepare('SELECT COUNT(*) AS n FROM users').first();
-  if ((count?.n || 0) > 0) return err('A configuração inicial já foi concluída.', 409);
-  const body = await safeBody(request);
-  if (!body) return err('Dados inválidos.');
-  if (!env.SETUP_KEY || body.setupKey !== env.SETUP_KEY) return err('Chave de configuração inválida.', 403);
-  const username = clampString(body.username, 120);
-  const password = String(body.password || '');
-  if (!username || password.length < 8) return err('Informe usuário e senha com pelo menos 8 caracteres.');
-  const { hash, salt } = await hashPassword(password);
-  await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('admin',?,?,?,?,0,1)`)
-    .bind(username, normalizeUsername(username), hash, salt).run();
-  return ok({ message: 'Administrador criado. Acesse o sistema com o usuário informado.' });
 }
 
 async function login(request, env, url) {
