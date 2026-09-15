@@ -169,8 +169,15 @@ async function boot(){
   try { const r=await api('/api/me'); state.me=r.user; state.profile=r.profile; showApp(); }
   catch { showLogin(); }
 }
-function showLogin(){ $('#loginView').classList.remove('hidden'); $('#appView').classList.add('hidden'); $('#courierView').classList.add('hidden'); }
+function showLogin(){ document.body.classList.remove('courier-mobile-mode'); $('#loginView').classList.remove('hidden'); $('#appView').classList.add('hidden'); $('#courierView').classList.add('hidden'); }
 async function showApp(){
+  if(state.me?.role==='courier'){
+    stopLabAlerts();
+    $('#loginView').classList.add('hidden');$('#appView').classList.add('hidden');$('#courierView').classList.remove('hidden');
+    if(state.me.forcePasswordChange)return showCourierPasswordChange(true);
+    return renderCourierPortal(null);
+  }
+  document.body.classList.remove('courier-mobile-mode');
   $('#loginView').classList.add('hidden');$('#courierView').classList.add('hidden');$('#appView').classList.remove('hidden');
   const roleLabel=state.me.role==='client'?'Cliente HLabVet':state.me.role==='staff'?'Técnico HLabVet':state.me.role==='tutor'?'Tutor / Cliente Final':'Administrador HLab Vet';
   $('#sideUser').innerHTML=`<strong>${esc(state.me.tutorName||state.me.technicianName||state.me.clientName||state.me.username)}</strong><small>${roleLabel}</small>`;
@@ -204,7 +211,7 @@ function renderNav(){
 
 async function navigate(page){
   state.page=page; $$('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('#topActions').innerHTML='';
-  const map={dashboard:['Painel','Visão geral do atendimento'],requests:[state.me.role==='client'?'Meus exames':'Solicitações','Pesquise por período, animal, tutor, raça e outros dados'],cancellations:['Cancelamentos','Solicitações canceladas e motivo'],clients:['Clientes','Cadastros e acessos dos clientes'],couriers:['Entregadores','Painel móvel, links privados e termômetros'],receivers:['Técnicos','Técnicos do laboratório com login próprio'],prices:['Preços dos exames','Tabela geral e valores específicos por cliente'],finance:['Financeiro','Ranking de clientes e espelho detalhado para cobrança'],temperature:['Controle de temperatura','Fichas mensais de envio e recebimento'],password:['Alterar senha','A senha diferencia maiúsculas e minúsculas'],audit:['Auditoria','Registro de ações importantes'],'client-users':['Usuários / técnicos','Cadastre acessos da clínica; carimbo é opcional e automático para técnicos'],tutors:['Tutores / clientes finais','Cadastre quem poderá acessar somente os próprios resultados'],'tutor-results':['Meus resultados','Visualize, baixe ou imprima somente os seus exames liberados'],'new-request':['Nova solicitação','Requisição de exames veterinários']};
+  const map={dashboard:['Painel','Visão geral do atendimento'],requests:[state.me.role==='client'?'Meus exames':'Solicitações','Pesquise por período, animal, tutor, raça e outros dados'],cancellations:['Cancelamentos','Solicitações canceladas e motivo'],clients:['Clientes','Cadastros e acessos dos clientes'],couriers:['Entregadores','Login próprio, painel móvel e termômetros'],receivers:['Técnicos','Técnicos do laboratório com login próprio'],prices:['Preços dos exames','Tabela geral e valores específicos por cliente'],finance:['Financeiro','Ranking de clientes e espelho detalhado para cobrança'],temperature:['Controle de temperatura','Fichas mensais de envio e recebimento'],password:['Alterar senha','A senha diferencia maiúsculas e minúsculas'],audit:['Auditoria','Registro de ações importantes'],'client-users':['Usuários / técnicos','Cadastre acessos da clínica; carimbo é opcional e automático para técnicos'],tutors:['Tutores / clientes finais','Cadastre quem poderá acessar somente os próprios resultados'],'tutor-results':['Meus resultados','Visualize, baixe ou imprima somente os seus exames liberados'],'new-request':['Nova solicitação','Requisição de exames veterinários']};
   $('#pageTitle').textContent=map[page]?.[0]||'HLab Vet';$('#pageSubtitle').textContent=map[page]?.[1]||'';
   const fn={dashboard:renderDashboard,requests:renderRequests,cancellations:renderCancellations,clients:renderClients,couriers:renderCouriers,receivers:renderReceivers,prices:renderPrices,finance:renderFinance,temperature:renderTemperature,'client-users':renderClientUsers,tutors:renderTutors,'tutor-results':renderTutorResults,password:()=>showPasswordChange(false),audit:renderAudit,'new-request':renderNewRequest}[page];
   try{await fn?.()}catch(e){if(e.status===428)return showPasswordChange(true);$('#content').innerHTML=`<div class="card empty-state">${esc(e.message)}</div>`;toast(e.message,'error')}
@@ -415,15 +422,20 @@ async function deleteClient(id){if(!confirm('Desativar este cliente? O históric
 
 async function renderCouriers(){
   const d=await api('/api/couriers');state.couriers=d.couriers||[];const admin=state.me.role==='admin';$('#topActions').innerHTML=admin?`<button class="btn primary" id="addCourier">＋ Entregador</button>`:'';
-  $('#content').innerHTML=`<div class="card">${!admin?'<p class="muted">Consulta dos entregadores e respectivos termômetros. Alterações ficam exclusivas do administrador.</p>':''}<div class="table-wrap"><table><thead><tr><th>Entregador</th><th>Telefone</th><th>Termômetro</th><th>Status</th>${admin?'<th>Ações</th>':''}</tr></thead><tbody>${state.couriers.map(c=>`<tr><td><strong>${esc(c.name)}</strong></td><td>${esc(c.phone||'')}</td><td><strong>${esc(c.thermometer_code||'—')}</strong></td><td><span class="badge ${c.active?'concluido':'cancelado'}">${c.active?'Ativo':'Inativo'}</span></td>${admin?`<td><div class="actions"><button class="btn soft small" data-edit-courier="${c.id}">Editar</button><button class="btn secondary small" data-link-courier="${c.id}">Gerar novo link</button></div></td>`:''}</tr>`).join('')}</tbody></table></div></div>`;
-  if(admin){$('#addCourier').addEventListener('click',()=>courierForm());$$('[data-edit-courier]').forEach(b=>b.addEventListener('click',()=>courierForm(state.couriers.find(x=>x.id===Number(b.dataset.editCourier)))));$$('[data-link-courier]').forEach(b=>b.addEventListener('click',()=>regenerateLink(Number(b.dataset.linkCourier))))}
+  $('#content').innerHTML=`<div class="card"><p class="muted">O entregador entra no mesmo endereço do HLabVet com usuário e senha. O painel dele continua exclusivo para celular e pronto para o futuro APK.${!admin?' Alterações ficam exclusivas do administrador.':''}</p><div class="table-wrap"><table><thead><tr><th>Entregador</th><th>Usuário</th><th>Telefone</th><th>Termômetro</th><th>Status</th>${admin?'<th>Ações</th>':''}</tr></thead><tbody>${state.couriers.map(c=>`<tr><td><strong>${esc(c.name)}</strong></td><td>${c.username_display?esc(c.username_display):'<span class="danger-text">Sem login</span>'}</td><td>${esc(c.phone||'')}</td><td><strong>${esc(c.thermometer_code||'—')}</strong></td><td><span class="badge ${c.active?'concluido':'cancelado'}">${c.active?'Ativo':'Inativo'}</span></td>${admin?`<td><div class="actions"><button class="btn soft small" data-edit-courier="${c.id}">Editar</button>${c.user_id?`<button class="btn ghost small" data-reset-courier="${c.id}">Senha</button>`:''}</div></td>`:''}</tr>`).join('')}</tbody></table></div></div>`;
+  if(admin){
+    $('#addCourier').addEventListener('click',()=>courierForm());
+    $$('[data-edit-courier]').forEach(b=>b.addEventListener('click',()=>courierForm(state.couriers.find(x=>x.id===Number(b.dataset.editCourier)))));
+    $$('[data-reset-courier]').forEach(b=>b.addEventListener('click',()=>resetCourierPassword(Number(b.dataset.resetCourier))));
+  }
 }
 
 function courierForm(c=null){
-  modal(`<h3>${c?'Editar entregador':'Cadastrar entregador'}</h3><form id="courierForm" class="stack"><label>Nome<input name="name" value="${esc(c?.name||'')}" required></label><label>Telefone<input name="phone" value="${esc(c?.phone||'')}"></label><label>Número do termômetro<input name="thermometerCode" value="${esc(c?.thermometer_code||'TER-001')}" placeholder="TER-001" required><small>Use o padrão TER-001, TER-002, TER-003...</small></label>${c?`<label>Ativo<select name="active"><option value="1" ${c.active?'selected':''}>Sim</option><option value="0" ${!c.active?'selected':''}>Não</option></select></label>`:''}<div class="actions"><button class="btn primary">Salvar</button><button type="button" class="btn ghost" data-close-modal>Cancelar</button></div></form>`);
-  $('#courierForm').addEventListener('submit',async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));if('active'in b)b.active=b.active==='1';try{const r=await api(c?`/api/couriers/${c.id}`:'/api/couriers',{method:c?'PATCH':'POST',json:b});if(r.link){await navigator.clipboard?.writeText(r.link).catch(()=>{});modal(`<h3>Entregador cadastrado</h3><p>Copie e guarde este link privado:</p><label class="field"><input id="newCourierLink" value="${esc(r.link)}" readonly></label><div class="actions"><button class="btn primary" id="copyCourierLink">Copiar link</button><button class="btn ghost" data-close-modal>Fechar</button></div>`);$('#copyCourierLink').addEventListener('click',async()=>{await navigator.clipboard.writeText(r.link);toast('Link copiado.')})}else{toast(r.message);closeModal();renderCouriers()}}catch(er){toast(er.message,'error')}})
+  const needsLogin=!c?.user_id;
+  modal(`<h3>${c?'Editar entregador':'Cadastrar entregador'}</h3><p class="muted">O acesso principal é por usuário e senha. No primeiro login o entregador deverá trocar a senha temporária.</p><form id="courierForm" class="stack"><label>Nome<input name="name" value="${esc(c?.name||'')}" required></label><label>Usuário de login<input name="username" value="${esc(c?.username_display||'')}" required></label>${needsLogin?`<label>Senha inicial<input name="password" type="password" minlength="8" required><small>Mínimo de 8 caracteres.</small></label>`:''}<label>Telefone<input name="phone" value="${esc(c?.phone||'')}"></label><label>Número do termômetro<input name="thermometerCode" value="${esc(c?.thermometer_code||'TER-001')}" placeholder="TER-001" required><small>Use o padrão TER-001, TER-002, TER-003...</small></label>${c?`<label>Ativo<select name="active"><option value="1" ${c.active?'selected':''}>Sim</option><option value="0" ${!c.active?'selected':''}>Não</option></select></label>`:''}<div class="actions"><button class="btn primary">Salvar entregador</button><button type="button" class="btn ghost" data-close-modal>Cancelar</button></div></form>`);
+  $('#courierForm').addEventListener('submit',async e=>{e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));if('active'in b)b.active=b.active==='1';try{const r=await api(c?`/api/couriers/${c.id}`:'/api/couriers',{method:c?'PATCH':'POST',json:b});toast(r.message);closeModal();renderCouriers()}catch(er){toast(er.message,'error')}})
 }
-async function regenerateLink(id){if(!confirm('Gerar um novo link? O anterior deixará de funcionar.'))return;try{const r=await api(`/api/couriers/${id}/regenerate-link`,{method:'POST'});modal(`<h3>Novo link do entregador</h3><p>O link anterior foi invalidado.</p><label class="field"><input id="newCourierLink" value="${esc(r.link)}" readonly></label><button class="btn primary" id="copyCourierLink">Copiar link</button>`);$('#copyCourierLink').addEventListener('click',async()=>{await navigator.clipboard.writeText(r.link);toast('Link copiado.')})}catch(e){toast(e.message,'error')}}
+async function resetCourierPassword(id){const password=prompt('Digite a nova senha temporária do entregador (mínimo 8 caracteres):');if(password===null)return;try{const r=await api(`/api/couriers/${id}/reset-password`,{json:{password}});toast(r.message)}catch(e){toast(e.message,'error')}}
 
 async function renderReceivers(){
   const d=await api('/api/technicians');state.receivers=d.receivers||[];const admin=state.me.role==='admin';$('#topActions').innerHTML=admin?`<button class="btn primary" id="addReceiver">＋ Técnico</button>`:'';
@@ -578,7 +590,26 @@ function temperatureSheetInner(month,rows,page,total){
   return `<div class="temp-sheet"><div class="temp-header"><div><img src="/assets/hlabvet-logo.png"></div><div class="temp-company">HLABVET DIAGNÓSTICOS VETERINÁRIOS LTDA<br>CNPJ: 88.816.118/0001-84<br>RUA AMÉRICO SOARES WANDERLEY, 1945 - CAPIM MACIO, NATAL - RN, 59082-080, BRASIL</div><div><strong>ENTREGADOR:</strong><br>${esc(courier)}</div></div><div class="temp-title">FICHA DE CONTROLE DE TEMPERATURA HLABVET</div><div class="temp-info"><div><b>SETOR:</b> TRANSPORTE DE AMOSTRAS</div><div><b>TERMÔMETRO:</b> ${esc(thermometer)}</div><div><b>MÊS:</b> ${esc(monthName)} &nbsp; <b>ANO:</b> ${year}</div><div><b>CONTATO HLABVET:</b> (84) 99180-4816 ${total>1?` • PÁG. ${page}/${total}`:''}</div></div><table class="temp-table"><thead><tr class="super"><th colspan="6">DADOS DO ENVIO</th><th colspan="5">DADOS DO RECEBIMENTO</th></tr><tr><th>Nº</th><th>DATA</th><th>HORA</th><th>TEMP.</th><th>LOCAL</th><th>RESPONSÁVEL</th><th>HORA</th><th>TEMP.</th><th>LOCAL</th><th>RESPONSÁVEL</th><th>OBSERVAÇÃO</th></tr></thead><tbody>${padded.map((r,i)=>`<tr><td>${((page-1)*45)+i+1}</td><td>${r?fmtDate(r.collected_at):''}</td><td>${r?fmtTime(r.collected_at):''}</td><td>${r?.collection_temperature!=null?`${esc(r.collection_temperature)}°C`:''}</td><td style="text-align:left">${r?esc(r.sent_from_location||r.client_name||''):''}</td><td style="text-align:left">${r?esc(r.sent_by_name||''):''}</td><td>${r?fmtTime(r.lab_received_at):''}</td><td>${r?.lab_received_temperature!=null?`${esc(r.lab_received_temperature)}°C`:''}</td><td style="text-align:left">${r?esc(r.received_location||''):''}</td><td style="text-align:left">${r?esc(r.receiver_name||''):''}</td><td style="text-align:left">${r?esc(r.receiving_observation||''):''}</td></tr>`).join('')}</tbody></table><div class="temp-notes">* Sempre identificar o termômetro e o entregador. &nbsp; * Temperatura refrigerada: 2°C a 8°C. Monitorar durante o transporte e, ao atingir 20°C, substituir o gelo.</div></div>`;
 }
 
-async function renderCourierPortal(token){
+async function courierLogout(){
+  try{await api('/api/logout',{method:'POST'})}catch{}
+  state.me=null;
+  document.body.classList.remove('courier-mobile-mode');
+  showLogin();
+}
+
+function showCourierPasswordChange(force=false){
+  $('#loginView').classList.add('hidden');$('#appView').classList.add('hidden');$('#courierView').classList.remove('hidden');
+  document.body.classList.add('courier-mobile-mode');
+  $('#courierView').innerHTML=`<div class="courier-shell"><div class="courier-error"><img src="/assets/hlabvet-logo.png"><h2>${force?'Troque sua senha':'Alterar senha'}</h2><p>${force?'Por segurança, troque a senha temporária antes de acessar as coletas.':'Defina uma nova senha para seu acesso.'}</p><form id="courierPasswordForm" class="stack" style="width:100%;max-width:360px;text-align:left"><label>Senha atual<input name="currentPassword" type="password" autocomplete="current-password" required></label><label>Nova senha<input name="newPassword" type="password" minlength="8" autocomplete="new-password" required></label><label>Confirmar nova senha<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required></label><button class="btn primary" type="submit">Salvar nova senha</button>${force?'':`<button class="btn ghost" type="button" data-back-courier>Voltar</button>`}</form></div></div>`;
+  $('[data-back-courier]')?.addEventListener('click',()=>renderCourierPortal(null));
+  $('#courierPasswordForm').addEventListener('submit',async e=>{
+    e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));
+    if(b.newPassword!==b.confirmPassword)return toast('A confirmação da nova senha não confere.','error');
+    try{const r=await api('/api/change-password',{json:{currentPassword:b.currentPassword,newPassword:b.newPassword}});toast(r.message);state.me.forcePasswordChange=false;await renderCourierPortal(null)}catch(er){toast(er.message,'error')}
+  });
+}
+
+async function renderCourierPortal(token=null){
   $('#loginView').classList.add('hidden');
   $('#appView').classList.add('hidden');
   $('#courierView').classList.remove('hidden');
@@ -644,35 +675,38 @@ async function renderCourierPortal(token){
   };
 
   const pendingSignature=tasks=>(tasks||[]).map(t=>`${t.id}:${t.status}:${t.courier_accepted_at||''}`).sort().join('|');
+  const courierEndpoint=suffix=>token?`/api/courier/${encodeURIComponent(token)}/${suffix}`:`/api/courier/${suffix}`;
 
   const fetchTasks=async wantedTab=>{
     const oldFrom=$('#courierFrom')?.value||'',oldTo=$('#courierTo')?.value||'';
     const qs=new URLSearchParams({tab:wantedTab});
     if(wantedTab==='collected'&&oldFrom)qs.set('from',oldFrom);
     if(wantedTab==='collected'&&oldTo)qs.set('to',oldTo);
-    return api(`/api/courier/${encodeURIComponent(token)}/tasks?${qs}`);
+    return api(`${courierEndpoint('tasks')}?${qs}`);
   };
 
   const render=async()=>{try{
     const oldFrom=$('#courierFrom')?.value||'',oldTo=$('#courierTo')?.value||'';
     const qs=new URLSearchParams({tab});if(tab==='collected'&&oldFrom)qs.set('from',oldFrom);if(tab==='collected'&&oldTo)qs.set('to',oldTo);
-    const d=await api(`/api/courier/${encodeURIComponent(token)}/tasks?${qs}`);
-    $('#courierView').innerHTML=`<div class="courier-shell"><header class="courier-head"><div class="inner"><img src="/assets/hlabvet-logo.png" alt="HLabVet"><div class="courier-ident"><strong>${esc(d.courier.name)}</strong><small>Entregador HLabVet • ${esc(d.courier.thermometer_code||'Sem termômetro')}</small></div></div></header><div id="courierSoundGate" class="courier-sound-gate hidden"></div><main class="courier-main"><div class="courier-tabs"><button class="courier-tab ${tab==='pending'?'active':''}" data-tab="pending"><span>Pendentes</span></button><button class="courier-tab ${tab==='collected'?'active':''}" data-tab="collected"><span>Histórico</span></button></div>${tab==='collected'?`<details class="courier-filter-box"><summary>Filtrar período</summary><div class="courier-filter-grid"><label>De<input id="courierFrom" type="date" value="${esc(oldFrom)}"></label><label>Até<input id="courierTo" type="date" value="${esc(oldTo)}"></label><button class="btn ghost" id="courierFilter">Aplicar filtro</button></div></details>`:''}<div class="courier-task-list">${d.tasks.length?d.tasks.map(t=>courierTask(t,tab)).join(''):`<div class="courier-empty">${tab==='pending'?'Nenhuma coleta pendente agora.':'Nenhuma coleta encontrada neste período.'}</div>`}</div></main></div>`;
+    const d=await api(`${courierEndpoint('tasks')}?${qs}`);
+    $('#courierView').innerHTML=`<div class="courier-shell"><header class="courier-head"><div class="inner"><img src="/assets/hlabvet-logo.png" alt="HLabVet"><div class="courier-ident"><strong>${esc(d.courier.name)}</strong><small>Entregador HLabVet • ${esc(d.courier.thermometer_code||'Sem termômetro')}</small></div>${!token?`<div class="courier-head-actions"><button type="button" class="courier-head-btn" data-courier-password>Senha</button><button type="button" class="courier-head-btn" data-courier-logout>Sair</button></div>`:''}</div></header><div id="courierSoundGate" class="courier-sound-gate hidden"></div><main class="courier-main"><div class="courier-tabs"><button class="courier-tab ${tab==='pending'?'active':''}" data-tab="pending"><span>Pendentes</span></button><button class="courier-tab ${tab==='collected'?'active':''}" data-tab="collected"><span>Histórico</span></button></div>${tab==='collected'?`<details class="courier-filter-box"><summary>Filtrar período</summary><div class="courier-filter-grid"><label>De<input id="courierFrom" type="date" value="${esc(oldFrom)}"></label><label>Até<input id="courierTo" type="date" value="${esc(oldTo)}"></label><button class="btn ghost" id="courierFilter">Aplicar filtro</button></div></details>`:''}<div class="courier-task-list">${d.tasks.length?d.tasks.map(t=>courierTask(t,tab)).join(''):`<div class="courier-empty">${tab==='pending'?'Nenhuma coleta pendente agora.':'Nenhuma coleta encontrada neste período.'}</div>`}</div></main></div>`;
     $$('[data-tab]').forEach(b=>b.addEventListener('click',()=>{tab=b.dataset.tab;render()}));
     $('#courierFilter')?.addEventListener('click',render);
-    $$('[data-accept-courier]').forEach(b=>b.addEventListener('click',()=>acceptCourierTask(token,Number(b.dataset.acceptCourier),render,pollPending)));
-    $$('[data-collect]').forEach(b=>b.addEventListener('click',()=>collectTask(token,Number(b.dataset.collect),render,pollPending)));
+    $('[data-courier-password]')?.addEventListener('click',()=>showCourierPasswordChange(false));
+    $('[data-courier-logout]')?.addEventListener('click',courierLogout);
+    $$('[data-accept-courier]').forEach(b=>b.addEventListener('click',()=>acceptCourierTask(courierEndpoint,Number(b.dataset.acceptCourier),render,pollPending)));
+    $$('[data-collect]').forEach(b=>b.addEventListener('click',()=>collectTask(courierEndpoint,Number(b.dataset.collect),render,pollPending)));
     if(tab==='pending'){
       lastPendingSignature=pendingSignature(d.tasks);
       await syncRing(d.tasks);
     }else{
       updateSoundGate();
     }
-  }catch(e){stopRing();$('#courierView').innerHTML=`<div class="courier-shell"><div class="courier-error"><img src="/assets/hlabvet-logo.png"><h2>Link inválido</h2><p>${esc(e.message)}</p></div></div>`}};
+  }catch(e){stopRing();if(!token&&e.status===401){state.me=null;showLogin();return;}$('#courierView').innerHTML=`<div class="courier-shell"><div class="courier-error"><img src="/assets/hlabvet-logo.png"><h2>${token?'Link inválido':'Acesso indisponível'}</h2><p>${esc(e.message)}</p></div></div>`}};
 
   const pollPending=async()=>{
     try{
-      const d=await api(`/api/courier/${encodeURIComponent(token)}/tasks?tab=pending`);
+      const d=await api(`${courierEndpoint('tasks')}?tab=pending`);
       await syncRing(d.tasks);
       const sig=pendingSignature(d.tasks);
       if(sig!==lastPendingSignature){
@@ -699,20 +733,20 @@ function courierTask(t,tab){
   return `<article class="courier-task-card"><div class="courier-task-top"><div><small>${esc(t.protocol)}</small><h3>${esc(t.client_name)}</h3><p>${esc(t.patient_name)}${t.species?` • ${esc(t.species)}`:''}</p></div><span class="badge ${t.status}">${esc(STATUS[t.status]||t.status)}</span></div><div class="courier-info-row"><span>📍</span><div><small>LOCAL DA COLETA</small><strong>${esc(address||t.client_name)}</strong></div></div><div class="courier-info-grid"><div><small>TERMÔMETRO</small><strong>${esc(t.thermometer_code||'—')}</strong></div><div><small>CONTATO</small><strong>${esc(t.phone||'—')}</strong></div></div><a class="courier-route" href="${esc(mapsUrl)}" target="_blank" rel="noopener noreferrer">🗺️ ABRIR ROTA NO GOOGLE MAPS</a>${tab==='pending'&&!accepted?`<div class="courier-accept-box"><strong>Nova coleta atribuída a você</strong><small>O toque continuará até você aceitar esta coleta.</small><button class="courier-accept-action" type="button" data-accept-courier="${t.id}">ACEITAR COLETA</button></div>`:tab==='pending'?`<div class="courier-accepted">✓ Coleta aceita ${t.courier_accepted_at?`em ${fmtDateTime(t.courier_accepted_at)}`:''}</div><form class="courier-collect-form" data-collect-form="${t.id}"><label>Temperatura da amostra (°C)<input name="temperature" inputmode="decimal" type="number" step="0.1" required placeholder="Ex.: 4,0"></label><label>Quem entregou a amostra?<input name="sentByName" required placeholder="Nome do responsável"></label><label>Local de envio<input name="sentFromLocation" value="${esc(t.client_name)}" readonly></label><button class="courier-primary-action" type="button" data-collect="${t.id}">CONFIRMAR COLETA</button></form>`:`<div class="courier-history-data"><div><small>COLETADO EM</small><strong>${fmtDateTime(t.collected_at)}</strong></div><div><small>TEMPERATURA</small><strong>${t.collection_temperature!=null?`${esc(t.collection_temperature)} °C`:'—'}</strong></div><div><small>RESPONSÁVEL</small><strong>${esc(t.sent_by_name||'—')}</strong></div><div><small>LOCAL</small><strong>${esc(t.sent_from_location||t.client_name)}</strong></div></div>`}</article>`;
 }
 
-async function acceptCourierTask(token,id,render,pollPending){
+async function acceptCourierTask(courierEndpoint,id,render,pollPending){
   try{
-    const r=await api(`/api/courier/${encodeURIComponent(token)}/requisitions/${id}/accept`,{method:'POST'});
+    const r=await api(courierEndpoint(`requisitions/${id}/accept`),{method:'POST'});
     toast(r.message);
     await pollPending();
     await render();
   }catch(e){toast(e.message,'error')}
 }
 
-async function collectTask(token,id,render,pollPending){
+async function collectTask(courierEndpoint,id,render,pollPending){
   const form=$(`[data-collect-form="${id}"]`);if(!form?.reportValidity())return;
   const body=Object.fromEntries(new FormData(form));
   try{
-    const r=await api(`/api/courier/${encodeURIComponent(token)}/requisitions/${id}/collect`,{json:body});
+    const r=await api(courierEndpoint(`requisitions/${id}/collect`),{json:body});
     toast(r.message);
     await pollPending();
     await render();
