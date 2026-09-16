@@ -85,6 +85,7 @@ function bindResultFileButtons(root=document,onDeleted=null){
   $$('[data-result-view]',root).forEach(b=>b.addEventListener('click',()=>resultFileAction(Number(b.dataset.resultView),'view',b.dataset.filename||'resultado')));
   $$('[data-result-download]',root).forEach(b=>b.addEventListener('click',()=>resultFileAction(Number(b.dataset.resultDownload),'download',b.dataset.filename||'resultado')));
   $$('[data-print-result]',root).forEach(b=>b.addEventListener('click',()=>resultFileAction(Number(b.dataset.printResult),'print',b.dataset.filename||'resultado')));
+  $$('[data-result-analysis]',root).forEach(b=>b.addEventListener('click',()=>openResultAnalysis(Number(b.dataset.resultAnalysis),b.dataset.filename||'resultado',b)));
   $$('[data-result-delete]',root).forEach(b=>b.addEventListener('click',async()=>{
     const filename=b.dataset.filename||'resultado';
     if(!confirm(`Excluir o resultado “${filename}”? O arquivo será removido do sistema e do armazenamento.`))return;
@@ -92,9 +93,113 @@ function bindResultFileButtons(root=document,onDeleted=null){
     catch(e){toast(e.message,'error')}
   }));
 }
-function resultFilesHtml(files,allowPrint=true,allowDelete=false){
+function resultFilesHtml(files,allowPrint=true,allowDelete=false,allowAnalyze=false){
   if(!files?.length)return '<div class="empty-state">Resultado ainda não disponível.</div>';
-  return files.map(f=>`<div class="file-card"><div><strong>${esc(f.original_name)}</strong><small>${fmtBytes(f.size_bytes)} • ${fmtDateTime(f.created_at)}</small></div><div class="actions"><button class="btn soft small" data-result-view="${f.id}" data-filename="${esc(f.original_name)}">Visualizar</button><button class="btn secondary small" data-result-download="${f.id}" data-filename="${esc(f.original_name)}">Baixar</button>${allowPrint?`<button class="btn ghost small" data-print-result="${f.id}" data-filename="${esc(f.original_name)}">Imprimir</button>`:''}${allowDelete?`<button class="btn danger small" data-result-delete="${f.id}" data-filename="${esc(f.original_name)}">Excluir</button>`:''}</div></div>`).join('');
+  return files.map(f=>`<div class="file-card"><div><strong>${esc(f.original_name)}</strong><small>${fmtBytes(f.size_bytes)} • ${fmtDateTime(f.created_at)}</small></div><div class="actions"><button class="btn soft small" data-result-view="${f.id}" data-filename="${esc(f.original_name)}">Visualizar</button>${allowAnalyze?`<button class="btn analysis small" data-result-analysis="${f.id}" data-filename="${esc(f.original_name)}">${Number(f.analysis_exists)?'Ver análise':'Analisar'}</button>`:''}<button class="btn secondary small" data-result-download="${f.id}" data-filename="${esc(f.original_name)}">Baixar</button>${allowPrint?`<button class="btn ghost small" data-print-result="${f.id}" data-filename="${esc(f.original_name)}">Imprimir</button>`:''}${allowDelete?`<button class="btn danger small" data-result-delete="${f.id}" data-filename="${esc(f.original_name)}">Excluir</button>`:''}</div></div>`).join('');
+}
+
+let pdfJsModulePromise=null;
+async function loadPdfJs(){
+  if(!pdfJsModulePromise){
+    pdfJsModulePromise=import('https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.min.mjs').then(m=>{
+      if(m.GlobalWorkerOptions)m.GlobalWorkerOptions.workerSrc='https://cdn.jsdelivr.net/npm/pdfjs-dist@4.10.38/build/pdf.worker.min.mjs';
+      return m;
+    });
+  }
+  return pdfJsModulePromise;
+}
+function numPt(v){if(v==null)return null;const n=Number(String(v).replace(/\s/g,'').replace(/\./g,'').replace(',','.'));return Number.isFinite(n)?n:null}
+function numFlexible(v){
+  if(v==null)return null;let x=String(v).trim().replace(/\s/g,'');
+  if(x.includes(',')&&x.includes('.')){const lastComma=x.lastIndexOf(','),lastDot=x.lastIndexOf('.');x=lastComma>lastDot?x.replace(/\./g,'').replace(',','.'):x.replace(/,/g,'');}
+  else if(x.includes(','))x=x.replace(',','.');
+  const n=Number(x);return Number.isFinite(n)?n:null;
+}
+async function extractPdfText(blob){
+  const pdfjs=await loadPdfJs();
+  const data=new Uint8Array(await blob.arrayBuffer());
+  const pdf=await pdfjs.getDocument({data}).promise;
+  const pages=[];
+  for(let p=1;p<=pdf.numPages;p++){
+    const page=await pdf.getPage(p),content=await page.getTextContent();
+    const rows=[];
+    for(const item of content.items||[]){
+      const text=String(item.str||'').trim();if(!text)continue;
+      const y=Number(item.transform?.[5]||0),x=Number(item.transform?.[4]||0);let row=rows.find(r=>Math.abs(r.y-y)<2.2);
+      if(!row){row={y,items:[]};rows.push(row)}row.items.push({x,text});
+    }
+    rows.sort((a,b)=>b.y-a.y);
+    pages.push(rows.map(r=>r.items.sort((a,b)=>a.x-b.x).map(i=>i.text).join(' ')).join('\n'));
+  }
+  return pages.join('\n');
+}
+async function extractResultText(blob,filename){
+  const name=String(filename||'').toLowerCase(),type=String(blob.type||'').toLowerCase();
+  if(type.includes('pdf')||name.endsWith('.pdf'))return extractPdfText(blob);
+  if(type.startsWith('text/')||/\.(txt|csv|tsv)$/i.test(name))return blob.text();
+  throw new Error('Para análise automática rápida, envie o resultado em PDF pesquisável ou arquivo de texto.');
+}
+function cleanParamName(v){return String(v||'').replace(/^[•·.:;\-–—\s]+|[.:;\-–—\s]+$/g,'').replace(/\s{2,}/g,' ').trim().slice(0,180)}
+function parseResultAnalysis(text){
+  const raw=String(text||'').replace(/\u00a0/g,' ').replace(/[−‐‑‒]/g,'-');
+  const lines=raw.split(/\r?\n/).map(x=>x.replace(/\s+/g,' ').trim()).filter(Boolean);
+  const out=[];
+  const seen=new Set();
+  const push=(name,result,min,max,referenceText,unit='')=>{
+    name=cleanParamName(name);if(!name||name.length<2||!/[A-Za-zÀ-ÿ]/.test(name)||!Number.isFinite(result))return;
+    if(min!=null&&!Number.isFinite(min))min=null;if(max!=null&&!Number.isFinite(max))max=null;if(min==null&&max==null)return;
+    let status='normal',deviationPct=null;
+    if(min!=null&&result<min){status='low';if(min!==0)deviationPct=((min-result)/Math.abs(min))*100}
+    else if(max!=null&&result>max){status='high';if(max!==0)deviationPct=((result-max)/Math.abs(max))*100}
+    const key=`${name.toLowerCase()}|${result}|${min}|${max}`;if(seen.has(key))return;seen.add(key);
+    out.push({name,result,unit:String(unit||'').trim().slice(0,50),referenceText,status,min,max,deviationPct:deviationPct==null?null:Math.round(deviationPct*10)/10});
+  };
+  for(const line of lines){
+    if(line.length>300)continue;
+    let m=line.match(/(-?\d[\d.,]*)\s*(?:-|–|—|a)\s*(-?\d[\d.,]*)\s*([A-Za-z%µμ\/³²0-9.\-]*)\s*$/i);
+    if(m){
+      const min=numFlexible(m[1]),max=numFlexible(m[2]);if(min==null||max==null||min>max)continue;
+      const before=line.slice(0,m.index).trim();const nums=[...before.matchAll(/-?\d[\d.,]*/g)];if(!nums.length)continue;
+      const last=nums[nums.length-1],result=numFlexible(last[0]);if(result==null)continue;
+      const name=before.slice(0,last.index).trim();let unit=before.slice(last.index+last[0].length).trim();
+      push(name,result,min,max,`${m[1]} – ${m[2]}${m[3]?` ${m[3]}`:''}`,unit||m[3]||'');continue;
+    }
+    m=line.match(/(?:até|<=|≤|menor\s+que|inferior\s+a|<)\s*(-?\d[\d.,]*)\s*([A-Za-z%µμ\/³²0-9.\-]*)\s*$/i);
+    if(m){const max=numFlexible(m[1]),before=line.slice(0,m.index).trim(),nums=[...before.matchAll(/-?\d[\d.,]*/g)];if(max==null||!nums.length)continue;const last=nums[nums.length-1],result=numFlexible(last[0]);if(result==null)continue;push(before.slice(0,last.index),result,null,max,`até ${m[1]}${m[2]?` ${m[2]}`:''}`,before.slice(last.index+last[0].length).trim()||m[2]||'');continue;}
+    m=line.match(/(?:>=|≥|maior\s+que|superior\s+a|>)\s*(-?\d[\d.,]*)\s*([A-Za-z%µμ\/³²0-9.\-]*)\s*$/i);
+    if(m){const min=numFlexible(m[1]),before=line.slice(0,m.index).trim(),nums=[...before.matchAll(/-?\d[\d.,]*/g)];if(min==null||!nums.length)continue;const last=nums[nums.length-1],result=numFlexible(last[0]);if(result==null)continue;push(before.slice(0,last.index),result,min,null,`a partir de ${m[1]}${m[2]?` ${m[2]}`:''}`,before.slice(last.index+last[0].length).trim()||m[2]||'');}
+  }
+  const parameters=out.slice(0,300),normal=parameters.filter(x=>x.status==='normal').length,low=parameters.filter(x=>x.status==='low').length,high=parameters.filter(x=>x.status==='high').length;
+  return {version:1,generatedAt:new Date().toISOString(),source:'Referências informadas no próprio laudo',summary:{total:parameters.length,normal,low,high,altered:low+high},parameters};
+}
+function analysisParamHtml(x){
+  const cls=x.status==='normal'?'normal':x.status==='low'?'low':'high';
+  const label=x.status==='normal'?'Dentro da referência':x.status==='low'?'Abaixo da referência':'Acima da referência';
+  const delta=x.status==='normal'||x.deviationPct==null?'':`<strong>${x.deviationPct.toLocaleString('pt-BR',{maximumFractionDigits:1})}% ${x.status==='low'?'abaixo do mínimo':'acima do máximo'}</strong>`;
+  return `<article class="analysis-param ${cls}"><div class="analysis-param-head"><div><h4>${esc(x.name)}</h4><span>${esc(label)}</span></div><b>${esc(String(x.result))}${x.unit?` ${esc(x.unit)}`:''}</b></div><div class="analysis-param-meta"><span>Referência: ${esc(x.referenceText||[x.min,x.max].filter(v=>v!=null).join(' – '))}</span>${delta}</div></article>`;
+}
+function showAnalysisModal(analysis,fileName){
+  const a=analysis||{},sum=a.summary||{},params=Array.isArray(a.parameters)?a.parameters:[],altered=params.filter(x=>x.status!=='normal'),normal=params.filter(x=>x.status==='normal');
+  modal(`<div class="analysis-modal"><div class="detail-head"><div><h3>📊 Análise do resultado</h3><p class="muted">${esc(fileName||'Resultado')} • referências do próprio laudo</p></div><span class="analysis-fast-pill">ANÁLISE RÁPIDA</span></div><div class="analysis-summary"><div><b>${sum.total||params.length}</b><span>Parâmetros analisados</span></div><div class="normal"><b>${sum.normal||0}</b><span>Normais</span></div><div class="low"><b>${sum.low||0}</b><span>Abaixo</span></div><div class="high"><b>${sum.high||0}</b><span>Acima</span></div></div>${params.length?`${altered.length?`<div class="analysis-section-title"><h4>Alterações encontradas</h4><p>Percentual calculado em relação ao limite informado no laudo.</p></div>${altered.map(analysisParamHtml).join('')}`:`<div class="analysis-all-normal"><b>✓ Todos os parâmetros analisados estão dentro das referências.</b><p>Segundo os valores e intervalos encontrados neste laudo, não foram identificados parâmetros fora da faixa informada.</p></div>`}${normal.length&&altered.length?`<details class="analysis-normal-details"><summary>Ver ${normal.length} parâmetro(s) dentro da referência</summary>${normal.map(analysisParamHtml).join('')}</details>`:''}`:`<div class="empty-state">Nenhum parâmetro com valor e referência reconhecíveis foi encontrado automaticamente.</div>`}<div class="analysis-disclaimer">Análise automatizada baseada exclusivamente nos valores e intervalos de referência presentes no laudo. Não constitui diagnóstico veterinário. A interpretação clínica deve ser realizada pelo médico-veterinário responsável.</div><div class="actions"><button class="btn ghost" data-close-modal>Fechar</button></div></div>`);
+}
+async function saveAndShowAnalysis(fileId,fileName,analysis,button){
+  if(!analysis?.parameters?.length)return showAnalysisTextFallback(fileId,fileName,'Não consegui identificar automaticamente valores acompanhados de intervalos de referência.');
+  try{const r=await api(`/api/results/${fileId}/analysis`,{method:'PUT',json:{analysis}});if(button)button.textContent='Ver análise';showAnalysisModal(r.analysis||analysis,fileName)}catch(e){toast(e.message,'error')}
+}
+function showAnalysisTextFallback(fileId,fileName,message,initial=''){
+  modal(`<div class="analysis-modal"><h3>📊 Analisar resultado</h3><p class="muted">${esc(message)}</p><label class="field">Texto do laudo<textarea id="analysisTextManual" rows="12" placeholder="Cole aqui o texto do resultado com os valores e as referências.">${esc(initial||'')}</textarea></label><div class="actions"><button class="btn analysis" id="runManualAnalysis">Analisar texto</button><button class="btn ghost" data-close-modal>Cancelar</button></div></div>`);
+  $('#runManualAnalysis')?.addEventListener('click',()=>{const a=parseResultAnalysis($('#analysisTextManual').value);if(!a.parameters.length)return toast('Ainda não encontrei linhas com resultado e referência.','error');saveAndShowAnalysis(fileId,fileName,a,null)});
+}
+async function openResultAnalysis(fileId,fileName,button){
+  if(state.me?.role!=='client')return toast('A análise é exclusiva para a clínica/cliente.','error');
+  try{
+    const saved=await api(`/api/results/${fileId}/analysis`);if(saved.analysis){if(button)button.textContent='Ver análise';return showAnalysisModal(saved.analysis,fileName)}
+    modal(`<div class="analysis-loading"><div class="analysis-spinner"></div><h3>Analisando resultado…</h3><p>Leitura local e rápida dos valores e referências do laudo.</p></div>`);
+    const blob=await fetchResultBlob(fileId,'view');let text='';
+    try{text=await extractResultText(blob,fileName)}catch(e){return showAnalysisTextFallback(fileId,fileName,e.message)}
+    const analysis=parseResultAnalysis(text);if(!analysis.parameters.length)return showAnalysisTextFallback(fileId,fileName,'O arquivo abriu corretamente, mas o formato da tabela não pôde ser reconhecido automaticamente.',text.slice(0,12000));
+    await saveAndShowAnalysis(fileId,fileName,analysis,button);
+  }catch(e){toast(e.message,'error');closeModal()}
 }
 function toast(msg,type='ok'){const el=$('#toast');el.textContent=msg;el.className=`toast show ${type}`;clearTimeout(toast.t);toast.t=setTimeout(()=>el.className='toast',3300)}
 function modal(html){$('#modalContent').innerHTML=html;$('#modal').classList.remove('hidden')}
@@ -306,10 +411,10 @@ function renderNav(){
     ['tutor-results','▣','Meus resultados'],['password','⚿','Alterar senha']
   ];
   else if(state.me.role==='staff') items=[
-    ['dashboard','⌂','Painel'],['requests','▣','Solicitações'],['cancellations','×','Cancelamentos'],['clients','♙','Clientes'],['couriers','➜','Entregadores'],['receivers','✓','Técnicos'],['temperature','▤','Temperaturas'],['password','⚿','Alterar senha']
+    ['dashboard','⌂','Painel'],['requests','▣','Solicitações'],['exam-timing','◷','Tempo de exames'],['cancellations','×','Cancelamentos'],['clients','♙','Clientes'],['couriers','➜','Entregadores'],['receivers','✓','Técnicos'],['temperature','▤','Temperaturas'],['password','⚿','Alterar senha']
   ];
   else items=[
-    ['dashboard','⌂','Painel'],['requests','▣','Solicitações'],['cancellations','×','Cancelamentos'],['clients','♙','Clientes'],['couriers','➜','Entregadores'],['receivers','✓','Técnicos'],['prices','R$','Preços'],['finance','▦','Financeiro'],['temperature','▤','Temperaturas'],['password','⚿','Alterar senha']
+    ['dashboard','⌂','Painel'],['requests','▣','Solicitações'],['exam-timing','◷','Tempo de exames'],['cancellations','×','Cancelamentos'],['clients','♙','Clientes'],['couriers','➜','Entregadores'],['receivers','✓','Técnicos'],['prices','R$','Preços'],['finance','▦','Financeiro'],['temperature','▤','Temperaturas'],['password','⚿','Alterar senha']
   ];
   $('#nav').innerHTML=items.map(([id,ic,label])=>`<button class="nav-btn" data-page="${id}"><span>${ic}</span>${label}</button>`).join('');
   $$('.nav-btn').forEach(b=>b.addEventListener('click',()=>{navigate(b.dataset.page);$('.sidebar').classList.remove('open')}));
@@ -317,18 +422,34 @@ function renderNav(){
 
 async function navigate(page){
   state.page=page; $$('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('#topActions').innerHTML='';
-  const map={dashboard:['Painel','Visão geral do atendimento'],requests:[state.me.role==='client'?'Meus exames':'Solicitações','Pesquise por período, animal, tutor, raça e outros dados'],cancellations:['Cancelamentos','Solicitações canceladas e motivo'],clients:['Clientes','Cadastros e acessos dos clientes'],couriers:['Entregadores','Painel móvel, login próprio e termômetros'],receivers:['Técnicos','Técnicos do laboratório com login próprio'],prices:['Preços dos exames','Tabela geral e valores específicos por cliente'],finance:['Financeiro','Ranking de clientes e espelho detalhado para cobrança'],temperature:['Controle de temperatura','Fichas mensais de envio e recebimento'],password:['Alterar senha','A senha diferencia maiúsculas e minúsculas'],'client-users':['Usuários / técnicos','Cadastre acessos da clínica; carimbo é opcional e automático para técnicos'],tutors:['Tutores / clientes finais','Cadastre quem poderá acessar somente os próprios resultados'],'tutor-results':['Meus resultados','Visualize, baixe ou imprima somente os seus exames liberados'],'new-request':['Nova solicitação','Requisição de exames veterinários']};
+  const map={dashboard:['Painel','Visão geral do atendimento'],requests:[state.me.role==='client'?'Meus exames':'Solicitações','Pesquise por período, animal, tutor, raça e outros dados'],'exam-timing':['Tempo de exames','Prazos contados a partir do recebimento da amostra no laboratório'],cancellations:['Cancelamentos','Solicitações canceladas e motivo'],clients:['Clientes','Cadastros e acessos dos clientes'],couriers:['Entregadores','Painel móvel, login próprio e termômetros'],receivers:['Técnicos','Técnicos do laboratório com login próprio'],prices:['Preços dos exames','Tabela geral e valores específicos por cliente'],finance:['Financeiro','Ranking de clientes e espelho detalhado para cobrança'],temperature:['Controle de temperatura','Fichas mensais de envio e recebimento'],password:['Alterar senha','A senha diferencia maiúsculas e minúsculas'],'client-users':['Usuários / técnicos','Cadastre acessos da clínica; carimbo é opcional e automático para técnicos'],tutors:['Tutores / clientes finais','Cadastre quem poderá acessar somente os próprios resultados'],'tutor-results':['Meus resultados','Visualize, baixe ou imprima somente os seus exames liberados'],'new-request':['Nova solicitação','Requisição de exames veterinários']};
   $('#pageTitle').textContent=map[page]?.[0]||'HLab Vet';$('#pageSubtitle').textContent=map[page]?.[1]||'';
-  const fn={dashboard:renderDashboard,requests:renderRequests,cancellations:renderCancellations,clients:renderClients,couriers:renderCouriers,receivers:renderReceivers,prices:renderPrices,finance:renderFinance,temperature:renderTemperature,'client-users':renderClientUsers,tutors:renderTutors,'tutor-results':renderTutorResults,password:()=>showPasswordChange(false),'new-request':renderNewRequest}[page];
+  const fn={dashboard:renderDashboard,requests:renderRequests,'exam-timing':renderExamTiming,cancellations:renderCancellations,clients:renderClients,couriers:renderCouriers,receivers:renderReceivers,prices:renderPrices,finance:renderFinance,temperature:renderTemperature,'client-users':renderClientUsers,tutors:renderTutors,'tutor-results':renderTutorResults,password:()=>showPasswordChange(false),'new-request':renderNewRequest}[page];
   try{await fn?.()}catch(e){if(e.status===428)return showPasswordChange(true);$('#content').innerHTML=`<div class="card empty-state">${esc(e.message)}</div>`;toast(e.message,'error')}
 }
 
+function chartBarList(items,{status=false}={}){
+  if(!items?.length)return '<div class="chart-empty">Sem dados no período.</div>';
+  const max=Math.max(...items.map(x=>Number(x.n||0)),1);
+  return `<div class="mini-bars">${items.map(x=>{const label=status?(STATUS[x.status]||x.status):x.label;const pct=Math.max(3,Math.round(Number(x.n||0)/max*100));return `<div class="mini-bar-row"><div class="mini-bar-label"><span>${esc(label||'—')}</span><b>${Number(x.n||0)}</b></div><div class="mini-bar-track"><i style="width:${pct}%"></i></div></div>`}).join('')}</div>`;
+}
+function dailyLineChart(items){
+  if(!items?.length)return '<div class="chart-empty">Sem dados no período.</div>';
+  const vals=items.map(x=>Number(x.n||0)),max=Math.max(...vals,1),w=640,h=170,pad=18;
+  const pts=vals.map((v,i)=>{const x=pad+(w-pad*2)*(i/Math.max(vals.length-1,1)),y=h-pad-(h-pad*2)*(v/max);return [x,y]});
+  const poly=pts.map(p=>p.join(',')).join(' '),area=`${pad},${h-pad} ${poly} ${w-pad},${h-pad}`;
+  return `<div class="line-chart"><svg viewBox="0 0 ${w} ${h}" role="img" aria-label="Solicitações nos últimos 14 dias"><polygon class="line-area" points="${area}"></polygon><polyline class="line-stroke" points="${poly}"></polyline>${pts.map((p,i)=>`<circle cx="${p[0]}" cy="${p[1]}" r="3.5"><title>${items[i].day}: ${vals[i]}</title></circle>`).join('')}</svg><div class="line-labels"><span>${fmtDate(items[0].day)}</span><span>${fmtDate(items[items.length-1].day)}</span></div></div>`;
+}
+function labChartsHtml(c){
+  if(!c)return '';
+  return `<section class="dashboard-charts"><article class="card chart-wide"><div class="chart-head"><div><h3>Movimento dos últimos 14 dias</h3><p>Solicitações não canceladas por dia.</p></div></div>${dailyLineChart(c.daily||[])}</article><article class="card"><div class="chart-head"><div><h3>Status • 30 dias</h3><p>Visão rápida do fluxo.</p></div></div>${chartBarList((c.status30||[]).filter(x=>x.status!=='cancelado'),{status:true})}</article><article class="card"><div class="chart-head"><div><h3>Exames mais solicitados</h3><p>Últimos 30 dias.</p></div></div>${chartBarList(c.topExams||[])}</article><article class="card"><div class="chart-head"><div><h3>Clientes mais ativos</h3><p>Últimos 30 dias.</p></div></div>${chartBarList(c.topClients||[])}</article></section>`;
+}
 async function renderDashboard(){
   if(state.me.role==='tutor')return navigate('tutor-results');
-  const d=await api('/api/dashboard'),t=d.totals||{};
+  const d=await api('/api/dashboard'),t=d.totals||{},lab=['admin','staff'].includes(state.me.role);
   $('#content').innerHTML=`<div class="grid cards">
     ${metric('Solicitados hoje',t.solicitado||0)}${metric('Em coleta hoje',(t.atribuido||0)+(t.coletado||0))}${metric('Em análise hoje',(t.recebido||0)+(t.em_analise||0))}${metric('Concluídos hoje',t.concluido||0)}
-  </div><div class="card" style="margin-top:16px"><div class="section-title"><div><h3>Solicitações de hoje</h3><p>Outros dias aparecem somente quando você filtrar em Solicitações.</p></div></div>${requestTable(d.recent||[],false)}</div>`;
+  </div>${lab?labChartsHtml(d.charts):''}<div class="card" style="margin-top:16px"><div class="section-title"><div><h3>Solicitações de hoje</h3><p>Outros dias aparecem somente quando você filtrar em Solicitações.</p></div></div>${requestTable(d.recent||[],false)}</div>`;
   bindDetailButtons();bindResultEyes();
 }
 
@@ -360,10 +481,11 @@ async function renderRequests(){
   await load();
 }
 
+function priorityBadge(value){const v=value||'normal';const label=v==='urgent'?'Urgente':v==='priority'?'Prioridade':'Normal';return `<span class="priority-pill ${v}">${label}</span>`}
 function requestTable(rows,actions=true){
   if(!rows.length)return `<div class="empty-state">Nenhuma solicitação encontrada.</div>`;
   const client=state.me?.role==='client';
-  return `<div class="table-wrap"><table><thead><tr><th>Protocolo</th>${!client?'<th>Cliente</th>':''}<th>Animal</th><th>Tutor</th><th>Status</th><th>Tipo</th><th>Data</th>${client?'<th>Resultado</th>':''}${actions&&!client?'<th>Ações</th>':''}</tr></thead><tbody>${rows.map(r=>`<tr><td><button class="link-btn" data-detail="${r.id}"><strong>${esc(r.protocol)}</strong></button></td>${!client?`<td>${esc(r.client_name||'')}</td>`:''}<td>${esc(r.patient_name||'')}</td><td>${esc(r.tutor_name||'')}</td><td><span class="badge ${r.status}">${esc(STATUS[r.status]||r.status)}</span>${!client&&r.status==='solicitado'&&!r.accepted_at?'<br><small class="pending-accept">Aguardando aceite</small>':''}</td><td>${r.request_kind==='scheduled'?`<span class="badge scheduled">Agendada</span><br><small>${fmtDateTime(r.scheduled_at)}</small>`:'Imediata'}</td><td>${fmtDateTime(r.created_at)}</td>${client?`<td class="result-cell"><button class="result-eye ${Number(r.result_count)>0?'ready':'pending'}" data-result-eye="${r.id}" data-has-result="${Number(r.result_count)>0?1:0}" title="${Number(r.result_count)>0?'Resultado disponível':'Resultado ainda não disponível'}">👁</button></td>`:''}${actions&&!client?`<td><div class="actions"><button class="btn soft small" data-detail="${r.id}">Abrir</button>${state.me.role==='admin'?`<button class="btn ghost small" data-print-one="${r.id}">Imprimir/PDF</button>`:''}</div></td>`:''}</tr>`).join('')}</tbody></table></div>`;
+  return `<div class="table-wrap"><table><thead><tr><th>Protocolo</th>${!client?'<th>Cliente</th>':''}<th>Animal</th><th>Prioridade</th><th>Tutor</th><th>Status</th><th>Tipo</th><th>Data</th>${client?'<th>Resultado</th>':''}${actions&&!client?'<th>Ações</th>':''}</tr></thead><tbody>${rows.map(r=>`<tr><td><button class="link-btn" data-detail="${r.id}"><strong>${esc(r.protocol)}</strong></button></td>${!client?`<td>${esc(r.client_name||'')}</td>`:''}<td>${esc(r.patient_name||'')}</td><td>${priorityBadge(r.priority)}</td><td>${esc(r.tutor_name||'')}</td><td><span class="badge ${r.status}">${esc(STATUS[r.status]||r.status)}</span>${!client&&r.status==='solicitado'&&!r.accepted_at?'<br><small class="pending-accept">Aguardando aceite</small>':''}</td><td>${r.request_kind==='scheduled'?`<span class="badge scheduled">Agendada</span><br><small>${fmtDateTime(r.scheduled_at)}</small>`:'Imediata'}</td><td>${fmtDateTime(r.created_at)}</td>${client?`<td class="result-cell"><button class="result-eye ${Number(r.result_count)>0?'ready':'pending'}" data-result-eye="${r.id}" data-has-result="${Number(r.result_count)>0?1:0}" title="${Number(r.result_count)>0?'Resultado disponível':'Resultado ainda não disponível'}">👁</button></td>`:''}${actions&&!client?`<td><div class="actions"><button class="btn soft small" data-detail="${r.id}">Abrir</button>${state.me.role==='admin'?`<button class="btn ghost small" data-print-one="${r.id}">Imprimir/PDF</button>`:''}</div></td>`:''}</tr>`).join('')}</tbody></table></div>`;
 }
 function bindDetailButtons(){
   $$('[data-detail]').forEach(b=>b.addEventListener('click',()=>openRequest(Number(b.dataset.detail))));
@@ -377,7 +499,7 @@ function bindResultEyes(){
 async function openClientResults(id){
   try{
     const d=await api(`/api/requisitions/${id}`),r=d.requisition;
-    modal(`<div class="detail-head"><div><h3>Resultado • ${esc(r.patient_name)}</h3><p class="muted">${esc(r.protocol)} • ${esc(r.client_name)}</p></div></div><h4>Exames solicitados</h4><div>${d.exams.map(x=>`<span class="badge" style="margin:2px">${esc(x.exam_name)}</span>`).join('')}</div><h4 style="margin-top:18px">Arquivos de resultado</h4>${resultFilesHtml(d.files,true)}<div class="actions" style="margin-top:16px"><button class="btn ghost" data-close-modal>Fechar</button></div>`);
+    modal(`<div class="detail-head"><div><h3>Resultado • ${esc(r.patient_name)}</h3><p class="muted">${esc(r.protocol)} • ${esc(r.client_name)}</p></div></div><h4>Exames solicitados</h4><div>${d.exams.map(x=>`<span class="badge" style="margin:2px">${esc(x.exam_name)}</span>`).join('')}</div><h4 style="margin-top:18px">Arquivos de resultado</h4>${resultFilesHtml(d.files,true,false,true)}<div class="actions" style="margin-top:16px"><button class="btn ghost" data-close-modal>Fechar</button></div>`);
     bindResultFileButtons($('#modalContent'),async()=>{closeModal();await openRequest(id)});
   }catch(e){toast(e.message,'error')}
 }
@@ -393,7 +515,7 @@ async function renderNewRequest(){
   const crmvDefault=loggedClientTech?[state.me.clientCouncil||'CRMV',state.me.clientCouncilState,state.me.clientCouncilNumber].filter(Boolean).join(' '):'';
   $('#content').innerHTML=`<form id="newReqForm" class="stack">
     ${state.me.role!=='client'?`<div class="form-card"><h4>Cliente solicitante</h4><div class="form-grid"><label class="field span2">Cliente<select name="clientId" required><option value="">Selecione</option>${state.clients.filter(c=>c.active).map(c=>`<option value="${c.id}">${esc(c.name)}</option>`).join('')}</select></label></div></div>`:''}
-    <div class="form-card"><h4>Tipo de solicitação</h4><div class="form-grid"><label class="field"><span>Atendimento</span><select name="requestKind" id="requestKind"><option value="immediate">Solicitar agora</option><option value="scheduled">Agendar coleta</option></select></label><label class="field hidden" id="scheduledWrap">Data e hora agendada<input name="scheduledAtLocal" id="scheduledAtLocal" type="datetime-local"></label></div><p class="muted">Solicitações imediatas alertam o laboratório assim que são enviadas. Nas agendadas, o alerta começa no horário marcado.</p></div>
+    <div class="form-card"><h4>Tipo de solicitação</h4><div class="form-grid"><label class="field"><span>Atendimento</span><select name="requestKind" id="requestKind"><option value="immediate">Solicitar agora</option><option value="scheduled">Agendar coleta</option></select></label><label class="field"><span>Prioridade</span><select name="priority"><option value="normal">Normal</option><option value="priority">Prioridade</option><option value="urgent">Urgente</option></select></label><label class="field hidden" id="scheduledWrap">Data e hora agendada<input name="scheduledAtLocal" id="scheduledAtLocal" type="datetime-local"></label></div><p class="muted">A prioridade ajuda o laboratório a organizar a fila. O prazo técnico de cada exame começa somente quando a amostra é recebida no laboratório.</p></div>
     <div class="form-card"><h4>Dados da requisição</h4><div class="form-grid">
       <label class="field span2">Clínica / estabelecimento<input name="clinicName" value="${esc(profile?.name||'')}" placeholder="Nome da clínica"></label>
       <label class="field">Veterinário / técnico responsável<input name="veterinarianName" value="${esc(vetDefault)}" ${loggedClientTech?'readonly':''}></label><label class="field">CRMV / registro<input name="crmv" value="${esc(crmvDefault)}" ${loggedClientTech?'readonly':''}></label>
@@ -447,14 +569,14 @@ async function openRequest(id){
   const lab=['admin','staff'].includes(state.me.role); if(lab) await loadAdminLists();
   const actions=lab?adminRequestActions(r):'';
   const clientCanCancel=state.me.role==='client'&&!r.collected_at&&['solicitado','atribuido'].includes(r.status);
-  const resultHtml=resultFilesHtml(d.files,true,lab);
+  const resultHtml=resultFilesHtml(d.files,true,lab,state.me.role==='client');
   const clientCanDeleteExam=state.me.role==='client'&&r.status==='solicitado'&&!r.accepted_at;
   const labCanDeleteExam=state.me.role!=='client'&&!['concluido','cancelado'].includes(r.status);
   const canDeleteExam=clientCanDeleteExam||labCanDeleteExam;
-  const examsHtml=d.exams.map(x=>`<span class="exam-chip"><span class="badge">${esc(x.exam_name)}</span>${canDeleteExam&&d.exams.length>1?`<button class="exam-remove" type="button" data-delete-exam="${x.id}" title="Excluir este exame">×</button>`:''}</span>`).join('');
+  const examsHtml=d.exams.map(x=>`<span class="exam-chip"><span class="badge">${esc(x.exam_name)}</span>${lab&&x.due_at?`<small class="exam-time-inline ${x.completed_at?(x.completed_within_sla===0?'late':'done'):(new Date(x.due_at).getTime()<Date.now()?'late':'')}">${x.completed_at?'Concluído':`Prazo ${fmtDateTime(x.due_at)}`}</small>`:''}${canDeleteExam&&d.exams.length>1?`<button class="exam-remove" type="button" data-delete-exam="${x.id}" title="Excluir este exame">×</button>`:''}</span>`).join('');
   modal(`<div class="detail-head"><div><h3>${esc(r.protocol)} • ${esc(r.patient_name)}</h3><p class="muted">${esc(r.client_name)} • criado em ${fmtDateTime(r.created_at)}${r.request_kind==='scheduled'?` • agendado para ${fmtDateTime(r.scheduled_at)}`:''}</p></div><span class="badge ${r.status}">${esc(STATUS[r.status])}</span></div>
     <div class="detail-cols"><div>
-      <dl class="kv"><dt>Paciente</dt><dd>${esc(r.patient_name)}</dd><dt>Espécie / raça</dt><dd>${esc([r.species,r.breed].filter(Boolean).join(' • '))||'—'}</dd><dt>Nascimento / idade</dt><dd>${esc(r.birth_date?fmtDate(r.birth_date):'—')} ${esc(r.age_text||exactAgeText(r.birth_date,r.collection_date||today()))}</dd><dt>Tutor</dt><dd>${esc(r.tutor_name||'—')}</dd><dt>Veterinário / CRMV</dt><dd>${esc([r.veterinarian_name,r.crmv].filter(Boolean).join(' • '))||'—'}</dd><dt>Tipo</dt><dd>${r.request_kind==='scheduled'?`Agendada • ${fmtDateTime(r.scheduled_at)}`:'Imediata'}</dd><dt>Aceite do laboratório</dt><dd>${r.accepted_at?`${fmtDateTime(r.accepted_at)} • ${esc(r.accepted_by_name||'HLab Vet')}`:'Aguardando aceite'}</dd><dt>Coleta</dt><dd>${fmtDateTime(r.collected_at)} ${r.collection_temperature!=null?`• ${esc(r.collection_temperature)} °C`:''}</dd><dt>Entregador / termômetro</dt><dd>${esc([r.transport_courier_name||r.courier_name,r.transport_thermometer_code].filter(Boolean).join(' • '))||'—'}</dd><dt>Responsável no envio</dt><dd>${esc(r.sent_by_name||'—')}</dd><dt>Local do envio</dt><dd>${esc(r.sent_from_location||'—')}</dd><dt>Recebimento</dt><dd>${fmtDateTime(r.lab_received_at)} ${r.lab_received_temperature!=null?`• ${esc(r.lab_received_temperature)} °C`:''}</dd><dt>Técnico</dt><dd>${esc(r.receiver_name||'—')}</dd><dt>Local do recebimento</dt><dd>${esc(r.received_location||'—')}</dd><dt>Observação do recebimento</dt><dd>${esc(r.receiving_observation||'—')}</dd></dl>
+      <dl class="kv"><dt>Paciente</dt><dd>${esc(r.patient_name)}</dd><dt>Espécie / raça</dt><dd>${esc([r.species,r.breed].filter(Boolean).join(' • '))||'—'}</dd><dt>Nascimento / idade</dt><dd>${esc(r.birth_date?fmtDate(r.birth_date):'—')} ${esc(r.age_text||exactAgeText(r.birth_date,r.collection_date||today()))}</dd><dt>Tutor</dt><dd>${esc(r.tutor_name||'—')}</dd><dt>Veterinário / CRMV</dt><dd>${esc([r.veterinarian_name,r.crmv].filter(Boolean).join(' • '))||'—'}</dd><dt>Tipo</dt><dd>${r.request_kind==='scheduled'?`Agendada • ${fmtDateTime(r.scheduled_at)}`:'Imediata'}</dd><dt>Prioridade</dt><dd>${priorityBadge(r.priority)}</dd><dt>Aceite do laboratório</dt><dd>${r.accepted_at?`${fmtDateTime(r.accepted_at)} • ${esc(r.accepted_by_name||'HLab Vet')}`:'Aguardando aceite'}</dd><dt>Coleta</dt><dd>${fmtDateTime(r.collected_at)} ${r.collection_temperature!=null?`• ${esc(r.collection_temperature)} °C`:''}</dd><dt>Entregador / termômetro</dt><dd>${esc([r.transport_courier_name||r.courier_name,r.transport_thermometer_code].filter(Boolean).join(' • '))||'—'}</dd><dt>Responsável no envio</dt><dd>${esc(r.sent_by_name||'—')}</dd><dt>Local do envio</dt><dd>${esc(r.sent_from_location||'—')}</dd><dt>Recebimento</dt><dd>${fmtDateTime(r.lab_received_at)} ${r.lab_received_temperature!=null?`• ${esc(r.lab_received_temperature)} °C`:''}</dd><dt>Técnico</dt><dd>${esc(r.receiver_name||'—')}</dd><dt>Local do recebimento</dt><dd>${esc(r.received_location||'—')}</dd><dt>Observação do recebimento</dt><dd>${esc(r.receiving_observation||'—')}</dd></dl>
       <h4>Exames</h4><div class="exam-list">${examsHtml}</div>${canDeleteExam&&d.exams.length===1?'<p class="muted">A solicitação precisa manter pelo menos um exame. Para substituir o único exame, cancele esta solicitação e faça outra.</p>':''}
       <h4>Material enviado</h4><p>${d.materials.map(esc).join(', ')||'—'} ${r.material_other?`• ${esc(r.material_other)}`:''}</p>
       <h4>Informações clínicas</h4><p>${esc(r.clinical_info||'—')}</p>
@@ -511,6 +633,46 @@ async function loadAdminLists(){
   if(state.me.role==='client')return;
   const [c,co,r]=await Promise.all([api('/api/clients'),api('/api/couriers'),api('/api/technicians')]);state.clients=c.clients||[];state.couriers=co.couriers||[];state.receivers=r.receivers||[];
 }
+
+
+function fmtDurationSeconds(sec){
+  if(sec==null||!Number.isFinite(Number(sec)))return '—';
+  let n=Math.abs(Math.round(Number(sec))),days=Math.floor(n/86400);n%=86400;const h=Math.floor(n/3600);n%=3600;const m=Math.floor(n/60);
+  const parts=[];if(days)parts.push(`${days}d`);if(h)parts.push(`${h}h`);parts.push(`${m}min`);return parts.join(' ');
+}
+function minutesLabel(min){const n=Number(min||0);if(!n)return '—';if(n%1440===0)return `${n/1440} dia${n/1440===1?'':'s'}`;if(n%60===0)return `${n/60} hora${n/60===1?'':'s'}`;return `${n} min`}
+function timingPill(t){
+  if(!t)return '<span class="sla-pill neutral">Sem prazo</span>';
+  if(t.status==='late')return `<span class="sla-pill late">Atrasado há ${fmtDurationSeconds(t.seconds)}</span>`;
+  if(t.status==='warning')return `<span class="sla-pill warning">Faltam ${fmtDurationSeconds(t.seconds)}</span>`;
+  if(t.status==='on_time')return `<span class="sla-pill on-time">No prazo • ${fmtDurationSeconds(t.seconds)} restantes</span>`;
+  if(t.status==='completed_late')return `<span class="sla-pill late">Concluído com atraso</span>`;
+  if(t.status==='completed_on_time')return `<span class="sla-pill done">Concluído no prazo</span>`;
+  return '<span class="sla-pill neutral">Sem prazo</span>';
+}
+function timingRequestCard(g){
+  const pending=g.pending||[],headline=g.state==='late'?`Atrasado • ${pending.filter(x=>x.timing?.status==='late').map(x=>x.examName).join(', ')||'há exame pendente'}`:g.state==='warning'?'Atenção: prazo próximo':g.state==='completed'?'Todos os exames concluídos':'Exames dentro do prazo';
+  return `<article class="timing-card ${g.state}"><div class="timing-card-head"><div><div class="timing-title"><strong>${esc(g.clientName)}</strong>${priorityBadge(g.priority)}</div><h3>${esc(g.protocol)} • ${esc(g.patientName)}</h3><p>Recebido ${fmtDateTime(g.labReceivedAt)} • Técnico: ${esc(g.receiverName||'—')}</p></div><div class="progress-number"><b>${g.completed}/${g.total}</b><span>${g.progressPct}% concluído</span></div></div><div class="timing-progress"><i style="width:${Math.max(0,Math.min(100,g.progressPct))}%"></i></div><div class="timing-summary"><strong>${esc(headline)}</strong></div>${pending.length?`<div class="timing-exam-list">${pending.map(x=>`<div class="timing-exam-row"><div><strong>${esc(x.examName)}</strong><small>Prazo: ${fmtDateTime(x.dueAt)}</small></div>${timingPill(x.timing)}<button class="btn soft small" data-finish-exam="${x.examId}">Concluir</button></div>`).join('')}</div>`:'<div class="timing-all-done">✓ Todos os exames foram concluídos.</div>'}</article>`;
+}
+async function renderExamTiming(){
+  if(!['admin','staff'].includes(state.me.role))return navigate('dashboard');
+  await loadAdminLists();
+  const [settings,report]=await Promise.all([api('/api/exam-timing/settings'),api('/api/exam-timing/report')]);
+  const admin=state.me.role==='admin',overrides=new Map((settings.overrides||[]).map(x=>[x.exam_code,x]));
+  $('#topActions').innerHTML=`<button class="btn soft" id="refreshTiming">↻ Atualizar</button>`;
+  $('#content').innerHTML=`${admin?`<section class="card timing-settings"><div class="section-title"><div><h3>Configuração dos prazos</h3><p>O cronômetro começa automaticamente no recebimento da amostra. Você pode selecionar vários exames e aplicar um único tempo a todos eles.</p></div></div><form id="timingDefaultForm" class="timing-default-form"><label>Tempo padrão<input id="timingDefaultValue" type="number" min="1" value="${Math.round(settings.defaultTurnaroundMinutes%60===0?settings.defaultTurnaroundMinutes/60:settings.defaultTurnaroundMinutes)}"></label><label>Unidade<select id="timingDefaultUnit"><option value="minutes" ${settings.defaultTurnaroundMinutes%60?'selected':''}>Minutos</option><option value="hours" ${settings.defaultTurnaroundMinutes%60===0?'selected':''}>Horas</option></select></label><label>Aviso amarelo<input id="timingWarning" type="number" min="1" value="${settings.warningMinutes}"><small>minutos antes do vencimento</small></label><button class="btn primary">Salvar padrão</button></form><div class="bulk-time-box"><div><h4>Aplicar o mesmo tempo a vários exames</h4><p class="muted">Marque quantos exames quiser e informe somente um tempo.</p></div><div class="bulk-time-controls"><input id="bulkTimeValue" type="number" min="1" value="2"><select id="bulkTimeUnit"><option value="hours">Horas</option><option value="minutes">Minutos</option></select><button class="btn secondary" id="applyBulkTime" type="button">Aplicar aos selecionados</button><button class="btn ghost" id="removeBulkTime" type="button">Usar tempo padrão</button></div><div class="timing-catalog">${(settings.catalog||[]).map(g=>`<section><h5>${esc(g.category)}</h5>${g.items.map(e=>{const o=overrides.get(e.code);return `<label class="timing-check"><input type="checkbox" class="timing-exam-check" value="${e.code}"><span>${esc(e.name)}</span><small>${o?minutesLabel(o.turnaround_minutes):`Padrão • ${minutesLabel(settings.defaultTurnaroundMinutes)}`}</small></label>`}).join('')}</section>`).join('')}</div></div></section>`:''}
+  <section class="timing-kpis"><div class="card metric"><div class="number" id="kpiPending">—</div><div class="label">Exames pendentes</div></div><div class="card metric green"><div class="number" id="kpiOnTime">—</div><div class="label">No prazo</div></div><div class="card metric yellow"><div class="number" id="kpiWarning">—</div><div class="label">Faltando até ${settings.warningMinutes} min</div></div><div class="card metric red"><div class="number" id="kpiLate">—</div><div class="label">Atrasados</div></div></section>
+  <section class="card"><form id="timingFilters" class="filters"><select name="mode"><option value="pending">Em andamento</option><option value="late">Somente atrasados</option><option value="completed">Concluídos recentes</option><option value="all">Todos</option></select><select name="clientId"><option value="">Todos os clientes</option>${state.clients.filter(x=>x.active).map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select><select name="technicianId"><option value="">Todos os técnicos</option>${state.receivers.filter(x=>x.active).map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select><button class="btn primary">Filtrar</button></form><div id="timingBoard" class="timing-board"><div class="empty-state">Carregando…</div></div></section>
+  <section class="card timing-report-card"><div class="section-title"><div><h3>Desempenho por técnico</h3><p>Últimos 30 dias. Mostra quantos exames foram concluídos no prazo, com atraso e quantos continuam atrasados.</p></div></div>${timingReportHtml(report)}</section>`;
+  const unitToMinutes=(v,u)=>Math.max(1,Math.round(Number(v||0)*(u==='hours'?60:1)));
+  $('#timingDefaultForm')?.addEventListener('submit',async e=>{e.preventDefault();try{const r=await api('/api/exam-timing/settings',{method:'PUT',json:{mode:'defaults',defaultTurnaroundMinutes:unitToMinutes($('#timingDefaultValue').value,$('#timingDefaultUnit').value),warningMinutes:Number($('#timingWarning').value)}});toast(r.message);renderExamTiming()}catch(er){toast(er.message,'error')}});
+  const selectedCodes=()=>$$('.timing-exam-check:checked').map(x=>x.value);
+  $('#applyBulkTime')?.addEventListener('click',async()=>{const examCodes=selectedCodes();if(!examCodes.length)return toast('Selecione pelo menos um exame.','error');try{const r=await api('/api/exam-timing/settings',{method:'PUT',json:{mode:'bulk',examCodes,turnaroundMinutes:unitToMinutes($('#bulkTimeValue').value,$('#bulkTimeUnit').value)}});toast(r.message);renderExamTiming()}catch(er){toast(er.message,'error')}});
+  $('#removeBulkTime')?.addEventListener('click',async()=>{const examCodes=selectedCodes();if(!examCodes.length)return toast('Selecione pelo menos um exame.','error');try{const r=await api('/api/exam-timing/settings',{method:'PUT',json:{mode:'remove',examCodes}});toast(r.message);renderExamTiming()}catch(er){toast(er.message,'error')}});
+  const loadBoard=async()=>{const qs=new URLSearchParams(new FormData($('#timingFilters')));for(const [k,v] of [...qs])if(!v)qs.delete(k);const d=await api(`/api/exam-timing/board?${qs}`);$('#kpiPending').textContent=d.counts.pending;$('#kpiOnTime').textContent=d.counts.onTime;$('#kpiWarning').textContent=d.counts.warning;$('#kpiLate').textContent=d.counts.late;$('#timingBoard').innerHTML=d.requests?.length?d.requests.map(timingRequestCard).join(''):'<div class="empty-state">Nenhum exame neste filtro.</div>';$$('[data-finish-exam]').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Marcar este exame como concluído agora?'))return;try{const x=await api(`/api/exam-timing/exams/${b.dataset.finishExam}/complete`,{method:'POST'});toast(x.message);loadBoard()}catch(er){toast(er.message,'error')}}));};
+  $('#timingFilters')?.addEventListener('submit',e=>{e.preventDefault();loadBoard()});$('#refreshTiming')?.addEventListener('click',loadBoard);await loadBoard();
+}
+function timingReportHtml(d){const t=d?.totals||{},rows=d?.technicians||[];return `<div class="report-kpis"><span><b>${t.onTime||0}</b> no prazo</span><span><b>${t.late||0}</b> com atraso</span><span><b>${t.pendingLate||0}</b> atrasados agora</span><span><b>${t.onTimePct||0}%</b> pontualidade</span></div>${rows.length?`<div class="table-wrap"><table><thead><tr><th>Técnico</th><th>Concluídos</th><th>No prazo</th><th>Atrasados</th><th>Pendentes atrasados</th><th>Pontualidade</th></tr></thead><tbody>${rows.map(x=>`<tr><td><strong>${esc(x.technician)}</strong></td><td>${x.completed}</td><td>${x.onTime}</td><td>${x.late}</td><td>${x.pendingLate}</td><td><strong>${x.onTimePct}%</strong></td></tr>`).join('')}</tbody></table></div>`:'<div class="empty-state">Ainda não há dados suficientes para o relatório.</div>'}`}
 
 async function renderClients(){
   const d=await api('/api/clients');state.clients=d.clients||[];const admin=state.me.role==='admin';$('#topActions').innerHTML=admin?`<button class="btn primary" id="addClient">＋ Cadastrar cliente</button>`:'';
