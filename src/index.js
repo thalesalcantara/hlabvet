@@ -67,6 +67,19 @@ async function api(request, env, url) {
 
   if (path === '/api/health') return ok({ app: env.APP_NAME || 'HLab Vet Resultados', time: nowIso() });
   if (path === '/api/catalog' && method === 'GET') return ok({ exams: catalogWithCodes(), materials: MATERIALS });
+  // Painel do proprietário: autenticação e rotas totalmente separadas do laboratório.
+  if (path === '/api/owner/login' && method === 'POST') return ownerLogin(request, env, url);
+  if (path === '/api/owner/logout' && method === 'POST') return ownerLogout(request, env, url);
+  if (path === '/api/owner/me' && method === 'GET') return ownerMe(request, env);
+  if (path === '/api/owner/dashboard' && method === 'GET') return ownerDashboard(request, env, url);
+  if (path === '/api/owner/pricing' && method === 'GET') return ownerPricing(request, env);
+  if (path === '/api/owner/pricing' && method === 'PUT') return ownerUpdatePricing(request, env);
+  if (path === '/api/owner/change-password' && method === 'POST') return ownerChangePassword(request, env);
+  if (path === '/api/owner/backup' && method === 'POST') return ownerCreateBackup(request, env);
+  if (path === '/api/owner/backups' && method === 'GET') return ownerListBackups(request, env);
+  if (path === '/api/owner/export.zip' && method === 'GET') return ownerExportZip(request, env, url);
+  if (path === '/api/owner/reset' && method === 'POST') return ownerResetSystem(request, env);
+
   if (path === '/api/login' && method === 'POST') return login(request, env, url);
   if (path === '/api/logout' && method === 'POST') return logout(request, env, url);
 
@@ -185,6 +198,320 @@ async function api(request, env, url) {
   if (path === '/api/audit' && method === 'GET') return requireAdminOnly(user, () => listAudit(env, url));
 
   return err('Rota não encontrada.', 404);
+}
+
+
+function ownerCookieToken(request) {
+  const cookie = request.headers.get('cookie') || '';
+  const match = cookie.match(/(?:^|;\s*)hlab_owner_session=([^;]+)/);
+  return match ? decodeURIComponent(match[1]) : null;
+}
+
+function ownerSessionCookie(token, expires, secure = true) {
+  return `hlab_owner_session=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Strict; Expires=${new Date(expires).toUTCString()}${secure ? '; Secure' : ''}`;
+}
+function clearOwnerSessionCookie(secure = true) {
+  return `hlab_owner_session=; Path=/; HttpOnly; SameSite=Strict; Max-Age=0${secure ? '; Secure' : ''}`;
+}
+
+async function ownerGet(request, env) {
+  const token = ownerCookieToken(request);
+  if (!token) return null;
+  const tokenHash = await sha256(token);
+  const row = await env.DB.prepare(`
+    SELECT oa.id,oa.username_display,oa.username_key,oa.active,os.expires_at
+    FROM owner_sessions os JOIN owner_accounts oa ON oa.id=os.owner_account_id
+    WHERE os.token_hash=?
+  `).bind(tokenHash).first();
+  if (!row || !row.active || new Date(row.expires_at).getTime() <= Date.now()) {
+    if (row) await env.DB.prepare('DELETE FROM owner_sessions WHERE token_hash=?').bind(tokenHash).run();
+    return null;
+  }
+  return row;
+}
+
+async function ownerRequire(request, env) {
+  const owner = await ownerGet(request, env);
+  return owner || null;
+}
+
+async function ownerLogin(request, env, url) {
+  const body = await safeBody(request);
+  const usernameKey = normalizeUsername(body?.username || '');
+  const owner = await env.DB.prepare('SELECT * FROM owner_accounts WHERE username_key=? AND active=1').bind(usernameKey).first();
+  if (!owner || !await verifyPassword(String(body?.password || ''), owner.password_hash, owner.password_salt)) {
+    return err('Usuário ou senha inválidos.', 401);
+  }
+  await env.DB.prepare('DELETE FROM owner_sessions WHERE expires_at<=?').bind(nowIso()).run();
+  const token = randomToken(32);
+  const tokenHash = await sha256(token);
+  const days = Math.max(1, Number(env.OWNER_SESSION_DAYS || env.SESSION_DAYS || 14));
+  const expires = new Date(Date.now() + days * 86400000).toISOString();
+  await env.DB.prepare('INSERT INTO owner_sessions(token_hash,owner_account_id,expires_at) VALUES(?,?,?)')
+    .bind(tokenHash, owner.id, expires).run();
+  return json({ok:true, owner:{id:owner.id,username:owner.username_display}}, 200, {
+    'set-cookie': ownerSessionCookie(token, expires, url.protocol === 'https:')
+  });
+}
+
+async function ownerLogout(request, env, url) {
+  const token = ownerCookieToken(request);
+  if (token) await env.DB.prepare('DELETE FROM owner_sessions WHERE token_hash=?').bind(await sha256(token)).run();
+  return json({ok:true}, 200, {'set-cookie': clearOwnerSessionCookie(url.protocol === 'https:')});
+}
+
+async function ownerMe(request, env) {
+  const owner = await ownerRequire(request, env);
+  if (!owner) return err('Acesso do proprietário não autorizado.', 401);
+  return ok({owner:{id:owner.id,username:owner.username_display}});
+}
+
+function ownerMonth(value='') {
+  const v=String(value||'').trim();
+  if(/^\d{4}-\d{2}$/.test(v)) return v;
+  return fortalezaToday().slice(0,7);
+}
+
+async function ownerR2Stats(env, maxObjects=20000) {
+  let cursor=undefined, count=0, bytes=0, truncated=false, loops=0;
+  do {
+    const page=await env.FILES.list({limit:1000,cursor});
+    for(const o of page.objects||[]){count++;bytes+=Number(o.size||0);if(count>=maxObjects){truncated=true;break;}}
+    if(truncated) break;
+    cursor=page.truncated?page.cursor:undefined;
+    loops++;
+  } while(cursor && loops<25);
+  if(cursor) truncated=true;
+  return {count,bytes,truncated};
+}
+
+async function ownerDbSize(env) {
+  try {
+    const pc=await env.DB.prepare('PRAGMA page_count').first();
+    const ps=await env.DB.prepare('PRAGMA page_size').first();
+    const pageCount=Number(pc?.page_count ?? Object.values(pc||{})[0] ?? 0);
+    const pageSize=Number(ps?.page_size ?? Object.values(ps||{})[0] ?? 0);
+    return pageCount && pageSize ? pageCount*pageSize : null;
+  } catch { return null; }
+}
+
+async function ownerPricingFor(env, activeClients) {
+  const tier=await env.DB.prepare(`
+    SELECT * FROM owner_pricing_tiers
+    WHERE active=1 AND min_clients<=? AND (max_clients IS NULL OR max_clients>=?)
+    ORDER BY sort_order,id LIMIT 1
+  `).bind(activeClients,activeClients).first();
+  const contract=await env.DB.prepare('SELECT * FROM owner_contract_settings WHERE id=1').first();
+  const suggested=Number(tier?.monthly_cents||0);
+  const contracted=contract?.contracted_monthly_cents==null ? null : Number(contract.contracted_monthly_cents);
+  const base=contracted==null?suggested:contracted;
+  const discount=Number(contract?.discount_cents||0);
+  return {tier,suggestedCents:suggested,contractedCents:contracted,discountCents:discount,finalCents:Math.max(0,base-discount),dueDay:Number(contract?.due_day||10),notes:contract?.notes||''};
+}
+
+async function ownerDashboard(request, env, url) {
+  const owner=await ownerRequire(request,env);if(!owner)return err('Acesso do proprietário não autorizado.',401);
+  const month=ownerMonth(url.searchParams.get('month'));
+  const t0=performance.now();
+  await env.DB.prepare('SELECT 1 AS ok').first();
+  const dbLatencyMs=Math.max(0,Math.round((performance.now()-t0)*10)/10);
+  const [clients,activeClients,requests,exams,results,tutors,couriers,staff,dbBytes,r2]=await Promise.all([
+    env.DB.prepare(`SELECT COUNT(*) n,SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) active_n FROM clients`).first(),
+    env.DB.prepare(`SELECT COUNT(DISTINCT client_id) n FROM requisitions WHERE status<>'cancelado' AND strftime('%Y-%m',datetime(created_at,'-3 hours'))=?`).bind(month).first(),
+    env.DB.prepare(`SELECT COUNT(*) n FROM requisitions WHERE status<>'cancelado' AND strftime('%Y-%m',datetime(created_at,'-3 hours'))=?`).bind(month).first(),
+    env.DB.prepare(`SELECT COUNT(*) n FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id WHERE r.status<>'cancelado' AND strftime('%Y-%m',datetime(r.created_at,'-3 hours'))=?`).bind(month).first(),
+    env.DB.prepare(`SELECT COUNT(*) n,COALESCE(SUM(size_bytes),0) bytes FROM result_files rf JOIN requisitions r ON r.id=rf.requisition_id WHERE r.status<>'cancelado'`).first(),
+    env.DB.prepare(`SELECT COUNT(*) n FROM tutors WHERE active=1`).first(),
+    env.DB.prepare(`SELECT COUNT(*) n FROM couriers WHERE active=1`).first(),
+    env.DB.prepare(`SELECT COUNT(*) n FROM receivers WHERE active=1`).first(),
+    ownerDbSize(env),
+    ownerR2Stats(env)
+  ]);
+  const activeN=Number(activeClients?.n||0);
+  const pricing=await ownerPricingFor(env,activeN);
+  const backups=await env.DB.prepare(`SELECT id,r2_key,size_bytes,kind,created_by,created_at FROM owner_backup_log ORDER BY id DESC LIMIT 5`).all();
+  return ok({
+    month,
+    counts:{registeredClients:Number(clients?.n||0),enabledClients:Number(clients?.active_n||0),activeClients:activeN,requests:Number(requests?.n||0),exams:Number(exams?.n||0),results:Number(results?.n||0),tutors:Number(tutors?.n||0),couriers:Number(couriers?.n||0),staff:Number(staff?.n||0)},
+    storage:{databaseBytes:dbBytes,resultBytes:Number(results?.bytes||0),r2Bytes:r2.bytes,r2Objects:r2.count,r2Truncated:r2.truncated},
+    health:{api:'online',database:'online',r2:'online',dbLatencyMs},
+    pricing,
+    backups:backups.results||[]
+  });
+}
+
+async function ownerPricing(request, env) {
+  const owner=await ownerRequire(request,env);if(!owner)return err('Acesso do proprietário não autorizado.',401);
+  const tiers=await env.DB.prepare('SELECT * FROM owner_pricing_tiers WHERE active=1 ORDER BY sort_order,id').all();
+  const contract=await env.DB.prepare('SELECT * FROM owner_contract_settings WHERE id=1').first();
+  return ok({tiers:tiers.results||[],contract});
+}
+
+async function ownerUpdatePricing(request, env) {
+  const owner=await ownerRequire(request,env);if(!owner)return err('Acesso do proprietário não autorizado.',401);
+  const body=await safeBody(request);if(!body)return err('Dados inválidos.');
+  const stmts=[];
+  if(Array.isArray(body.tiers)){
+    for(const item of body.tiers){
+      const id=Number(item.id),cents=Math.round(Number(item.monthlyCents));
+      if(!Number.isInteger(id)||id<1||!Number.isFinite(cents)||cents<0)return err('Faixa de preço inválida.');
+      stmts.push(env.DB.prepare('UPDATE owner_pricing_tiers SET monthly_cents=?,updated_at=? WHERE id=?').bind(cents,nowIso(),id));
+    }
+  }
+  const contracted=body.contractedMonthlyCents==null||body.contractedMonthlyCents===''?null:Math.round(Number(body.contractedMonthlyCents));
+  const discount=Math.max(0,Math.round(Number(body.discountCents||0)));
+  const dueDay=Math.max(1,Math.min(28,Math.round(Number(body.dueDay||10))));
+  if(contracted!==null && (!Number.isFinite(contracted)||contracted<0))return err('Valor contratado inválido.');
+  stmts.push(env.DB.prepare(`UPDATE owner_contract_settings SET contracted_monthly_cents=?,discount_cents=?,due_day=?,notes=?,updated_at=? WHERE id=1`)
+    .bind(contracted,discount,dueDay,clampString(body.notes||'',1000),nowIso()));
+  if(stmts.length)await env.DB.batch(stmts);
+  return ok({message:'Configuração comercial salva.'});
+}
+
+async function ownerChangePassword(request, env) {
+  const owner=await ownerRequire(request,env);if(!owner)return err('Acesso do proprietário não autorizado.',401);
+  const body=await safeBody(request),current=String(body?.currentPassword||''),next=String(body?.newPassword||'');
+  const dbu=await env.DB.prepare('SELECT * FROM owner_accounts WHERE id=?').bind(owner.id).first();
+  if(!dbu||!await verifyPassword(current,dbu.password_hash,dbu.password_salt))return err('Senha atual incorreta.',400);
+  if(next.length<10)return err('A nova senha deve ter pelo menos 10 caracteres.');
+  if(next===current)return err('A nova senha deve ser diferente da atual.');
+  const hp=await hashPassword(next);
+  await env.DB.prepare('UPDATE owner_accounts SET password_hash=?,password_salt=?,updated_at=? WHERE id=?').bind(hp.hash,hp.salt,nowIso(),owner.id).run();
+  await env.DB.prepare('DELETE FROM owner_sessions WHERE owner_account_id=? AND token_hash<>?')
+    .bind(owner.id,await sha256(ownerCookieToken(request)||'')).run();
+  return ok({message:'Senha do proprietário alterada com sucesso.'});
+}
+
+async function ownerLogicalSnapshot(env) {
+  const tables={};
+  const specs={
+    clients:`SELECT * FROM clients ORDER BY id`,
+    client_members:`SELECT cm.*,u.username_display FROM client_members cm LEFT JOIN users u ON u.id=cm.user_id ORDER BY cm.id`,
+    tutors:`SELECT t.*,u.username_display FROM tutors t LEFT JOIN users u ON u.id=t.user_id ORDER BY t.id`,
+    couriers:`SELECT c.*,ca.username_display AS login_username FROM couriers c LEFT JOIN courier_accounts ca ON ca.courier_id=c.id ORDER BY c.id`,
+    receivers:`SELECT r.*,u.username_display FROM receivers r LEFT JOIN users u ON u.id=r.user_id ORDER BY r.id`,
+    requisitions:`SELECT * FROM requisitions ORDER BY id`,
+    requisition_exams:`SELECT * FROM requisition_exams ORDER BY id`,
+    requisition_materials:`SELECT * FROM requisition_materials ORDER BY id`,
+    status_events:`SELECT * FROM status_events ORDER BY id`,
+    result_files:`SELECT * FROM result_files ORDER BY id`,
+    exam_prices:`SELECT * FROM exam_prices ORDER BY exam_code`,
+    client_exam_prices:`SELECT * FROM client_exam_prices ORDER BY id`,
+    lab_alerts:`SELECT * FROM lab_alerts ORDER BY id`
+  };
+  for(const [name,sql] of Object.entries(specs)){
+    try{const r=await env.DB.prepare(sql).all();tables[name]=r.results||[];}catch{tables[name]=[];}
+  }
+  return {format:'HLabVet logical backup v1',createdAt:nowIso(),tables};
+}
+
+async function ownerCreateBackup(request, env) {
+  const owner=await ownerRequire(request,env);if(!owner)return err('Acesso do proprietário não autorizado.',401);
+  const snap=await ownerLogicalSnapshot(env);
+  const data=JSON.stringify(snap);
+  const stamp=nowIso().replace(/[:.]/g,'-');
+  const key=`backups/hlabvet-${stamp}.json`;
+  await env.FILES.put(key,data,{httpMetadata:{contentType:'application/json; charset=utf-8'}});
+  await env.DB.prepare('INSERT INTO owner_backup_log(r2_key,size_bytes,kind,created_by) VALUES(?,?,?,?)')
+    .bind(key,new TextEncoder().encode(data).length,'logical',owner.username_display).run();
+  return ok({message:'Backup lógico criado.',key,sizeBytes:new TextEncoder().encode(data).length});
+}
+
+async function ownerListBackups(request,env){
+  const owner=await ownerRequire(request,env);if(!owner)return err('Acesso do proprietário não autorizado.',401);
+  const rows=await env.DB.prepare('SELECT * FROM owner_backup_log ORDER BY id DESC LIMIT 50').all();
+  return ok({backups:rows.results||[]});
+}
+
+function csvCell(v){
+  if(v==null)return '';
+  const s=typeof v==='object'?JSON.stringify(v):String(v);
+  return /["\n\r,;]/.test(s)?`"${s.replace(/"/g,'""')}"`:s;
+}
+function rowsToCsv(rows){
+  if(!rows?.length)return '';
+  const cols=[...new Set(rows.flatMap(r=>Object.keys(r)))];
+  return '\ufeff'+cols.join(';')+'\r\n'+rows.map(r=>cols.map(c=>csvCell(r[c])).join(';')).join('\r\n');
+}
+function safeZipName(v){return String(v||'arquivo').replace(/[\\/:*?"<>|\r\n]+/g,'_').replace(/^\.+/,'').slice(0,180)||'arquivo';}
+function crc32(bytes){
+  let c=0xffffffff;
+  for(const b of bytes){c^=b;for(let k=0;k<8;k++)c=(c>>>1)^((c&1)?0xedb88320:0);}
+  return (c^0xffffffff)>>>0;
+}
+function u16(n){const a=new Uint8Array(2);new DataView(a.buffer).setUint16(0,n,true);return a;}
+function u32(n){const a=new Uint8Array(4);new DataView(a.buffer).setUint32(0,n>>>0,true);return a;}
+function concatBytes(parts){let len=0;for(const p of parts)len+=p.length;const out=new Uint8Array(len);let off=0;for(const p of parts){out.set(p,off);off+=p.length;}return out;}
+function zipDosDate(d=new Date()){
+  const year=Math.max(1980,d.getFullYear());
+  return {time:(d.getHours()<<11)|(d.getMinutes()<<5)|(d.getSeconds()>>1),date:((year-1980)<<9)|((d.getMonth()+1)<<5)|d.getDate()};
+}
+function buildStoreZip(entries){
+  const enc=new TextEncoder(),locals=[],centrals=[];let offset=0;const dt=zipDosDate();
+  for(const e of entries){
+    const name=enc.encode(e.name),data=e.data instanceof Uint8Array?e.data:enc.encode(String(e.data??'')),crc=crc32(data);
+    const local=concatBytes([u32(0x04034b50),u16(20),u16(0x0800),u16(0),u16(dt.time),u16(dt.date),u32(crc),u32(data.length),u32(data.length),u16(name.length),u16(0),name,data]);
+    locals.push(local);
+    const central=concatBytes([u32(0x02014b50),u16(20),u16(20),u16(0x0800),u16(0),u16(dt.time),u16(dt.date),u32(crc),u32(data.length),u32(data.length),u16(name.length),u16(0),u16(0),u16(0),u16(0),u32(0),u32(offset),name]);
+    centrals.push(central);offset+=local.length;
+  }
+  const centralSize=centrals.reduce((n,a)=>n+a.length,0);
+  const end=concatBytes([u32(0x06054b50),u16(0),u16(0),u16(entries.length),u16(entries.length),u32(centralSize),u32(offset),u16(0)]);
+  return concatBytes([...locals,...centrals,end]);
+}
+
+async function ownerExportZip(request, env, url) {
+  const owner=await ownerRequire(request,env);if(!owner)return err('Acesso do proprietário não autorizado.',401);
+  const snap=await ownerLogicalSnapshot(env),entries=[];
+  entries.push({name:'00_LEIA-ME.txt',data:`Exportação HLabVet\nGerada em: ${snap.createdAt}\nContém dados operacionais em CSV/JSON e arquivos de resultados encontrados no R2.\nSenhas, hashes e sessões não são exportados.\n`});
+  entries.push({name:'01_DADOS/dados_completos.json',data:JSON.stringify(snap,null,2)});
+  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',lab_alerts:'alertas_cancelamentos'};
+  for(const [table,filename] of Object.entries(map))entries.push({name:`01_DADOS/${filename}.csv`,data:rowsToCsv(snap.tables[table]||[])});
+  let total=entries.reduce((n,e)=>n+(typeof e.data==='string'?new TextEncoder().encode(e.data).length:e.data.length),0);
+  const maxBytes=80*1024*1024;
+  for(const rf of snap.tables.result_files||[]){
+    if(!rf.r2_key)continue;
+    const obj=await env.FILES.get(rf.r2_key);if(!obj)continue;
+    const bytes=new Uint8Array(await obj.arrayBuffer());
+    if(total+bytes.length>maxBytes)return err('A exportação completa ultrapassou 80 MB. Faça exportações periódicas ou use o procedimento de exportação em lote.',413,{estimatedBytes:total+bytes.length});
+    const req=(snap.tables.requisitions||[]).find(r=>Number(r.id)===Number(rf.requisition_id));
+    entries.push({name:`02_RESULTADOS/${safeZipName(req?.protocol||`requisicao-${rf.requisition_id}`)}/${String(rf.id).padStart(6,'0')}-${safeZipName(rf.original_name)}`,data:bytes});
+    total+=bytes.length;
+  }
+  const zip=buildStoreZip(entries);
+  const stamp=fortalezaToday();
+  return new Response(zip,{status:200,headers:{'content-type':'application/zip','content-disposition':`attachment; filename="HLabVet-exportacao-${stamp}.zip"`,'cache-control':'no-store'}});
+}
+
+async function ownerDeleteAllR2(env){
+  let cursor=undefined,loops=0;const keys=[];
+  do{
+    const page=await env.FILES.list({limit:1000,cursor});
+    for(const o of page.objects||[])keys.push(o.key);
+    cursor=page.truncated?page.cursor:undefined;loops++;
+  }while(cursor&&loops<100);
+  if(cursor)throw new Error('Há arquivos demais para o reset seguro em uma única operação. Faça a limpeza em lote.');
+  for(let i=0;i<keys.length;i+=100)await env.FILES.delete(keys.slice(i,i+100));
+  return keys.length;
+}
+
+async function ownerResetSystem(request, env) {
+  const owner=await ownerRequire(request,env);if(!owner)return err('Acesso do proprietário não autorizado.',401);
+  const body=await safeBody(request);
+  if(String(body?.confirmation||'').trim().toUpperCase()!=='ZERAR HLABVET')return err('Confirmação incorreta. Digite exatamente ZERAR HLABVET.');
+  const dbOwner=await env.DB.prepare('SELECT * FROM owner_accounts WHERE id=?').bind(owner.id).first();
+  if(!dbOwner||!await verifyPassword(String(body?.password||''),dbOwner.password_hash,dbOwner.password_salt))return err('Senha do proprietário incorreta.',401);
+  const deletedFiles=await ownerDeleteAllR2(env);
+  const stmts=[
+    'DELETE FROM lab_alerts','DELETE FROM result_files','DELETE FROM status_events','DELETE FROM requisition_materials','DELETE FROM requisition_exams','DELETE FROM requisitions',
+    'DELETE FROM client_exam_prices','DELETE FROM exam_prices','DELETE FROM tutors','DELETE FROM client_members','DELETE FROM clients',
+    'DELETE FROM courier_sessions','DELETE FROM courier_accounts','DELETE FROM couriers','DELETE FROM receivers','DELETE FROM sessions','DELETE FROM audit_log',
+    `DELETE FROM users WHERE username_key<>'hlabvet'`,
+    `UPDATE users SET role='admin',username_display='HLabVet',username_key='hlabvet',password_hash='TwP_yjkuugIsPRV71Z4e0rVeTcmPgXU7YImyBgrCPLI',password_salt='pinBnr9TtE24ToDkIXYa6g',force_password_change=1,active=1,updated_at=CURRENT_TIMESTAMP WHERE username_key='hlabvet'`,
+    'DELETE FROM owner_backup_log'
+  ].map(sql=>env.DB.prepare(sql));
+  await env.DB.batch(stmts);
+  return ok({message:'HLabVet zerado para primeiro uso. Somente o administrador HLabVet foi preservado e voltou para a senha inicial com troca obrigatória.',deletedFiles});
 }
 
 function requireAdmin(user, fn) {
