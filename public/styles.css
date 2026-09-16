@@ -167,3 +167,12 @@ body.courier-mobile-mode #courierView{min-height:100dvh}
 @media(max-width:1250px){.timing-tv-hero{grid-template-columns:300px 1fr 260px}.timing-overview-grid{grid-template-columns:1.65fr .8fr}.timing-period-presets{max-width:430px;overflow:auto}.timing-tv-filters select{min-width:110px}}
 @media(max-width:900px){.timing-fullscreen{overflow:auto}.timing-tv-hero{grid-template-columns:1fr auto;min-height:auto;padding:12px 14px}.timing-brand-card{min-height:70px;max-width:260px}.timing-brand-card img{max-height:55px}.timing-hero-title{grid-column:1/-1;grid-row:2}.timing-hero-title h1{font-size:28px}.timing-hero-title p{font-size:16px}.timing-hero-tagline{display:none}.timing-tv-main{display:block;padding:0 10px 18px}.timing-kpis-tv{grid-template-columns:1fr 1fr}.timing-toolbar{grid-template-columns:1fr}.timing-tv-filters{justify-content:flex-start}.timing-overview-grid{height:auto;grid-template-columns:1fr}.timing-tech-panel,.timing-status-panel{min-height:220px}.timing-board-shell{min-height:560px}.timing-board-tv{grid-template-columns:1fr}}
 @media(max-width:600px){.timing-kpi{min-height:104px;padding:12px;gap:8px}.timing-kpi-icon{width:42px;height:42px}.timing-kpi-icon svg{width:40px;height:40px}.timing-kpi-copy strong{font-size:36px}.timing-kpi-copy em{font-size:13px}.timing-period-presets{width:100%;overflow:auto}.timing-date-range{width:100%}.timing-date-range label{flex:1}.timing-date-range input{width:100%}.timing-tv-filters select{flex:1 1 130px}.timing-status-body{gap:10px}.timing-donut{width:125px;height:125px}.timing-donut:after{width:78px;height:78px}}
+
+/* Administração de entregadores */
+.courier-admin-note{margin-bottom:14px}
+.courier-admin-actions{display:flex;gap:8px;flex-wrap:wrap;align-items:center}
+.courier-admin-actions .btn{white-space:nowrap}
+@media (max-width:760px){
+  .courier-admin-actions{min-width:220px}
+  .courier-admin-actions .btn{flex:1 1 auto}
+}
