@@ -1484,25 +1484,55 @@ async function updateExamTimingSettings(request,env,user){
 }
 
 async function examTimingBoard(env,user,url){
-  const mode=['pending','late','completed','all'].includes(url.searchParams.get('mode'))?url.searchParams.get('mode'):'pending';
+  const legacyMode=['pending','late','completed','all'].includes(url.searchParams.get('mode'))?url.searchParams.get('mode'):null;
+  let scope=['unfinished','active','all'].includes(url.searchParams.get('scope'))?url.searchParams.get('scope'):'unfinished';
+  let bucket=['on_time','warning','late','completed'].includes(url.searchParams.get('bucket'))?url.searchParams.get('bucket'):'';
+  if(legacyMode==='pending')scope='unfinished';
+  if(legacyMode==='late'){scope='all';bucket='late'}
+  if(legacyMode==='completed'){scope='all';bucket='completed'}
+  if(legacyMode==='all')scope='all';
   const clientId=Number(url.searchParams.get('clientId')||0),technicianId=Number(url.searchParams.get('technicianId')||0);
+  const priority=['normal','priority','urgent'].includes(String(url.searchParams.get('priority')||''))?String(url.searchParams.get('priority')):'';
   const setting=await env.DB.prepare('SELECT warning_minutes FROM lab_timing_settings WHERE id=1').first();const warningMinutes=Number(setting?.warning_minutes||10);
   let sql=`SELECT e.id exam_id,e.requisition_id,e.exam_code,e.exam_name,e.turnaround_minutes,e.due_at,e.completed_at,e.completed_by_user_id,e.completed_by_name,e.completed_within_sla,r.protocol,r.priority,r.patient_name,r.status requisition_status,r.lab_received_at,r.completed_at requisition_completed_at,r.receiver_id,r.receiver_name,r.client_id,c.name client_name FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id JOIN clients c ON c.id=r.client_id WHERE r.status<>'cancelado' AND r.lab_received_at IS NOT NULL AND (EXISTS(SELECT 1 FROM requisition_exams pnd WHERE pnd.requisition_id=r.id AND pnd.completed_at IS NULL) OR datetime(r.completed_at)>=datetime('now','-7 days'))`;
-  const p=[];if(clientId){sql+=' AND r.client_id=?';p.push(clientId)}if(technicianId){sql+=' AND r.receiver_id=?';p.push(technicianId)}
+  const p=[];
+  if(clientId){sql+=' AND r.client_id=?';p.push(clientId)}
+  if(technicianId){sql+=' AND r.receiver_id=?';p.push(technicianId)}
+  if(priority){sql+=' AND r.priority=?';p.push(priority)}
   sql+=' ORDER BY CASE r.priority WHEN \'urgent\' THEN 0 WHEN \'priority\' THEN 1 ELSE 2 END, COALESCE(e.due_at,e.completed_at) ASC LIMIT 2000';
   const rows=await env.DB.prepare(sql).bind(...p).all(),now=Date.now();
   const exams=(rows.results||[]).map(x=>({...x,timing:timingStatusForExam(x,warningMinutes,now)}));
   const groups=new Map();
-  for(const e of exams){let g=groups.get(e.requisition_id);if(!g){g={requisitionId:e.requisition_id,protocol:e.protocol,priority:e.priority||'normal',patientName:e.patient_name,clientName:e.client_name,receiverName:e.receiver_name,labReceivedAt:e.lab_received_at,requisitionCompletedAt:e.requisition_completed_at,total:0,completed:0,onTime:0,warning:0,late:0,completedLate:0,pending:[],latestCompletedAt:null};groups.set(e.requisition_id,g)}g.total++;if(e.completed_at){g.completed++;if(!g.latestCompletedAt||new Date(e.completed_at)>new Date(g.latestCompletedAt))g.latestCompletedAt=e.completed_at}if(e.timing.status==='on_time')g.onTime++;if(e.timing.status==='warning')g.warning++;if(e.timing.status==='late')g.late++;if(e.timing.status==='completed_late')g.completedLate++;if(!e.completed_at)g.pending.push({examId:e.exam_id,examName:e.exam_name,dueAt:e.due_at,timing:e.timing});}
-  let requests=[...groups.values()].map(g=>({...g,progressPct:g.total?Math.round(g.completed/g.total*100):0,state:g.late?'late':g.warning?'warning':g.completed===g.total?'completed':'on_time'}));
-  if(mode==='pending')requests=requests.filter(g=>g.completed<g.total);
-  else if(mode==='late')requests=requests.filter(g=>g.late>0||g.completedLate>0);
-  else if(mode==='completed')requests=requests.filter(g=>g.completed===g.total);
+  for(const e of exams){
+    let g=groups.get(e.requisition_id);
+    if(!g){g={requisitionId:e.requisition_id,protocol:e.protocol,priority:e.priority||'normal',patientName:e.patient_name,clientName:e.client_name,receiverName:e.receiver_name,labReceivedAt:e.lab_received_at,requisitionCompletedAt:e.requisition_completed_at,requisitionStatus:e.requisition_status,total:0,completed:0,onTime:0,warning:0,late:0,completedLate:0,pending:[],latestCompletedAt:null,earliestDueAt:null};groups.set(e.requisition_id,g)}
+    g.total++;
+    if(e.completed_at){g.completed++;if(!g.latestCompletedAt||new Date(e.completed_at)>new Date(g.latestCompletedAt))g.latestCompletedAt=e.completed_at}
+    if(e.timing.status==='on_time')g.onTime++;
+    if(e.timing.status==='warning')g.warning++;
+    if(e.timing.status==='late')g.late++;
+    if(e.timing.status==='completed_late')g.completedLate++;
+    if(!e.completed_at){g.pending.push({examId:e.exam_id,examName:e.exam_name,dueAt:e.due_at,timing:e.timing});if(e.due_at&&(!g.earliestDueAt||new Date(e.due_at)<new Date(g.earliestDueAt)))g.earliestDueAt=e.due_at}
+  }
+  const allRequests=[...groups.values()].map(g=>({...g,progressPct:g.total?Math.round(g.completed/g.total*100):0,state:g.completed===g.total?'completed':g.late?'late':g.warning?'warning':'on_time'}));
+  const counts={requests:allRequests.length,completedRequests:allRequests.filter(g=>g.state==='completed').length,onTimeRequests:allRequests.filter(g=>g.state==='on_time').length,warningRequests:allRequests.filter(g=>g.state==='warning').length,lateRequests:allRequests.filter(g=>g.state==='late').length};
+  let requests=allRequests;
+  if(bucket==='completed')requests=allRequests.filter(g=>g.state==='completed');
+  else{
+    if(scope==='unfinished')requests=requests.filter(g=>g.completed<g.total);
+    else if(scope==='active')requests=requests.filter(g=>g.completed>0&&g.completed<g.total);
+    if(bucket)requests=requests.filter(g=>g.state===bucket);
+  }
+  const stateRank={late:0,warning:1,on_time:2,completed:3},priorityRank={urgent:0,priority:1,normal:2};
+  requests.sort((a,b)=>{
+    const sr=(stateRank[a.state]??9)-(stateRank[b.state]??9);if(sr)return sr;
+    const pr=(priorityRank[a.priority]??9)-(priorityRank[b.priority]??9);if(pr)return pr;
+    if(a.state==='completed')return new Date(b.latestCompletedAt||0)-new Date(a.latestCompletedAt||0);
+    return new Date(a.earliestDueAt||'9999-12-31')-new Date(b.earliestDueAt||'9999-12-31');
+  });
   const visibleIds=new Set(requests.map(g=>Number(g.requisitionId)));
   const visibleExams=exams.filter(e=>visibleIds.has(Number(e.requisition_id)));
-  const activeExams=exams.filter(e=>!e.completed_at);
-  const counts={requests:requests.length,exams:visibleExams.length,pending:activeExams.length,onTime:activeExams.filter(x=>x.timing.status==='on_time').length,warning:activeExams.filter(x=>x.timing.status==='warning').length,late:activeExams.filter(x=>x.timing.status==='late').length,completed:exams.filter(x=>!!x.completed_at).length};
-  return ok({mode,warningMinutes,counts,requests,exams:visibleExams});
+  return ok({scope,bucket,warningMinutes,counts,requests,exams:visibleExams});
 }
 
 async function completeTimedExam(env,user,examId){
@@ -1522,11 +1552,25 @@ async function examTimingReport(env,user,url){
   if(from){where+=` AND date(datetime(r.lab_received_at,'-3 hours'))>=date(?)`;p.push(from)}
   if(to){where+=` AND date(datetime(r.lab_received_at,'-3 hours'))<=date(?)`;p.push(to)}
   if(!from&&!to)where+=` AND datetime(r.lab_received_at)>=datetime('now','-30 days')`;
-  const rows=await env.DB.prepare(`SELECT e.completed_at,e.due_at,e.completed_within_sla,e.completed_by_name,r.receiver_name,r.receiver_id FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id WHERE ${where}`).bind(...p).all();
-  const now=Date.now(),map=new Map();for(const x of rows.results||[]){const tech=x.receiver_name||x.completed_by_name||'Sem técnico';let a=map.get(tech);if(!a){a={technician:tech,total:0,completed:0,onTime:0,late:0,pending:0,pendingLate:0};map.set(tech,a)}a.total++;if(x.completed_at){a.completed++;const late=x.due_at&&new Date(x.completed_at).getTime()>new Date(x.due_at).getTime();late?a.late++:a.onTime++;}else{a.pending++;if(x.due_at&&now>new Date(x.due_at).getTime())a.pendingLate++;}}
-  const technicians=[...map.values()].map(x=>({...x,onTimePct:x.completed?Math.round(x.onTime/x.completed*100):0})).sort((a,b)=>b.late-a.late||b.pendingLate-a.pendingLate||a.technician.localeCompare(b.technician));
-  const totals=technicians.reduce((a,x)=>{for(const k of ['total','completed','onTime','late','pending','pendingLate'])a[k]+=x[k];return a},{total:0,completed:0,onTime:0,late:0,pending:0,pendingLate:0});totals.onTimePct=totals.completed?Math.round(totals.onTime/totals.completed*100):0;
-  return ok({from:from||null,to:to||null,totals,technicians});
+  const [rows,setting]=await Promise.all([
+    env.DB.prepare(`SELECT e.completed_at,e.due_at,e.completed_within_sla,e.completed_by_name,r.receiver_name,r.receiver_id FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id WHERE ${where}`).bind(...p).all(),
+    env.DB.prepare('SELECT warning_minutes FROM lab_timing_settings WHERE id=1').first()
+  ]);
+  const warningMinutes=Number(setting?.warning_minutes||10),now=Date.now(),map=new Map();
+  for(const x of rows.results||[]){
+    const tech=x.completed_at?(x.completed_by_name||x.receiver_name||'Sem técnico'):(x.receiver_name||x.completed_by_name||'Sem técnico');
+    let a=map.get(tech);if(!a){a={technician:tech,total:0,completed:0,onTime:0,late:0,pending:0,pendingWarning:0,pendingLate:0};map.set(tech,a)}
+    a.total++;
+    if(x.completed_at){a.completed++;const late=x.due_at&&new Date(x.completed_at).getTime()>new Date(x.due_at).getTime();late?a.late++:a.onTime++;}
+    else{
+      a.pending++;
+      if(x.due_at){const left=new Date(x.due_at).getTime()-now;if(left<0)a.pendingLate++;else if(left<=warningMinutes*60000)a.pendingWarning++;}
+    }
+  }
+  const technicians=[...map.values()].map(x=>({...x,onTimePct:x.completed?Math.round(x.onTime/x.completed*100):0})).sort((a,b)=>(b.pendingLate+b.late)-(a.pendingLate+a.late)||b.pendingWarning-a.pendingWarning||a.technician.localeCompare(b.technician));
+  const totals=technicians.reduce((a,x)=>{for(const k of ['total','completed','onTime','late','pending','pendingWarning','pendingLate'])a[k]+=x[k];return a},{total:0,completed:0,onTime:0,late:0,pending:0,pendingWarning:0,pendingLate:0});
+  totals.onTimePct=totals.completed?Math.round(totals.onTime/totals.completed*100):0;
+  return ok({from:from||null,to:to||null,warningMinutes,totals,technicians});
 }
 
 async function temperatureSheet(env,user,url){
