@@ -531,7 +531,7 @@ function requireAdmin(user, fn) {
   return ADMIN_ROLES.has(user.role) ? fn() : err('Acesso permitido somente ao HLab Vet.', 403);
 }
 function requireAdminOnly(user, fn) {
-  return user.role === 'admin' ? fn() : err('Acesso permitido somente ao administrador central do HLab Vet.', 403);
+  return user.role === 'admin' ? fn() : err('Acesso permitido somente ao administrador do laboratório.', 403);
 }
 
 function requireClient(user, fn) {
@@ -1032,6 +1032,8 @@ async function updateCourier(request,env,user,id){
     WHERE c.id=?
   `).bind(id).first();
   if(!c)return err('Entregador não encontrado.',404);
+  const name=clampString(b?.name??c.name,160);
+  if(!name)return err('Informe o nome do entregador.');
   const active=b.active==null?c.active:boolInt(b.active);
   const thermometer=normalizeThermometer(b.thermometerCode??c.thermometer_code);
   if(active&&!/^TER-\d{3,4}$/.test(thermometer))return err('Informe o termômetro no padrão TER-001.');
@@ -1056,7 +1058,7 @@ async function updateCourier(request,env,user,id){
       VALUES(?,?,?,?,?,1,?)`).bind(id,username,key,passwordHash,salt,active).run();
   }
   await env.DB.prepare('UPDATE couriers SET name=?,phone=?,thermometer_code=?,active=?,updated_at=? WHERE id=?')
-    .bind(clampString(b.name??c.name,160),clampString(b.phone??c.phone,40),thermometer||null,active,nowIso(),id).run();
+    .bind(name,clampString(b.phone??c.phone,40),thermometer||null,active,nowIso(),id).run();
   await audit(env,user,'editou_entregador','courier',id,{thermometer,username,active:!!active});
   return ok({message:c.account_id?'Entregador atualizado.':'Login do entregador criado e cadastro atualizado.'});
 }
