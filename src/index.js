@@ -162,6 +162,13 @@ async function api(request, env, url) {
   m = path.match(/^\/api\/technicians\/(\d+)\/reset-password$/);
   if (m && method === 'POST') return requireAdminOnly(user, () => resetTechnicianPassword(request, env, user, Number(m[1])));
 
+  if (path === '/api/exam-timing/settings' && method === 'GET') return requireAdmin(user, () => examTimingSettings(env));
+  if (path === '/api/exam-timing/settings' && method === 'PUT') return requireAdminOnly(user, () => updateExamTimingSettings(request, env, user));
+  if (path === '/api/exam-timing/board' && method === 'GET') return requireAdmin(user, () => examTimingBoard(env, user, url));
+  if (path === '/api/exam-timing/report' && method === 'GET') return requireAdmin(user, () => examTimingReport(env, user, url));
+  m = path.match(/^\/api\/exam-timing\/exams\/(\d+)\/complete$/);
+  if (m && method === 'POST') return requireAdmin(user, () => completeTimedExam(env, user, Number(m[1])));
+
   if (path === '/api/requisitions' && method === 'GET') return listRequisitions(env, user, url);
   if (path === '/api/requisitions' && method === 'POST') return createRequisition(request, env, user);
   m = path.match(/^\/api\/requisitions\/(\d+)$/);
@@ -185,6 +192,9 @@ async function api(request, env, url) {
 
   m = path.match(/^\/api\/results\/(\d+)\/(download|view)$/);
   if (m && method === 'GET') return downloadResult(env, user, Number(m[1]), m[2] === 'view');
+  m = path.match(/^\/api\/results\/(\d+)\/analysis$/);
+  if (m && method === 'GET') return requireClient(user, () => getResultAnalysis(env, user, Number(m[1])));
+  if (m && (method === 'PUT' || method === 'POST')) return requireClient(user, () => saveResultAnalysis(request, env, user, Number(m[1])));
   m = path.match(/^\/api\/results\/(\d+)$/);
   if (m && method === 'DELETE') return requireAdmin(user, () => deleteResult(env, user, Number(m[1])));
 
@@ -395,8 +405,11 @@ async function ownerLogicalSnapshot(env) {
     requisition_materials:`SELECT * FROM requisition_materials ORDER BY id`,
     status_events:`SELECT * FROM status_events ORDER BY id`,
     result_files:`SELECT * FROM result_files ORDER BY id`,
+    result_analyses:`SELECT * FROM result_analyses ORDER BY result_file_id`,
     exam_prices:`SELECT * FROM exam_prices ORDER BY exam_code`,
     client_exam_prices:`SELECT * FROM client_exam_prices ORDER BY id`,
+    exam_turnaround_settings:`SELECT * FROM exam_turnaround_settings ORDER BY exam_name`,
+    lab_timing_settings:`SELECT * FROM lab_timing_settings ORDER BY id`,
     lab_alerts:`SELECT * FROM lab_alerts ORDER BY id`
   };
   for(const [name,sql] of Object.entries(specs)){
@@ -465,7 +478,7 @@ async function ownerExportZip(request, env, url) {
   const snap=await ownerLogicalSnapshot(env),entries=[];
   entries.push({name:'00_LEIA-ME.txt',data:`Exportação HLabVet\nGerada em: ${snap.createdAt}\nContém dados operacionais em CSV/JSON e arquivos de resultados encontrados no R2.\nSenhas, hashes e sessões não são exportados.\n`});
   entries.push({name:'01_DADOS/dados_completos.json',data:JSON.stringify(snap,null,2)});
-  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',lab_alerts:'alertas_cancelamentos'};
+  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',result_analyses:'analises_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',exam_turnaround_settings:'tempos_por_exame',lab_timing_settings:'configuracao_tempo_exames',lab_alerts:'alertas_cancelamentos'};
   for(const [table,filename] of Object.entries(map))entries.push({name:`01_DADOS/${filename}.csv`,data:rowsToCsv(snap.tables[table]||[])});
   let total=entries.reduce((n,e)=>n+(typeof e.data==='string'?new TextEncoder().encode(e.data).length:e.data.length),0);
   const maxBytes=80*1024*1024;
@@ -503,8 +516,8 @@ async function ownerResetSystem(request, env) {
   if(!dbOwner||!await verifyPassword(String(body?.password||''),dbOwner.password_hash,dbOwner.password_salt))return err('Senha do proprietário incorreta.',401);
   const deletedFiles=await ownerDeleteAllR2(env);
   const stmts=[
-    'DELETE FROM lab_alerts','DELETE FROM result_files','DELETE FROM status_events','DELETE FROM requisition_materials','DELETE FROM requisition_exams','DELETE FROM requisitions',
-    'DELETE FROM client_exam_prices','DELETE FROM exam_prices','DELETE FROM tutors','DELETE FROM client_members','DELETE FROM clients',
+    'DELETE FROM lab_alerts','DELETE FROM result_analyses','DELETE FROM result_files','DELETE FROM status_events','DELETE FROM requisition_materials','DELETE FROM requisition_exams','DELETE FROM requisitions',
+    'DELETE FROM client_exam_prices','DELETE FROM exam_prices','DELETE FROM exam_turnaround_settings','DELETE FROM lab_timing_settings','INSERT INTO lab_timing_settings(id,default_turnaround_minutes,warning_minutes) VALUES(1,1440,10)','DELETE FROM tutors','DELETE FROM client_members','DELETE FROM clients',
     'DELETE FROM courier_sessions','DELETE FROM courier_accounts','DELETE FROM couriers','DELETE FROM receivers','DELETE FROM sessions','DELETE FROM audit_log',
     `DELETE FROM users WHERE username_key<>'hlabvet'`,
     `UPDATE users SET role='admin',username_display='HLabVet',username_key='hlabvet',password_hash='TwP_yjkuugIsPRV71Z4e0rVeTcmPgXU7YImyBgrCPLI',password_salt='pinBnr9TtE24ToDkIXYa6g',force_password_change=1,active=1,updated_at=CURRENT_TIMESTAMP WHERE username_key='hlabvet'`,
@@ -601,6 +614,28 @@ async function changePassword(request, env, user) {
   return ok({ message: 'Senha alterada com sucesso.' });
 }
 
+async function labDashboardCharts(env){
+  const [dailyRows,statusRows,examRows,clientRows]=await Promise.all([
+    env.DB.prepare(`SELECT date(datetime(created_at,'-3 hours')) day,COUNT(*) n FROM requisitions WHERE status<>'cancelado' AND datetime(created_at,'-3 hours')>=datetime('now','-3 hours','-13 days','start of day') GROUP BY day ORDER BY day`).all(),
+    env.DB.prepare(`SELECT status,COUNT(*) n FROM requisitions WHERE datetime(created_at,'-3 hours')>=datetime('now','-3 hours','-29 days','start of day') GROUP BY status ORDER BY n DESC`).all(),
+    env.DB.prepare(`SELECT e.exam_name label,COUNT(*) n FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id WHERE r.status<>'cancelado' AND datetime(r.created_at,'-3 hours')>=datetime('now','-3 hours','-29 days','start of day') GROUP BY e.exam_name ORDER BY n DESC,e.exam_name LIMIT 6`).all(),
+    env.DB.prepare(`SELECT c.name label,COUNT(*) n FROM requisitions r JOIN clients c ON c.id=r.client_id WHERE r.status<>'cancelado' AND datetime(r.created_at,'-3 hours')>=datetime('now','-3 hours','-29 days','start of day') GROUP BY c.id,c.name ORDER BY n DESC,c.name LIMIT 6`).all()
+  ]);
+  const map=new Map((dailyRows.results||[]).map(x=>[x.day,Number(x.n||0)]));
+  const daily=[];
+  const base=new Date(Date.now()-3*3600000);
+  for(let i=13;i>=0;i--){
+    const d=new Date(base);d.setUTCDate(d.getUTCDate()-i);
+    const day=d.toISOString().slice(0,10);daily.push({day,n:map.get(day)||0});
+  }
+  return {
+    daily,
+    status30:(statusRows.results||[]).map(x=>({status:x.status,n:Number(x.n||0)})),
+    topExams:(examRows.results||[]).map(x=>({label:x.label,n:Number(x.n||0)})),
+    topClients:(clientRows.results||[]).map(x=>({label:x.label,n:Number(x.n||0)}))
+  };
+}
+
 async function dashboard(env, user) {
   if(user.role==='tutor') return tutorDashboard(env,user);
   const p=[];
@@ -616,7 +651,8 @@ async function dashboard(env, user) {
     ${where}
     ORDER BY COALESCE(r.scheduled_at,r.created_at) DESC LIMIT 20
   `).bind(...p).all();
-  return ok({ totals, recent: recent.results || [], day: new Date(Date.now()-3*3600000).toISOString().slice(0,10) });
+  const charts=ADMIN_ROLES.has(user.role)?await labDashboardCharts(env):null;
+  return ok({ totals, recent: recent.results || [], charts, day: new Date(Date.now()-3*3600000).toISOString().slice(0,10) });
 }
 
 async function tutorDashboard(env,user){
@@ -1088,7 +1124,7 @@ async function resetTechnicianPassword(request,env,user,id){
 async function listRequisitions(env,user,url){
   if(user.role==='tutor')return err('O tutor acessa somente os resultados liberados.',403);
   const filters={q:url.searchParams.get('q'),status:url.searchParams.get('status'),from:url.searchParams.get('from'),to:url.searchParams.get('to'),patient:url.searchParams.get('patient'),tutor:url.searchParams.get('tutor'),birth:url.searchParams.get('birth'),breed:url.searchParams.get('breed'),clientId:url.searchParams.get('clientId')};
-  let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.breed,r.birth_date,r.tutor_name,r.created_at,r.collection_date,r.assigned_at,r.collected_at,r.collection_temperature,r.lab_received_at,r.lab_received_temperature,r.analysis_started_at,r.completed_at,r.request_kind,r.scheduled_at,r.accepted_at,r.accepted_by_name,c.name client_name,co.name courier_name,CASE WHEN r.status='cancelado' THEN 0 ELSE (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) END result_count FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE 1=1`;
+  let sql=`SELECT r.id,r.protocol,r.status,r.priority,r.patient_name,r.species,r.breed,r.birth_date,r.tutor_name,r.created_at,r.collection_date,r.assigned_at,r.collected_at,r.collection_temperature,r.lab_received_at,r.lab_received_temperature,r.analysis_started_at,r.completed_at,r.request_kind,r.scheduled_at,r.accepted_at,r.accepted_by_name,c.name client_name,co.name courier_name,CASE WHEN r.status='cancelado' THEN 0 ELSE (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) END result_count FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE 1=1`;
   const p=[];
   if(user.role==='client'){sql+=' AND r.client_id=?';p.push(user.client_id);} else if(filters.clientId){sql+=' AND r.client_id=?';p.push(Number(filters.clientId));}
   if(filters.status){sql+=' AND r.status=?';p.push(filters.status);}
@@ -1133,6 +1169,7 @@ async function createRequisition(request,env,user){
   const tutorName=tutorAccount?.name||clampString(b.tutorName,160);
 
   const requestKind=b.requestKind==='scheduled'?'scheduled':'immediate';
+  const priority=['normal','priority','urgent'].includes(String(b.priority||''))?String(b.priority):'normal';
   let scheduledAt=null;
   if(requestKind==='scheduled'){
     const dt=new Date(String(b.scheduledAt||''));if(!Number.isFinite(dt.getTime()))return err('Informe a data e hora do agendamento.');
@@ -1145,8 +1182,8 @@ async function createRequisition(request,env,user){
 
   const tempProto=`TEMP-${crypto.randomUUID()}`;
   const requesterName=member?.name||user.username_display;
-  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,clinic_name,veterinarian_name,crmv,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at,requested_by_user_id,requested_by_name) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .bind(tempProto,clientId,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),birthDate,ageText,collectionDate,clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
+  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,priority,clinic_name,veterinarian_name,crmv,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at,requested_by_user_id,requested_by_name) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(tempProto,clientId,priority,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),birthDate,ageText,collectionDate,clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
   const id=ins.meta.last_row_id, proto=protocolCode(id,new Date());
   const statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,id)];
   let missingPriceCount=0;
@@ -1157,8 +1194,8 @@ async function createRequisition(request,env,user){
   }
   for(const m of materials) statements.push(env.DB.prepare('INSERT INTO requisition_materials(requisition_id,material_code,material_name) VALUES(?,?,?)').bind(id,m.toLowerCase().replace(/\s+/g,'_'),m));
   const message=requestKind==='scheduled'?`Coleta agendada para ${scheduledAt}`:'Requisição enviada ao HLab Vet';
-  statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json) VALUES(?,'solicitado',?,?,?)`).bind(id,user.id,requesterName,JSON.stringify({message,requestKind,scheduledAt,missingPriceCount})));
-  await env.DB.batch(statements); await audit(env,user,'criou_requisicao','requisition',id,{protocol:proto,patient,requestKind,scheduledAt,missingPriceCount,requesterName});
+  statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json) VALUES(?,'solicitado',?,?,?)`).bind(id,user.id,requesterName,JSON.stringify({message,requestKind,scheduledAt,priority,missingPriceCount})));
+  await env.DB.batch(statements); await audit(env,user,'criou_requisicao','requisition',id,{protocol:proto,patient,requestKind,scheduledAt,priority,missingPriceCount,requesterName});
   return ok({id,protocol:proto,missingPriceCount,message:requestKind==='scheduled'?'Solicitação agendada e enviada ao HLab Vet.':'Solicitação enviada ao HLab Vet.'});
 }
 
@@ -1171,10 +1208,10 @@ async function getRequisition(env,user,id){
   const allowed=await canSeeReq(env,user,id); if(allowed===null)return err('Requisição não encontrada.',404); if(!allowed)return err('Sem acesso a essa requisição.',403);
   const r=await env.DB.prepare(`SELECT r.*,c.name client_name,c.address client_address,c.city client_city,c.state client_state,c.phone client_phone,co.name courier_name FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=?`).bind(id).first();
   const [ex,mat,events,files]=await Promise.all([
-    env.DB.prepare('SELECT id,category,exam_code,exam_name FROM requisition_exams WHERE requisition_id=? ORDER BY id').bind(id).all(),
+    env.DB.prepare('SELECT id,category,exam_code,exam_name,turnaround_minutes,due_at,completed_at,completed_by_name,completed_within_sla FROM requisition_exams WHERE requisition_id=? ORDER BY id').bind(id).all(),
     env.DB.prepare('SELECT material_name FROM requisition_materials WHERE requisition_id=? ORDER BY id').bind(id).all(),
     env.DB.prepare('SELECT status,actor_name,details_json,created_at FROM status_events WHERE requisition_id=? ORDER BY created_at,id').bind(id).all(),
-    env.DB.prepare('SELECT id,original_name,mime_type,size_bytes,created_at FROM result_files WHERE requisition_id=? ORDER BY created_at DESC').bind(id).all()
+    env.DB.prepare(`SELECT rf.id,rf.original_name,rf.mime_type,rf.size_bytes,rf.created_at,CASE WHEN EXISTS(SELECT 1 FROM result_analyses ra WHERE ra.result_file_id=rf.id) THEN 1 ELSE 0 END analysis_exists FROM result_files rf WHERE rf.requisition_id=? ORDER BY rf.created_at DESC`).bind(id).all()
   ]);
   const visibleFiles=(user.role==='client'&&r.status==='cancelado')?[]:(files.results||[]);
   return ok({requisition:r,exams:ex.results||[],materials:(mat.results||[]).map(x=>x.material_name),events:(events.results||[]).map(e=>({...e,details:parseJson(e.details_json)})),files:visibleFiles});
@@ -1243,9 +1280,18 @@ async function receiveAtLab(request,env,user,id){
   else if(Number(b?.technicianId))rec=await env.DB.prepare('SELECT * FROM receivers WHERE id=? AND active=1').bind(Number(b.technicianId)).first();
   if(!rec)return err(user.role==='staff'?'Seu login não está vinculado a um técnico ativo.':'Selecione o técnico que está recebendo.');
   const ts=nowIso(),loc=clampString(b.location,200)||rec.location||'HLab Vet',obs=clampString(b.observation,1000);
+  const timing=await env.DB.prepare('SELECT default_turnaround_minutes,warning_minutes FROM lab_timing_settings WHERE id=1').first();
+  const defaultMinutes=Math.max(1,Number(timing?.default_turnaround_minutes||1440));
+  const reqExams=await env.DB.prepare(`SELECT e.id,e.exam_code,COALESCE(s.turnaround_minutes,?) turnaround_minutes FROM requisition_exams e LEFT JOIN exam_turnaround_settings s ON s.exam_code=e.exam_code AND s.active=1 WHERE e.requisition_id=?`).bind(defaultMinutes,id).all();
+  const timingStatements=(reqExams.results||[]).map(e=>{
+    const minutes=Math.max(1,Number(e.turnaround_minutes||defaultMinutes));
+    const dueAt=new Date(new Date(ts).getTime()+minutes*60000).toISOString();
+    return env.DB.prepare(`UPDATE requisition_exams SET turnaround_minutes=?,due_at=?,completed_at=NULL,completed_by_user_id=NULL,completed_by_name=NULL,completed_within_sla=NULL WHERE id=?`).bind(minutes,dueAt,e.id);
+  });
   await env.DB.batch([
     env.DB.prepare(`UPDATE requisitions SET status='recebido',lab_received_at=?,lab_received_temperature=?,receiver_id=?,receiver_name=?,received_location=?,receiving_observation=?,updated_at=? WHERE id=?`).bind(ts,temp,rec.id,rec.name,loc,obs,ts,id),
-    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'recebido',?,?,?,?)`).bind(id,user.id,rec.name,JSON.stringify({temperature:temp,receiver:rec.name,location:loc,observation:obs}),ts)
+    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'recebido',?,?,?,?)`).bind(id,user.id,rec.name,JSON.stringify({temperature:temp,receiver:rec.name,location:loc,observation:obs,timingStarted:true}),ts),
+    ...timingStatements
   ]);
   await audit(env,user,'recebeu_amostra','requisition',id,{temperature:temp,receiver:rec.name,location:loc,observation:obs});return ok({message:`Recebimento registrado por ${rec.name} com data e hora automáticas.`});
 }
@@ -1254,7 +1300,14 @@ async function markAnalysis(env,user,id){
   const r=await env.DB.prepare('SELECT status FROM requisitions WHERE id=?').bind(id).first(); if(!r)return err('Requisição não encontrada.',404);if(!['recebido','em_analise'].includes(r.status))return err('O exame deve estar recebido pelo laboratório.');
   const ts=nowIso();await env.DB.batch([env.DB.prepare(`UPDATE requisitions SET status='em_analise',analysis_started_at=COALESCE(analysis_started_at,?),updated_at=? WHERE id=?`).bind(ts,ts,id),env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'em_analise',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({message:'Amostra em análise'}),ts)]);await audit(env,user,'iniciou_analise','requisition',id);return ok({message:'Status alterado para Em análise.'});
 }
-async function markComplete(env,user,id){const r=await env.DB.prepare('SELECT status FROM requisitions WHERE id=?').bind(id).first();if(!r)return err('Requisição não encontrada.',404);if(!['recebido','em_analise','concluido'].includes(r.status))return err('Não é possível concluir nesse status.');const ts=nowIso();await env.DB.batch([env.DB.prepare(`UPDATE requisitions SET status='concluido',completed_at=?,updated_at=? WHERE id=?`).bind(ts,ts,id),env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'concluido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({message:'Exame concluído'}),ts)]);await audit(env,user,'concluiu_exame','requisition',id);return ok({message:'Exame concluído.'});}
+async function markComplete(env,user,id){
+  const r=await env.DB.prepare('SELECT status FROM requisitions WHERE id=?').bind(id).first();if(!r)return err('Requisição não encontrada.',404);if(!['recebido','em_analise','concluido'].includes(r.status))return err('Não é possível concluir nesse status.');
+  const ts=nowIso();
+  const pending=await env.DB.prepare('SELECT id,due_at FROM requisition_exams WHERE requisition_id=? AND completed_at IS NULL').bind(id).all();
+  const examStatements=(pending.results||[]).map(e=>env.DB.prepare(`UPDATE requisition_exams SET completed_at=?,completed_by_user_id=?,completed_by_name=?,completed_within_sla=? WHERE id=?`).bind(ts,user.id,user.username_display,e.due_at?(new Date(ts).getTime()<=new Date(e.due_at).getTime()?1:0):null,e.id));
+  await env.DB.batch([env.DB.prepare(`UPDATE requisitions SET status='concluido',completed_at=?,updated_at=? WHERE id=?`).bind(ts,ts,id),...examStatements,env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'concluido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({message:'Solicitação concluída e exames pendentes marcados como concluídos'}),ts)]);
+  await audit(env,user,'concluiu_exame','requisition',id);return ok({message:'Solicitação concluída. Os exames pendentes também foram marcados como concluídos.'});
+}
 async function cancelRequisition(request,env,user,id){
   const b=await safeBody(request);
   const r=await env.DB.prepare(`SELECT r.*,c.name client_name FROM requisitions r JOIN clients c ON c.id=r.client_id WHERE r.id=?`).bind(id).first();
@@ -1306,6 +1359,7 @@ async function deleteResult(env,user,fileId){
   const count=await env.DB.prepare('SELECT COUNT(*) total FROM result_files WHERE requisition_id=? AND id<>?').bind(f.requisition_id,fileId).first();
   const remaining=Number(count?.total||0);
   const statements=[
+    env.DB.prepare('DELETE FROM result_analyses WHERE result_file_id=?').bind(fileId),
     env.DB.prepare('DELETE FROM result_files WHERE id=?').bind(fileId),
     env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,?,?,?,?,?)`)
       .bind(f.requisition_id,f.status,user.id,user.username_display,JSON.stringify({message:`Resultado excluído: ${f.original_name}`,fileId}),ts)
@@ -1333,6 +1387,146 @@ async function downloadResult(env,user,fileId,inline=false){
   h.set('cache-control','private, no-store');
   h.set('x-content-type-options','nosniff');
   return new Response(obj.body,{headers:h});
+}
+
+async function resultForClient(env,user,fileId){
+  const row=await env.DB.prepare(`
+    SELECT rf.id,rf.requisition_id,rf.original_name,rf.mime_type,rf.size_bytes,r.client_id,r.patient_name,r.protocol,r.status
+    FROM result_files rf JOIN requisitions r ON r.id=rf.requisition_id
+    WHERE rf.id=?
+  `).bind(fileId).first();
+  if(!row)return {error:err('Resultado não encontrado.',404)};
+  if(user.role!=='client'||Number(row.client_id)!==Number(user.client_id)||row.status==='cancelado')return {error:err('Sem acesso a esta análise.',403)};
+  return {row};
+}
+
+async function getResultAnalysis(env,user,fileId){
+  const access=await resultForClient(env,user,fileId);if(access.error)return access.error;
+  const a=await env.DB.prepare(`SELECT analysis_json,created_at,updated_at FROM result_analyses WHERE result_file_id=? AND client_id=?`).bind(fileId,user.client_id).first();
+  return ok({analysis:a?parseJson(a.analysis_json):null,createdAt:a?.created_at||null,updatedAt:a?.updated_at||null,file:{id:access.row.id,name:access.row.original_name,mimeType:access.row.mime_type,sizeBytes:access.row.size_bytes,patientName:access.row.patient_name,protocol:access.row.protocol}});
+}
+
+async function saveResultAnalysis(request,env,user,fileId){
+  const access=await resultForClient(env,user,fileId);if(access.error)return access.error;
+  const b=await safeBody(request);const analysis=b?.analysis;
+  if(!analysis||typeof analysis!=='object')return err('Análise inválida.',400);
+  const params=Array.isArray(analysis.parameters)?analysis.parameters:[];
+  if(params.length>300)return err('A análise excede o limite de parâmetros.',400);
+  const clean={
+    version:1,
+    generatedAt:clampString(analysis.generatedAt,60)||nowIso(),
+    source:'Referências informadas no próprio laudo',
+    summary:{
+      total:Number(analysis.summary?.total||params.length),normal:Number(analysis.summary?.normal||0),low:Number(analysis.summary?.low||0),high:Number(analysis.summary?.high||0),altered:Number(analysis.summary?.altered||0)
+    },
+    parameters:params.slice(0,300).map(x=>({
+      name:clampString(x?.name,180),result:Number(x?.result),unit:clampString(x?.unit,50),referenceText:clampString(x?.referenceText,120),min:x?.min==null?null:Number(x.min),max:x?.max==null?null:Number(x.max),status:['normal','low','high'].includes(x?.status)?x.status:'normal',deviationPct:x?.deviationPct==null?null:Number(x.deviationPct)
+    })).filter(x=>x.name&&Number.isFinite(x.result)),
+    notes:clampString(analysis.notes,500)
+  };
+  clean.summary.total=clean.parameters.length;clean.summary.normal=clean.parameters.filter(x=>x.status==='normal').length;clean.summary.low=clean.parameters.filter(x=>x.status==='low').length;clean.summary.high=clean.parameters.filter(x=>x.status==='high').length;clean.summary.altered=clean.summary.low+clean.summary.high;
+  const jsonText=JSON.stringify(clean);if(jsonText.length>120000)return err('A análise ficou muito grande.',400);
+  const now=nowIso();
+  await env.DB.prepare(`INSERT INTO result_analyses(result_file_id,requisition_id,client_id,created_by_user_id,analysis_json,created_at,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(result_file_id) DO UPDATE SET client_id=excluded.client_id,created_by_user_id=excluded.created_by_user_id,analysis_json=excluded.analysis_json,updated_at=excluded.updated_at`)
+    .bind(fileId,access.row.requisition_id,user.client_id,user.id,jsonText,now,now).run();
+  await audit(env,user,'analisou_resultado','result_file',fileId,{protocol:access.row.protocol,patient:access.row.patient_name,total:clean.summary.total,altered:clean.summary.altered});
+  return ok({analysis:clean,message:'Análise salva e pronta para consulta.'});
+}
+
+
+function timingStatusForExam(row,warningMinutes,nowMs=Date.now()){
+  const dueMs=row.due_at?new Date(row.due_at).getTime():NaN;
+  const completedMs=row.completed_at?new Date(row.completed_at).getTime():NaN;
+  if(row.completed_at){
+    const late=Number.isFinite(dueMs)&&Number.isFinite(completedMs)&&completedMs>dueMs;
+    return {status:late?'completed_late':'completed_on_time',seconds: Number.isFinite(dueMs)?Math.round((dueMs-completedMs)/1000):null};
+  }
+  if(!Number.isFinite(dueMs))return {status:'no_deadline',seconds:null};
+  const seconds=Math.round((dueMs-nowMs)/1000);
+  if(seconds<0)return {status:'late',seconds};
+  if(seconds<=Math.max(1,Number(warningMinutes||10))*60)return {status:'warning',seconds};
+  return {status:'on_time',seconds};
+}
+
+async function examTimingSettings(env){
+  const base=await env.DB.prepare('SELECT default_turnaround_minutes,warning_minutes FROM lab_timing_settings WHERE id=1').first();
+  const rows=await env.DB.prepare('SELECT exam_code,exam_name,turnaround_minutes,active FROM exam_turnaround_settings WHERE active=1 ORDER BY exam_name COLLATE NOCASE').all();
+  return ok({defaultTurnaroundMinutes:Number(base?.default_turnaround_minutes||1440),warningMinutes:Number(base?.warning_minutes||10),overrides:rows.results||[],catalog:catalogWithCodes()});
+}
+
+async function updateExamTimingSettings(request,env,user){
+  const b=await safeBody(request);if(!b)return err('Dados inválidos.');
+  const mode=String(b.mode||'bulk');
+  if(mode==='defaults'){
+    const defaultMinutes=Math.round(Number(b.defaultTurnaroundMinutes));
+    const warningMinutes=Math.round(Number(b.warningMinutes));
+    if(!Number.isFinite(defaultMinutes)||defaultMinutes<1||defaultMinutes>60*24*30)return err('Informe um tempo padrão válido.');
+    if(!Number.isFinite(warningMinutes)||warningMinutes<1||warningMinutes>1440)return err('Informe um aviso válido em minutos.');
+    const ts=nowIso();
+    await env.DB.prepare(`INSERT INTO lab_timing_settings(id,default_turnaround_minutes,warning_minutes,created_at,updated_at) VALUES(1,?,?,?,?) ON CONFLICT(id) DO UPDATE SET default_turnaround_minutes=excluded.default_turnaround_minutes,warning_minutes=excluded.warning_minutes,updated_at=excluded.updated_at`).bind(defaultMinutes,warningMinutes,ts,ts).run();
+    await audit(env,user,'alterou_tempo_padrao_exames','timing_settings',1,{defaultMinutes,warningMinutes});
+    return ok({message:'Tempo padrão atualizado.'});
+  }
+  if(mode==='remove'){
+    const codes=Array.isArray(b.examCodes)?[...new Set(b.examCodes.map(String).filter(Boolean))]:[];if(!codes.length)return err('Selecione pelo menos um exame.');
+    const stmts=codes.map(code=>env.DB.prepare('DELETE FROM exam_turnaround_settings WHERE exam_code=?').bind(code));
+    await env.DB.batch(stmts);await audit(env,user,'removeu_tempo_exames','timing_settings','bulk',{examCodes:codes});return ok({message:'Os exames selecionados voltaram a usar o tempo padrão.'});
+  }
+  const minutes=Math.round(Number(b.turnaroundMinutes));
+  const codes=Array.isArray(b.examCodes)?[...new Set(b.examCodes.map(String).filter(Boolean))]:[];
+  if(!codes.length)return err('Selecione um ou mais exames.');
+  if(!Number.isFinite(minutes)||minutes<1||minutes>60*24*30)return err('Informe um tempo válido para os exames selecionados.');
+  const catalog=new Map();for(const g of catalogWithCodes())for(const e of g.items)catalog.set(e.code,e.name);
+  const ts=nowIso(),stmts=[];for(const code of codes){const name=catalog.get(code);if(!name)continue;stmts.push(env.DB.prepare(`INSERT INTO exam_turnaround_settings(exam_code,exam_name,turnaround_minutes,active,created_at,updated_at) VALUES(?,?,?,1,?,?) ON CONFLICT(exam_code) DO UPDATE SET exam_name=excluded.exam_name,turnaround_minutes=excluded.turnaround_minutes,active=1,updated_at=excluded.updated_at`).bind(code,name,minutes,ts,ts));}
+  if(!stmts.length)return err('Nenhum exame válido foi selecionado.');
+  await env.DB.batch(stmts);await audit(env,user,'definiu_tempo_exames','timing_settings','bulk',{examCodes:codes,minutes});
+  return ok({message:`Tempo único aplicado a ${stmts.length} exame${stmts.length>1?'s':''}.`});
+}
+
+async function examTimingBoard(env,user,url){
+  const mode=['pending','late','completed','all'].includes(url.searchParams.get('mode'))?url.searchParams.get('mode'):'pending';
+  const clientId=Number(url.searchParams.get('clientId')||0),technicianId=Number(url.searchParams.get('technicianId')||0);
+  const setting=await env.DB.prepare('SELECT warning_minutes FROM lab_timing_settings WHERE id=1').first();const warningMinutes=Number(setting?.warning_minutes||10);
+  let sql=`SELECT e.id exam_id,e.requisition_id,e.exam_code,e.exam_name,e.turnaround_minutes,e.due_at,e.completed_at,e.completed_by_user_id,e.completed_by_name,e.completed_within_sla,r.protocol,r.priority,r.patient_name,r.status requisition_status,r.lab_received_at,r.completed_at requisition_completed_at,r.receiver_id,r.receiver_name,r.client_id,c.name client_name FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id JOIN clients c ON c.id=r.client_id WHERE r.status<>'cancelado' AND r.lab_received_at IS NOT NULL AND (EXISTS(SELECT 1 FROM requisition_exams pnd WHERE pnd.requisition_id=r.id AND pnd.completed_at IS NULL) OR datetime(r.completed_at)>=datetime('now','-7 days'))`;
+  const p=[];if(clientId){sql+=' AND r.client_id=?';p.push(clientId)}if(technicianId){sql+=' AND r.receiver_id=?';p.push(technicianId)}
+  sql+=' ORDER BY CASE r.priority WHEN \'urgent\' THEN 0 WHEN \'priority\' THEN 1 ELSE 2 END, COALESCE(e.due_at,e.completed_at) ASC LIMIT 2000';
+  const rows=await env.DB.prepare(sql).bind(...p).all(),now=Date.now();
+  const exams=(rows.results||[]).map(x=>({...x,timing:timingStatusForExam(x,warningMinutes,now)}));
+  const groups=new Map();
+  for(const e of exams){let g=groups.get(e.requisition_id);if(!g){g={requisitionId:e.requisition_id,protocol:e.protocol,priority:e.priority||'normal',patientName:e.patient_name,clientName:e.client_name,receiverName:e.receiver_name,labReceivedAt:e.lab_received_at,requisitionCompletedAt:e.requisition_completed_at,total:0,completed:0,onTime:0,warning:0,late:0,completedLate:0,pending:[],latestCompletedAt:null};groups.set(e.requisition_id,g)}g.total++;if(e.completed_at){g.completed++;if(!g.latestCompletedAt||new Date(e.completed_at)>new Date(g.latestCompletedAt))g.latestCompletedAt=e.completed_at}if(e.timing.status==='on_time')g.onTime++;if(e.timing.status==='warning')g.warning++;if(e.timing.status==='late')g.late++;if(e.timing.status==='completed_late')g.completedLate++;if(!e.completed_at)g.pending.push({examId:e.exam_id,examName:e.exam_name,dueAt:e.due_at,timing:e.timing});}
+  let requests=[...groups.values()].map(g=>({...g,progressPct:g.total?Math.round(g.completed/g.total*100):0,state:g.late?'late':g.warning?'warning':g.completed===g.total?'completed':'on_time'}));
+  if(mode==='pending')requests=requests.filter(g=>g.completed<g.total);
+  else if(mode==='late')requests=requests.filter(g=>g.late>0||g.completedLate>0);
+  else if(mode==='completed')requests=requests.filter(g=>g.completed===g.total);
+  const visibleIds=new Set(requests.map(g=>Number(g.requisitionId)));
+  const visibleExams=exams.filter(e=>visibleIds.has(Number(e.requisition_id)));
+  const activeExams=exams.filter(e=>!e.completed_at);
+  const counts={requests:requests.length,exams:visibleExams.length,pending:activeExams.length,onTime:activeExams.filter(x=>x.timing.status==='on_time').length,warning:activeExams.filter(x=>x.timing.status==='warning').length,late:activeExams.filter(x=>x.timing.status==='late').length,completed:exams.filter(x=>!!x.completed_at).length};
+  return ok({mode,warningMinutes,counts,requests,exams:visibleExams});
+}
+
+async function completeTimedExam(env,user,examId){
+  const e=await env.DB.prepare(`SELECT e.*,r.id requisition_id,r.protocol,r.status requisition_status,r.receiver_name FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id WHERE e.id=?`).bind(examId).first();
+  if(!e)return err('Exame não encontrado.',404);if(e.requisition_status==='cancelado')return err('A solicitação está cancelada.',409);if(!e.due_at)return err('O cronômetro deste exame ainda não começou. Dê o recebimento da amostra primeiro.',409);if(e.completed_at)return ok({message:'Este exame já está concluído.'});
+  const ts=nowIso(),within=new Date(ts).getTime()<=new Date(e.due_at).getTime()?1:0;
+  await env.DB.prepare(`UPDATE requisition_exams SET completed_at=?,completed_by_user_id=?,completed_by_name=?,completed_within_sla=? WHERE id=?`).bind(ts,user.id,user.username_display,within,examId).run();
+  const left=await env.DB.prepare('SELECT COUNT(*) n FROM requisition_exams WHERE requisition_id=? AND completed_at IS NULL').bind(e.requisition_id).first();
+  const stmts=[env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,?,?,?,?,?)`).bind(e.requisition_id,e.requisition_status,user.id,user.username_display,JSON.stringify({message:`Exame concluído: ${e.exam_name}`,examId,onTime:!!within}),ts)];
+  if(Number(left?.n||0)===0 && ['recebido','em_analise'].includes(e.requisition_status))stmts.push(env.DB.prepare(`UPDATE requisitions SET status='concluido',completed_at=?,updated_at=? WHERE id=?`).bind(ts,ts,e.requisition_id));
+  await env.DB.batch(stmts);await audit(env,user,'concluiu_exame_individual','requisition',e.requisition_id,{examId,examName:e.exam_name,onTime:!!within});return ok({message:`${e.exam_name} concluído${within?' dentro do prazo':' com atraso'}.`,allCompleted:Number(left?.n||0)===0});
+}
+
+async function examTimingReport(env,user,url){
+  const from=clampString(url.searchParams.get('from'),20),to=clampString(url.searchParams.get('to'),20);
+  let where=`r.status<>'cancelado' AND r.lab_received_at IS NOT NULL`;const p=[];
+  if(from){where+=` AND date(datetime(r.lab_received_at,'-3 hours'))>=date(?)`;p.push(from)}
+  if(to){where+=` AND date(datetime(r.lab_received_at,'-3 hours'))<=date(?)`;p.push(to)}
+  if(!from&&!to)where+=` AND datetime(r.lab_received_at)>=datetime('now','-30 days')`;
+  const rows=await env.DB.prepare(`SELECT e.completed_at,e.due_at,e.completed_within_sla,e.completed_by_name,r.receiver_name,r.receiver_id FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id WHERE ${where}`).bind(...p).all();
+  const now=Date.now(),map=new Map();for(const x of rows.results||[]){const tech=x.receiver_name||x.completed_by_name||'Sem técnico';let a=map.get(tech);if(!a){a={technician:tech,total:0,completed:0,onTime:0,late:0,pending:0,pendingLate:0};map.set(tech,a)}a.total++;if(x.completed_at){a.completed++;const late=x.due_at&&new Date(x.completed_at).getTime()>new Date(x.due_at).getTime();late?a.late++:a.onTime++;}else{a.pending++;if(x.due_at&&now>new Date(x.due_at).getTime())a.pendingLate++;}}
+  const technicians=[...map.values()].map(x=>({...x,onTimePct:x.completed?Math.round(x.onTime/x.completed*100):0})).sort((a,b)=>b.late-a.late||b.pendingLate-a.pendingLate||a.technician.localeCompare(b.technician));
+  const totals=technicians.reduce((a,x)=>{for(const k of ['total','completed','onTime','late','pending','pendingLate'])a[k]+=x[k];return a},{total:0,completed:0,onTime:0,late:0,pending:0,pendingLate:0});totals.onTimePct=totals.completed?Math.round(totals.onTime/totals.completed*100):0;
+  return ok({from:from||null,to:to||null,totals,technicians});
 }
 
 async function temperatureSheet(env,user,url){
