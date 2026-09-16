@@ -162,10 +162,10 @@ async function api(request, env, url) {
   m = path.match(/^\/api\/technicians\/(\d+)\/reset-password$/);
   if (m && method === 'POST') return requireAdminOnly(user, () => resetTechnicianPassword(request, env, user, Number(m[1])));
 
-  if (path === '/api/exam-timing/settings' && method === 'GET') return requireAdmin(user, () => examTimingSettings(env));
+  if (path === '/api/exam-timing/settings' && method === 'GET') return requireAdminOnly(user, () => examTimingSettings(env));
   if (path === '/api/exam-timing/settings' && method === 'PUT') return requireAdminOnly(user, () => updateExamTimingSettings(request, env, user));
   if (path === '/api/exam-timing/board' && method === 'GET') return requireAdmin(user, () => examTimingBoard(env, user, url));
-  if (path === '/api/exam-timing/report' && method === 'GET') return requireAdmin(user, () => examTimingReport(env, user, url));
+  if (path === '/api/exam-timing/report' && method === 'GET') return requireAdminOnly(user, () => examTimingReport(env, user, url));
   m = path.match(/^\/api\/exam-timing\/exams\/(\d+)\/complete$/);
   if (m && method === 'POST') return requireAdmin(user, () => completeTimedExam(env, user, Number(m[1])));
 
@@ -1493,9 +1493,13 @@ async function examTimingBoard(env,user,url){
   if(legacyMode==='all')scope='all';
   const clientId=Number(url.searchParams.get('clientId')||0),technicianId=Number(url.searchParams.get('technicianId')||0);
   const priority=['normal','priority','urgent'].includes(String(url.searchParams.get('priority')||''))?String(url.searchParams.get('priority')):'';
+  const from=clampString(url.searchParams.get('from'),20),to=clampString(url.searchParams.get('to'),20);
   const setting=await env.DB.prepare('SELECT warning_minutes FROM lab_timing_settings WHERE id=1').first();const warningMinutes=Number(setting?.warning_minutes||10);
-  let sql=`SELECT e.id exam_id,e.requisition_id,e.exam_code,e.exam_name,e.turnaround_minutes,e.due_at,e.completed_at,e.completed_by_user_id,e.completed_by_name,e.completed_within_sla,r.protocol,r.priority,r.patient_name,r.status requisition_status,r.lab_received_at,r.completed_at requisition_completed_at,r.receiver_id,r.receiver_name,r.client_id,c.name client_name FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id JOIN clients c ON c.id=r.client_id WHERE r.status<>'cancelado' AND r.lab_received_at IS NOT NULL AND (EXISTS(SELECT 1 FROM requisition_exams pnd WHERE pnd.requisition_id=r.id AND pnd.completed_at IS NULL) OR datetime(r.completed_at)>=datetime('now','-7 days'))`;
+  let sql=`SELECT e.id exam_id,e.requisition_id,e.exam_code,e.exam_name,e.turnaround_minutes,e.due_at,e.completed_at,e.completed_by_user_id,e.completed_by_name,e.completed_within_sla,r.protocol,r.priority,r.patient_name,r.status requisition_status,r.lab_received_at,r.completed_at requisition_completed_at,r.receiver_id,r.receiver_name,r.client_id,c.name client_name FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id JOIN clients c ON c.id=r.client_id WHERE r.status<>'cancelado' AND r.lab_received_at IS NOT NULL`;
   const p=[];
+  if(from){sql+=` AND date(datetime(r.lab_received_at,'-3 hours'))>=date(?)`;p.push(from)}
+  if(to){sql+=` AND date(datetime(r.lab_received_at,'-3 hours'))<=date(?)`;p.push(to)}
+  if(!from&&!to)sql+=` AND (EXISTS(SELECT 1 FROM requisition_exams pnd WHERE pnd.requisition_id=r.id AND pnd.completed_at IS NULL) OR datetime(r.completed_at)>=datetime('now','-7 days'))`;
   if(clientId){sql+=' AND r.client_id=?';p.push(clientId)}
   if(technicianId){sql+=' AND r.receiver_id=?';p.push(technicianId)}
   if(priority){sql+=' AND r.priority=?';p.push(priority)}
@@ -1505,9 +1509,9 @@ async function examTimingBoard(env,user,url){
   const groups=new Map();
   for(const e of exams){
     let g=groups.get(e.requisition_id);
-    if(!g){g={requisitionId:e.requisition_id,protocol:e.protocol,priority:e.priority||'normal',patientName:e.patient_name,clientName:e.client_name,receiverName:e.receiver_name,labReceivedAt:e.lab_received_at,requisitionCompletedAt:e.requisition_completed_at,requisitionStatus:e.requisition_status,total:0,completed:0,onTime:0,warning:0,late:0,completedLate:0,pending:[],latestCompletedAt:null,earliestDueAt:null};groups.set(e.requisition_id,g)}
+    if(!g){g={requisitionId:e.requisition_id,protocol:e.protocol,priority:e.priority||'normal',patientName:e.patient_name,clientName:e.client_name,receiverName:e.receiver_name,labReceivedAt:e.lab_received_at,requisitionCompletedAt:e.requisition_completed_at,requisitionStatus:e.requisition_status,total:0,completed:0,onTime:0,warning:0,late:0,completedLate:0,pending:[],completedExams:[],latestCompletedAt:null,earliestDueAt:null};groups.set(e.requisition_id,g)}
     g.total++;
-    if(e.completed_at){g.completed++;if(!g.latestCompletedAt||new Date(e.completed_at)>new Date(g.latestCompletedAt))g.latestCompletedAt=e.completed_at}
+    if(e.completed_at){g.completed++;g.completedExams.push({examId:e.exam_id,examName:e.exam_name,completedAt:e.completed_at,onTime:e.timing.status==='completed_on_time'});if(!g.latestCompletedAt||new Date(e.completed_at)>new Date(g.latestCompletedAt))g.latestCompletedAt=e.completed_at}
     if(e.timing.status==='on_time')g.onTime++;
     if(e.timing.status==='warning')g.warning++;
     if(e.timing.status==='late')g.late++;
@@ -1521,7 +1525,9 @@ async function examTimingBoard(env,user,url){
   else{
     if(scope==='unfinished')requests=requests.filter(g=>g.completed<g.total);
     else if(scope==='active')requests=requests.filter(g=>g.completed>0&&g.completed<g.total);
-    if(bucket)requests=requests.filter(g=>g.state===bucket);
+    if(bucket==='late')requests=requests.filter(g=>g.late>0);
+    if(bucket==='warning')requests=requests.filter(g=>g.warning>0);
+    if(bucket==='on_time')requests=requests.filter(g=>g.onTime>0);
   }
   const stateRank={late:0,warning:1,on_time:2,completed:3},priorityRank={urgent:0,priority:1,normal:2};
   requests.sort((a,b)=>{
@@ -1532,7 +1538,7 @@ async function examTimingBoard(env,user,url){
   });
   const visibleIds=new Set(requests.map(g=>Number(g.requisitionId)));
   const visibleExams=exams.filter(e=>visibleIds.has(Number(e.requisition_id)));
-  return ok({scope,bucket,warningMinutes,counts,requests,exams:visibleExams});
+  return ok({scope,bucket,from:from||null,to:to||null,warningMinutes,counts,requests,exams:visibleExams});
 }
 
 async function completeTimedExam(env,user,examId){
