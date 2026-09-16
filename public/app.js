@@ -7,7 +7,7 @@ const esc = (v='') => String(v ?? '').replace(/[&<>'"]/g, c => ({'&':'&amp;','<'
 const fmtDate = v => v ? new Intl.DateTimeFormat('pt-BR',{timeZone:'America/Fortaleza'}).format(new Date(v.length===10 ? `${v}T12:00:00-03:00` : v)) : '—';
 const fmtDateTime = v => v ? new Intl.DateTimeFormat('pt-BR',{dateStyle:'short',timeStyle:'short',timeZone:'America/Fortaleza'}).format(new Date(v)) : '—';
 const fmtTime = v => v ? new Intl.DateTimeFormat('pt-BR',{hour:'2-digit',minute:'2-digit',timeZone:'America/Fortaleza'}).format(new Date(v)) : '';
-const fmtBytes = n => !n ? '0 B' : n<1024?`${n} B`:n<1048576?`${(n/1024).toFixed(1)} KB`:`${(n/1048576).toFixed(1)} MB`;
+const fmtBytes = n => !n ? '0 B' : n<1024?`${n} B`:n<1048576?`${(n/1024).toFixed(1)} KB`:n<1073741824?`${(n/1048576).toFixed(1)} MB`:`${(n/1073741824).toFixed(2)} GB`;
 const today = () => new Date().toLocaleDateString('sv-SE',{timeZone:'America/Fortaleza'});
 const currentMonth = () => today().slice(0,7);
 
@@ -162,7 +162,72 @@ function startLabAlerts(){
 }
 document.addEventListener('click',e=>{if(e.target.matches('[data-close-modal]'))closeModal()});
 
+
+function ownerPath(){
+  const clean=location.pathname.replace(/\/+$/,'')||'/';
+  return clean==='/proprietario' || new URLSearchParams(location.search).get('proprietario')==='1';
+}
+function ownerToast(msg,type='ok'){
+  let el=$('#ownerToast');if(!el){el=document.createElement('div');el.id='ownerToast';el.className='owner-toast';document.body.appendChild(el)}
+  el.textContent=msg;el.className=`owner-toast show ${type}`;clearTimeout(ownerToast.t);ownerToast.t=setTimeout(()=>el.className='owner-toast',3600);
+}
+function reaisToCents(v){
+  const raw=String(v??'').trim();if(!raw)return null;
+  const n=Number(raw.replace(/\./g,'').replace(',','.'));return Number.isFinite(n)?Math.round(n*100):NaN;
+}
+function centsToInput(c){return c==null?'':(Number(c)/100).toFixed(2).replace('.',',')}
+function ownerShell(inner){
+  stopLabAlerts();document.body.className='owner-mode';
+  document.body.innerHTML=`<div class="owner-page"><div id="ownerRoot">${inner}</div><div id="ownerToast" class="owner-toast"></div></div>`;
+}
+async function ownerBoot(){
+  try{await api('/api/owner/me');await renderOwnerDashboard(currentMonth())}catch{showOwnerLogin()}
+}
+function showOwnerLogin(){
+  ownerShell(`<main class="owner-auth-wrap"><section class="owner-auth-card"><div class="owner-brand"><div class="owner-logo-mark">H</div><div><h1>HLabVet Gestão</h1><p>Painel exclusivo do proprietário do sistema</p></div></div><form id="ownerLoginForm" class="owner-stack"><label>Login<input name="username" autocomplete="username" required></label><label>Senha<input name="password" type="password" autocomplete="current-password" required></label><button class="btn primary" type="submit">Entrar no painel</button></form><a class="owner-back-link" href="/">Voltar ao HLabVet do laboratório</a></section></main>`);
+  $('#ownerLoginForm').addEventListener('submit',async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.currentTarget));try{await api('/api/owner/login',{json:body});await renderOwnerDashboard(currentMonth())}catch(err){ownerToast(err.message,'error')}});
+}
+async function renderOwnerDashboard(month=currentMonth()){
+  let d,p;
+  try{[d,p]=await Promise.all([api(`/api/owner/dashboard?month=${encodeURIComponent(month)}`),api('/api/owner/pricing')])}catch(e){if(e.status===401)return showOwnerLogin();return ownerToast(e.message,'error')}
+  const q=d.counts,st=d.storage,h=d.health,pr=d.pricing;
+  const tierLabel=pr.tier?`${pr.tier.min_clients}–${pr.tier.max_clients??'+'} clientes ativos`:'Sem faixa';
+  const healthClass=(h.dbLatencyMs||0)>800?'bad':(h.dbLatencyMs||0)>350?'warn':'ok';
+  const tierRows=(p.tiers||[]).map(t=>`<tr><td>${t.min_clients}</td><td>${t.max_clients??'Acima'}</td><td><input class="owner-price-input" data-tier-id="${t.id}" value="${centsToInput(t.monthly_cents)}"></td></tr>`).join('');
+  ownerShell(`<header class="owner-top"><div><strong>HLabVet Gestão</strong><span>Painel do proprietário</span></div><div class="owner-top-actions"><a href="/" class="btn ghost small">Abrir sistema do laboratório</a><button id="ownerLogout" class="btn ghost small">Sair</button></div></header><main class="owner-container">
+    <section class="owner-title-row"><div><h1>Visão geral</h1><p>Uso, cobrança, armazenamento, backup e encerramento da instalação.</p></div><label>Mês de referência<input id="ownerMonth" type="month" value="${esc(d.month)}"></label></section>
+    <section class="owner-cards">
+      <article class="owner-card emphasis"><small>VALOR MENSAL SUGERIDO</small><strong>${fmtMoney(pr.suggestedCents)}</strong><span>${esc(tierLabel)}</span></article>
+      <article class="owner-card"><small>VALOR FINAL CONTRATADO</small><strong>${fmtMoney(pr.finalCents)}</strong><span>Vencimento: dia ${pr.dueDay}</span></article>
+      <article class="owner-card"><small>CLIENTES ATIVOS NO MÊS</small><strong>${q.activeClients}</strong><span>${q.registeredClients} cadastrados • ${q.enabledClients} habilitados</span></article>
+      <article class="owner-card"><small>SOLICITAÇÕES NO MÊS</small><strong>${q.requests}</strong><span>${q.exams} exames vinculados</span></article>
+    </section>
+    <section class="owner-grid-2">
+      <article class="owner-panel"><div class="owner-panel-head"><div><h2>Consumo</h2><p>Indicadores reais desta instalação.</p></div></div><div class="owner-metric-list">
+        <div><span>Resultados cadastrados</span><b>${q.results}</b></div><div><span>Tutores ativos</span><b>${q.tutors}</b></div><div><span>Entregadores ativos</span><b>${q.couriers}</b></div><div><span>Técnicos do laboratório</span><b>${q.staff}</b></div><div><span>Banco D1 aproximado</span><b>${st.databaseBytes==null?'Não informado':fmtBytes(st.databaseBytes)}</b></div><div><span>Objetos no R2</span><b>${st.r2Objects}${st.r2Truncated?' +':''}</b></div><div><span>Armazenamento R2</span><b>${fmtBytes(st.r2Bytes)}</b></div><div><span>Arquivos de resultados</span><b>${fmtBytes(st.resultBytes)}</b></div>
+      </div></article>
+      <article class="owner-panel"><div class="owner-panel-head"><div><h2>Saúde do sistema</h2><p>Leitura rápida para você não depender de reclamação do cliente.</p></div></div><div class="owner-health"><div class="status-dot ok"><i></i><span>API</span><b>ONLINE</b></div><div class="status-dot ok"><i></i><span>Banco D1</span><b>ONLINE</b></div><div class="status-dot ok"><i></i><span>Arquivos R2</span><b>ONLINE</b></div><div class="status-dot ${healthClass}"><i></i><span>Resposta do banco</span><b>${h.dbLatencyMs} ms</b></div></div><small class="owner-note">O painel mede o tempo de uma consulta simples. Picos isolados não significam falha; o histórico poderá ser ampliado depois.</small></article>
+    </section>
+    <section class="owner-grid-2">
+      <article class="owner-panel"><div class="owner-panel-head"><div><h2>Tabela comercial</h2><p>O valor sugerido é calculado pelos clientes que realmente usaram o sistema no mês.</p></div></div><form id="ownerPricingForm"><div class="table-wrap"><table><thead><tr><th>De</th><th>Até</th><th>Mensalidade (R$)</th></tr></thead><tbody>${tierRows}</tbody></table></div><div class="owner-form-grid"><label>Valor contratado (R$)<input id="contractedMonthly" value="${centsToInput(p.contract?.contracted_monthly_cents)}" placeholder="Em branco = automático"></label><label>Desconto (R$)<input id="discountCents" value="${centsToInput(p.contract?.discount_cents||0)}"></label><label>Dia do vencimento<input id="dueDay" type="number" min="1" max="28" value="${p.contract?.due_day||10}"></label><label>Observação<input id="contractNotes" value="${esc(p.contract?.notes||'')}"></label></div><button class="btn primary" type="submit">Salvar preços</button></form></article>
+      <article class="owner-panel"><div class="owner-panel-head"><div><h2>Backup e devolução dos dados</h2><p>Faça snapshot lógico e exporte um pacote organizado quando necessário.</p></div></div><div class="owner-actions-stack"><button id="ownerBackup" class="btn secondary">Criar backup lógico agora</button><button id="ownerExport" class="btn primary">Exportar dados completos (.ZIP)</button></div><div class="owner-backups"><h3>Últimos backups</h3>${(d.backups||[]).length?(d.backups||[]).map(b=>`<div><span>${fmtDateTime(b.created_at)}</span><b>${fmtBytes(b.size_bytes)}</b></div>`).join(''):'<p>Nenhum backup lógico criado ainda.</p>'}</div><small class="owner-note">O D1 também possui recuperação por Time Travel da Cloudflare; o ZIP é a cópia portátil para entregar ao laboratório.</small></article>
+    </section>
+    <section class="owner-grid-2">
+      <article class="owner-panel"><div class="owner-panel-head"><div><h2>Segurança do proprietário</h2><p>Troque sua senha sem alterar o acesso do laboratório.</p></div></div><form id="ownerPasswordForm" class="owner-stack"><label>Senha atual<input name="currentPassword" type="password" required></label><label>Nova senha<input name="newPassword" type="password" minlength="10" required></label><label>Confirmar nova senha<input name="confirm" type="password" minlength="10" required></label><button class="btn secondary" type="submit">Alterar minha senha</button></form></article>
+      <article class="owner-panel danger-zone"><div class="owner-panel-head"><div><h2>Zerar para primeiro uso</h2><p>Exclui todos os testes, clientes, tutores, entregadores, solicitações, resultados, preços e arquivos. Preserva seu acesso de proprietário e deixa somente HLabVet com a senha inicial para o novo laboratório.</p></div></div><div class="owner-stack"><label>Digite <b>ZERAR HLABVET</b><input id="ownerResetPhrase" autocomplete="off"></label><label>Sua senha de proprietário<input id="ownerResetPassword" type="password" autocomplete="current-password"></label><label class="owner-check"><input id="ownerResetCheck" type="checkbox"> Confirmo que já exportei o que preciso e que a exclusão é definitiva.</label><button id="ownerReset" class="btn danger" type="button">Zerar instalação</button></div></article>
+    </section>
+  </main>`);
+  $('#ownerMonth').addEventListener('change',e=>renderOwnerDashboard(e.target.value||currentMonth()));
+  $('#ownerLogout').addEventListener('click',async()=>{try{await api('/api/owner/logout',{method:'POST'})}catch{}showOwnerLogin()});
+  $('#ownerPricingForm').addEventListener('submit',async e=>{e.preventDefault();const tiers=$$('.owner-price-input').map(i=>({id:Number(i.dataset.tierId),monthlyCents:reaisToCents(i.value)}));const contractedMonthlyCents=reaisToCents($('#contractedMonthly').value);const discountCents=reaisToCents($('#discountCents').value)??0;try{await api('/api/owner/pricing',{method:'PUT',json:{tiers,contractedMonthlyCents,discountCents,dueDay:Number($('#dueDay').value||10),notes:$('#contractNotes').value}});ownerToast('Configuração comercial salva.');await renderOwnerDashboard($('#ownerMonth')?.value||month)}catch(err){ownerToast(err.message,'error')}});
+  $('#ownerBackup').addEventListener('click',async()=>{const b=$('#ownerBackup');b.disabled=true;b.textContent='Criando backup...';try{const r=await api('/api/owner/backup',{method:'POST'});ownerToast(`${r.message} ${fmtBytes(r.sizeBytes)}`);await renderOwnerDashboard(month)}catch(err){ownerToast(err.message,'error')}finally{if(document.body.contains(b)){b.disabled=false;b.textContent='Criar backup lógico agora'}}});
+  $('#ownerExport').addEventListener('click',async()=>{const b=$('#ownerExport');b.disabled=true;b.textContent='Preparando ZIP...';try{const res=await fetch('/api/owner/export.zip',{credentials:'include'});if(!res.ok){const ct=res.headers.get('content-type')||'';const d=ct.includes('json')?await res.json():null;throw new Error(d?.error||`Erro ${res.status}`)}const blob=await res.blob();const url=URL.createObjectURL(blob);const a=document.createElement('a');a.href=url;a.download=`HLabVet-exportacao-${today()}.zip`;document.body.appendChild(a);a.click();a.remove();setTimeout(()=>URL.revokeObjectURL(url),60000);ownerToast('Exportação concluída.')}catch(err){ownerToast(err.message,'error')}finally{b.disabled=false;b.textContent='Exportar dados completos (.ZIP)'}});
+  $('#ownerPasswordForm').addEventListener('submit',async e=>{e.preventDefault();const body=Object.fromEntries(new FormData(e.currentTarget));if(body.newPassword!==body.confirm)return ownerToast('A confirmação da nova senha não confere.','error');delete body.confirm;try{const r=await api('/api/owner/change-password',{json:body});ownerToast(r.message);e.currentTarget.reset()}catch(err){ownerToast(err.message,'error')}});
+  $('#ownerReset').addEventListener('click',async()=>{if(!$('#ownerResetCheck').checked)return ownerToast('Marque a confirmação antes de zerar.','error');if(!confirm('Esta ação apagará definitivamente todos os dados de teste desta instalação. Continuar?'))return;const b=$('#ownerReset');b.disabled=true;b.textContent='Zerando...';try{const r=await api('/api/owner/reset',{json:{confirmation:$('#ownerResetPhrase').value,password:$('#ownerResetPassword').value}});ownerToast(r.message);setTimeout(()=>renderOwnerDashboard(currentMonth()),1200)}catch(err){ownerToast(err.message,'error')}finally{if(document.body.contains(b)){b.disabled=false;b.textContent='Zerar instalação'}}});
+}
+
 async function boot(){
+  if(ownerPath()) return ownerBoot();
   const params=new URLSearchParams(location.search);
   const token=params.get('entregador');
   if(token)return renderCourierPortal(token);
@@ -244,7 +309,7 @@ function renderNav(){
     ['dashboard','⌂','Painel'],['requests','▣','Solicitações'],['cancellations','×','Cancelamentos'],['clients','♙','Clientes'],['couriers','➜','Entregadores'],['receivers','✓','Técnicos'],['temperature','▤','Temperaturas'],['password','⚿','Alterar senha']
   ];
   else items=[
-    ['dashboard','⌂','Painel'],['requests','▣','Solicitações'],['cancellations','×','Cancelamentos'],['clients','♙','Clientes'],['couriers','➜','Entregadores'],['receivers','✓','Técnicos'],['prices','R$','Preços'],['finance','▦','Financeiro'],['temperature','▤','Temperaturas'],['audit','◴','Auditoria'],['password','⚿','Alterar senha']
+    ['dashboard','⌂','Painel'],['requests','▣','Solicitações'],['cancellations','×','Cancelamentos'],['clients','♙','Clientes'],['couriers','➜','Entregadores'],['receivers','✓','Técnicos'],['prices','R$','Preços'],['finance','▦','Financeiro'],['temperature','▤','Temperaturas'],['password','⚿','Alterar senha']
   ];
   $('#nav').innerHTML=items.map(([id,ic,label])=>`<button class="nav-btn" data-page="${id}"><span>${ic}</span>${label}</button>`).join('');
   $$('.nav-btn').forEach(b=>b.addEventListener('click',()=>{navigate(b.dataset.page);$('.sidebar').classList.remove('open')}));
@@ -252,9 +317,9 @@ function renderNav(){
 
 async function navigate(page){
   state.page=page; $$('.nav-btn').forEach(b=>b.classList.toggle('active',b.dataset.page===page)); $('#topActions').innerHTML='';
-  const map={dashboard:['Painel','Visão geral do atendimento'],requests:[state.me.role==='client'?'Meus exames':'Solicitações','Pesquise por período, animal, tutor, raça e outros dados'],cancellations:['Cancelamentos','Solicitações canceladas e motivo'],clients:['Clientes','Cadastros e acessos dos clientes'],couriers:['Entregadores','Painel móvel, login próprio e termômetros'],receivers:['Técnicos','Técnicos do laboratório com login próprio'],prices:['Preços dos exames','Tabela geral e valores específicos por cliente'],finance:['Financeiro','Ranking de clientes e espelho detalhado para cobrança'],temperature:['Controle de temperatura','Fichas mensais de envio e recebimento'],password:['Alterar senha','A senha diferencia maiúsculas e minúsculas'],audit:['Auditoria','Registro de ações importantes'],'client-users':['Usuários / técnicos','Cadastre acessos da clínica; carimbo é opcional e automático para técnicos'],tutors:['Tutores / clientes finais','Cadastre quem poderá acessar somente os próprios resultados'],'tutor-results':['Meus resultados','Visualize, baixe ou imprima somente os seus exames liberados'],'new-request':['Nova solicitação','Requisição de exames veterinários']};
+  const map={dashboard:['Painel','Visão geral do atendimento'],requests:[state.me.role==='client'?'Meus exames':'Solicitações','Pesquise por período, animal, tutor, raça e outros dados'],cancellations:['Cancelamentos','Solicitações canceladas e motivo'],clients:['Clientes','Cadastros e acessos dos clientes'],couriers:['Entregadores','Painel móvel, login próprio e termômetros'],receivers:['Técnicos','Técnicos do laboratório com login próprio'],prices:['Preços dos exames','Tabela geral e valores específicos por cliente'],finance:['Financeiro','Ranking de clientes e espelho detalhado para cobrança'],temperature:['Controle de temperatura','Fichas mensais de envio e recebimento'],password:['Alterar senha','A senha diferencia maiúsculas e minúsculas'],'client-users':['Usuários / técnicos','Cadastre acessos da clínica; carimbo é opcional e automático para técnicos'],tutors:['Tutores / clientes finais','Cadastre quem poderá acessar somente os próprios resultados'],'tutor-results':['Meus resultados','Visualize, baixe ou imprima somente os seus exames liberados'],'new-request':['Nova solicitação','Requisição de exames veterinários']};
   $('#pageTitle').textContent=map[page]?.[0]||'HLab Vet';$('#pageSubtitle').textContent=map[page]?.[1]||'';
-  const fn={dashboard:renderDashboard,requests:renderRequests,cancellations:renderCancellations,clients:renderClients,couriers:renderCouriers,receivers:renderReceivers,prices:renderPrices,finance:renderFinance,temperature:renderTemperature,'client-users':renderClientUsers,tutors:renderTutors,'tutor-results':renderTutorResults,password:()=>showPasswordChange(false),audit:renderAudit,'new-request':renderNewRequest}[page];
+  const fn={dashboard:renderDashboard,requests:renderRequests,cancellations:renderCancellations,clients:renderClients,couriers:renderCouriers,receivers:renderReceivers,prices:renderPrices,finance:renderFinance,temperature:renderTemperature,'client-users':renderClientUsers,tutors:renderTutors,'tutor-results':renderTutorResults,password:()=>showPasswordChange(false),'new-request':renderNewRequest}[page];
   try{await fn?.()}catch(e){if(e.status===428)return showPasswordChange(true);$('#content').innerHTML=`<div class="card empty-state">${esc(e.message)}</div>`;toast(e.message,'error')}
 }
 
