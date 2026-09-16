@@ -566,7 +566,7 @@ async function renderNewRequest(){
   $('#newReqForm').addEventListener('submit',async e=>{e.preventDefault();const f=new FormData(e.currentTarget),body=Object.fromEntries(f);body.exams=f.getAll('exams');body.materials=f.getAll('materials');body.requestKind=f.get('requestKind')||'immediate';if(body.requestKind==='scheduled'){const local=f.get('scheduledAtLocal');if(!local)return toast('Informe a data e hora do agendamento.','error');body.scheduledAt=new Date(local).toISOString()}delete body.scheduledAtLocal;try{const r=await api('/api/requisitions',{json:body});toast(`${r.message} Protocolo ${r.protocol}`);navigate('requests')}catch(err){toast(err.message,'error')}});
 }
 
-async function openRequest(id){
+async function openRequest(id,opts={}){
   const d=await api(`/api/requisitions/${id}`),r=d.requisition;
   const lab=['admin','staff'].includes(state.me.role); if(lab) await loadAdminLists();
   const actions=lab?adminRequestActions(r):'';
@@ -594,6 +594,17 @@ async function openRequest(id){
     try{const x=await api(`/api/requisitions/${id}/exams/${examId}`,{method:'DELETE'});toast(x.message);closeModal();openRequest(id)}catch(e){toast(e.message,'error')}
   }));
   if(lab) bindAdminRequestActions(id,r);
+  if(opts?.focusResults){
+    setTimeout(()=>{
+      const input=$('#resultFile');
+      if(input){
+        const box=input.closest('.form-card');
+        box?.classList.add('result-focus-flash');
+        input.scrollIntoView({behavior:'smooth',block:'center'});
+        setTimeout(()=>box?.classList.remove('result-focus-flash'),1800);
+      }
+    },80);
+  }
 }
 function eventDetails(d){if(!d)return'';const parts=[];if(d.courier)parts.push(`Entregador: ${d.courier}`);if(d.thermometer)parts.push(`Termômetro: ${d.thermometer}`);if(d.temperature!=null)parts.push(`Temperatura: ${d.temperature} °C`);if(d.receiver)parts.push(`Técnico: ${d.receiver}`);if(d.location)parts.push(`Local: ${d.location}`);if(d.sentBy)parts.push(`Responsável: ${d.sentBy}`);if(d.observation)parts.push(`Obs.: ${d.observation}`);if(d.reason)parts.push(`Motivo: ${d.reason}`);if(d.message)parts.push(d.message);return parts.length?`<p>${esc(parts.join(' • '))}</p>`:''}
 function adminRequestActions(r){
@@ -658,19 +669,25 @@ function timingStateLabel(stateName){
 function timingStateIcon(stateName){
   return stateName==='late'?'!':stateName==='warning'?'◷':stateName==='completed'?'✓':'✓';
 }
-function timingRequestCard(g){
-  const pending=(g.pending||[]).slice().sort((a,b)=>{
+function timingRequestCard(g,bucket=''){
+  const allPending=(g.pending||[]).slice().sort((a,b)=>{
     const rank=x=>x?.timing?.status==='late'?0:x?.timing?.status==='warning'?1:2;
     return rank(a)-rank(b)||String(a.dueAt||'').localeCompare(String(b.dueAt||''));
   });
-  const headline=g.state==='late'?`Há ${g.late} exame${g.late===1?'':'s'} atrasado${g.late===1?'':'s'}`:g.state==='warning'?`Há ${g.warning} exame${g.warning===1?'':'s'} no limite`:g.state==='completed'?'Todos os exames concluídos':'Exames dentro do prazo';
-  const pendingRows=pending.slice(0,5).map(x=>`<div class="timing-exam-row"><div><strong>${esc(x.examName)}</strong><small>Prazo: ${fmtDateTime(x.dueAt)}</small></div>${timingPill(x.timing)}<button class="btn soft small" data-finish-exam="${x.examId}">Concluir</button></div>`).join('');
-  const more=pending.length>5?`<div class="timing-more">+ ${pending.length-5} exame${pending.length-5===1?'':'s'} pendente${pending.length-5===1?'':'s'}</div>`:'';
+  const statusForBucket={late:'late',warning:'warning',on_time:'on_time'};
+  const wanted=statusForBucket[bucket];
+  const pending=wanted?allPending.filter(x=>x?.timing?.status===wanted):allPending;
+  const completed=(g.completedExams||[]).slice().sort((a,b)=>new Date(b.completedAt||0)-new Date(a.completedAt||0));
+  const headline=bucket==='late'?`${pending.length} exame${pending.length===1?'':'s'} atrasado${pending.length===1?'':'s'}`:bucket==='warning'?`${pending.length} exame${pending.length===1?'':'s'} no limite`:bucket==='on_time'?`${pending.length} exame${pending.length===1?'':'s'} dentro do prazo`:g.state==='completed'?'Todos os exames concluídos':g.state==='late'?`Há ${g.late} exame${g.late===1?'':'s'} atrasado${g.late===1?'':'s'}`:g.state==='warning'?`Há ${g.warning} exame${g.warning===1?'':'s'} no limite`:'Exames dentro do prazo';
+  const pendingRows=pending.slice(0,8).map(x=>`<div class="timing-exam-row ${x?.timing?.status||''}"><div><strong>${esc(x.examName)}</strong><small>Prazo: ${fmtDateTime(x.dueAt)}</small></div>${timingPill(x.timing)}<button class="btn soft small" data-finish-exam="${x.examId}">Concluir</button></div>`).join('');
+  const completedRows=(bucket==='completed'||g.state==='completed')?completed.slice(0,8).map(x=>`<div class="timing-exam-row completed"><div><strong>${esc(x.examName)}</strong><small>Concluído ${fmtDateTime(x.completedAt)}</small></div><span class="sla-pill ${x.onTime?'done':'late'}">${x.onTime?'No prazo':'Com atraso'}</span></div>`).join(''):'';
+  const shownCount=(bucket==='completed'||g.state==='completed')?completed.length:pending.length;
+  const more=shownCount>8?`<div class="timing-more">+ ${shownCount-8} exame${shownCount-8===1?'':'s'}</div>`:'';
   return `<article class="timing-card ${g.state}" data-request-card="${g.requisitionId}">
     <div class="timing-card-head"><div><div class="timing-title"><button class="timing-client-link" data-open-request="${g.requisitionId}" title="Abrir solicitação">${esc(g.clientName)}</button>${priorityBadge(g.priority)}<span class="timing-state-badge ${g.state}">${timingStateIcon(g.state)} ${timingStateLabel(g.state)}</span></div><h3>${esc(g.protocol)} • ${esc(g.patientName)}</h3><p>Recebido ${fmtDateTime(g.labReceivedAt)} • Técnico: ${esc(g.receiverName||'—')}</p></div><div class="progress-number"><b>${g.completed}/${g.total}</b><span>${g.progressPct}% concluído</span></div></div>
     <div class="timing-progress"><i style="width:${Math.max(0,Math.min(100,g.progressPct))}%"></i></div>
     <div class="timing-summary"><strong>${esc(headline)}</strong></div>
-    ${pending.length?`<div class="timing-exam-list">${pendingRows}${more}</div>`:'<div class="timing-all-done">✓ Todos os exames foram concluídos.</div>'}
+    ${(bucket==='completed'||g.state==='completed')?(completedRows||'<div class="timing-all-done">✓ Exames concluídos.</div>'):(pendingRows?`<div class="timing-exam-list">${pendingRows}${more}</div>`:'<div class="timing-all-done">Nenhum exame nesta situação.</div>')}
     <div class="timing-card-actions"><button class="btn ghost small" data-open-request="${g.requisitionId}">Abrir solicitação</button>${g.state==='completed'?`<button class="btn primary small" data-send-result="${g.requisitionId}">Enviar resultado ao cliente</button>`:''}</div>
   </article>`;
 }
@@ -687,30 +704,70 @@ function closeExamTimingFullscreen(goBack=true){
 }
 function timingReportHtml(d){
   const t=d?.totals||{},rows=d?.technicians||[];
-  return `<div class="report-kpis"><span><b>${t.completed||0}</b> concluídos</span><span><b>${t.onTime||0}</b> no prazo</span><span><b>${t.late||0}</b> concluídos com atraso</span><span><b>${t.pendingWarning||0}</b> no limite agora</span><span><b>${t.pendingLate||0}</b> atrasados agora</span><span><b>${t.onTimePct||0}%</b> pontualidade</span></div>${rows.length?`<div class="table-wrap"><table><thead><tr><th>Técnico</th><th>Concluídos</th><th>No prazo</th><th>Com atraso</th><th>No limite agora</th><th>Atrasados agora</th><th>Pontualidade</th></tr></thead><tbody>${rows.map(x=>`<tr><td><strong>${esc(x.technician)}</strong></td><td>${x.completed}</td><td>${x.onTime}</td><td>${x.late}</td><td>${x.pendingWarning||0}</td><td>${x.pendingLate}</td><td><strong>${x.onTimePct}%</strong></td></tr>`).join('')}</tbody></table></div>`:'<div class="empty-state">Ainda não há dados suficientes para o relatório.</div>'}`;
+  return `<div class="timing-report-kpis"><span><b>${t.completed||0}</b><small>Concluídos</small></span><span><b>${t.onTime||0}</b><small>No prazo</small></span><span><b>${t.late||0}</b><small>Com atraso</small></span><span><b>${t.pendingLate||0}</b><small>Atrasados agora</small></span><span><b>${t.onTimePct||0}%</b><small>Pontualidade</small></span></div>${rows.length?`<div class="timing-report-table"><table><thead><tr><th>Técnico</th><th>Concluídos</th><th>No prazo</th><th>Com atraso</th><th>Atrasados agora</th><th>Pontualidade</th></tr></thead><tbody>${rows.map(x=>`<tr><td><strong>${esc(x.technician)}</strong></td><td>${x.completed}</td><td class="ok">${x.onTime}</td><td class="bad">${x.late}</td><td class="bad">${x.pendingLate}</td><td><strong>${x.onTimePct}%</strong><div class="tech-progress"><i style="width:${Math.max(0,Math.min(100,x.onTimePct))}%"></i></div></td></tr>`).join('')}</tbody></table></div>`:'<div class="empty-state">Ainda não há dados suficientes para o período.</div>'}`;
 }
+
 async function renderExamTiming(){
   if(!['admin','staff'].includes(state.me.role))return navigate('dashboard');
   await loadAdminLists();
-  state.timingScope='unfinished';state.timingBucket='';
+  state.timingScope='unfinished';state.timingBucket='';state.timingVisibleCount=0;state.timingBoardRows=[];
   if($('#timingFullscreen')) closeExamTimingFullscreen(false);
-  const [settings,report]=await Promise.all([api('/api/exam-timing/settings'),api('/api/exam-timing/report')]);
   const admin=state.me.role==='admin';
-  const panel=document.createElement('div');panel.id='timingFullscreen';panel.className='timing-fullscreen';
-  panel.innerHTML=`<header class="timing-fullscreen-head"><div><div class="timing-eyebrow"><span class="live-dot"></span> acompanhamento ao vivo</div><h1>Painel de andamento dos exames</h1><p>O prazo começa no momento do recebimento da amostra no laboratório.</p></div><div class="timing-head-actions"><span id="timingLiveClock" class="timing-live-clock"></span>${admin?'<button class="timing-icon-btn" id="openTimingSettings" title="Configurar tempos">⚙</button>':''}<button class="timing-icon-btn close" id="closeTimingFullscreen" title="Fechar (Esc)">×</button></div></header>
-  <main class="timing-fullscreen-main">
-    <section class="timing-kpis timing-kpis-tv">
-      <button class="timing-kpi completed" data-timing-bucket="completed"><span>Concluídos</span><strong id="kpiCompleted">—</strong><small>prontos para envio</small></button>
-      <button class="timing-kpi on-time" data-timing-bucket="on_time"><span>No prazo</span><strong id="kpiOnTime">—</strong><small>dentro do tempo</small></button>
-      <button class="timing-kpi warning" data-timing-bucket="warning"><span>No limite</span><strong id="kpiWarning">—</strong><small>faltam até ${settings.warningMinutes} min</small></button>
-      <button class="timing-kpi late" data-timing-bucket="late"><span>Atrasados agora</span><strong id="kpiLate">—</strong><small>prazo vencido</small></button>
-    </section>
-    <section class="timing-toolbar"><div class="timing-scope-tabs"><button class="active" data-timing-scope="unfinished">Não concluídos</button><button data-timing-scope="active">Em andamento</button><button data-timing-scope="all">Todos</button></div><form id="timingFilters" class="timing-tv-filters"><select name="clientId"><option value="">Todos os clientes</option>${state.clients.filter(x=>x.active).map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select><select name="technicianId"><option value="">Todos os técnicos</option>${state.receivers.filter(x=>x.active).map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select><select name="priority"><option value="">Todas as prioridades</option><option value="urgent">Urgente</option><option value="priority">Prioridade</option><option value="normal">Normal</option></select><button class="btn soft small" type="submit">Aplicar</button><button class="btn ghost small" id="refreshTiming" type="button">↻ Atualizar</button></form></section>
-    <section class="timing-board-shell"><div class="timing-board-title"><div><h2 id="timingBoardTitle">Exames não concluídos</h2><p id="timingBoardSubtitle">Atrasados aparecem primeiro, depois os que estão no limite e os que seguem no prazo.</p></div><span class="timing-auto-note">Atualização automática • 20s</span></div><div id="timingBoard" class="timing-board timing-board-tv"><div class="empty-state">Carregando…</div></div></section>
-    <section class="timing-report-tv"><div class="timing-board-title"><div><h2>Desempenho por técnico</h2><p>Últimos 30 dias: entregas no prazo, atrasos e pendências atuais.</p></div></div><div id="timingReport">${timingReportHtml(report)}</div></section>
-  </main>${admin?`<aside id="timingSettingsPanel" class="timing-settings-drawer hidden">${timingSettingsHtml(settings)}</aside>`:''}`;
+  const settings=admin?await api('/api/exam-timing/settings'):{warningMinutes:10};
+  const warningInitial=Number(settings.warningMinutes||10);
+  const panel=document.createElement('div');panel.id='timingFullscreen';panel.className=`timing-fullscreen ${admin?'is-admin':'is-staff'}`;
+  panel.innerHTML=`<div class="timing-tv-hero">
+      <div class="timing-brand-card"><img src="/assets/hlabvet-logo.png" alt="HLabVet"></div>
+      <div class="timing-hero-title"><h1>Painel de Andamento dos Exames</h1><p>Monitoramento em tempo real</p></div>
+      <div class="timing-hero-side"><div class="timing-hero-tagline">CIÊNCIA<br>A FAVOR<br>DA VIDA ANIMAL</div><span id="timingLiveClock" class="timing-live-clock"></span>${admin?'<button class="timing-icon-btn" id="openTimingSettings" title="Configurar tempo dos exames">⚙</button>':''}<button class="timing-icon-btn close" id="closeTimingFullscreen" title="Fechar (Esc)">×</button></div>
+    </div>
+    <main class="timing-tv-main">
+      <div class="timing-fixed-zone">
+        <section class="timing-kpis timing-kpis-tv">
+          <button class="timing-kpi completed" data-timing-bucket="completed"><span class="timing-kpi-icon"><svg viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="21"/><path d="m14 24 7 7 14-16"/></svg></span><span class="timing-kpi-copy"><em>Concluídos</em><strong id="kpiCompleted">—</strong><small>prontos para envio</small></span></button>
+          <button class="timing-kpi on-time" data-timing-bucket="on_time"><span class="timing-kpi-icon"><svg viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="20"/><path d="M24 12v13l9 5"/></svg></span><span class="timing-kpi-copy"><em>No prazo</em><strong id="kpiOnTime">—</strong><small>dentro do tempo</small></span></button>
+          <button class="timing-kpi warning" data-timing-bucket="warning"><span class="timing-kpi-icon"><svg viewBox="0 0 48 48" aria-hidden="true"><circle cx="24" cy="24" r="20"/><path d="M24 13v13M24 34h.01"/></svg></span><span class="timing-kpi-copy"><em>No limite</em><strong id="kpiWarning">—</strong><small id="timingWarningLabel">faltam até ${warningInitial} min</small></span></button>
+          <button class="timing-kpi late" data-timing-bucket="late"><span class="timing-kpi-icon siren"><svg viewBox="0 0 48 48" aria-hidden="true"><path d="M14 34h20M17 34v-9a7 7 0 0 1 14 0v9M24 8v5M9 18l5 2M39 18l-5 2"/></svg></span><span class="timing-kpi-copy"><em>Atrasados agora</em><strong id="kpiLate">—</strong><small>prazo vencido</small></span></button>
+        </section>
+        <section class="timing-toolbar">
+          <div class="timing-scope-tabs"><button class="active" data-timing-scope="unfinished">Não concluídos</button><button data-timing-scope="active">Em andamento</button><button data-timing-scope="all">Todos</button></div>
+          <form id="timingFilters" class="timing-tv-filters">
+            <div class="timing-period-presets"><button type="button" class="active" data-period="today">Hoje</button><button type="button" data-period="yesterday">Ontem</button><button type="button" data-period="month">Este mês</button><button type="button" data-period="lastMonth">Mês passado</button><button type="button" data-period="year">Este ano</button><button type="button" data-period="custom">Personalizado</button></div>
+            <div class="timing-date-range"><label>De<input name="from" id="timingFrom" type="date"></label><label>Até<input name="to" id="timingTo" type="date"></label></div>
+            <select name="clientId"><option value="">Todos os clientes</option>${state.clients.filter(x=>x.active).map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select>
+            <select name="technicianId"><option value="">Todos os técnicos</option>${state.receivers.filter(x=>x.active).map(x=>`<option value="${x.id}">${esc(x.name)}</option>`).join('')}</select>
+            <select name="priority"><option value="">Todas as prioridades</option><option value="urgent">Urgente</option><option value="priority">Prioridade</option><option value="normal">Normal</option></select>
+            <button class="btn soft small" type="submit">Aplicar</button><button class="btn ghost small" id="refreshTiming" type="button">↻ Atualizar</button>
+          </form>
+        </section>
+        ${admin?`<section class="timing-overview-grid">
+          <div class="timing-tech-panel"><div class="timing-panel-heading"><span class="timing-panel-icon">♟</span><div><h2>Desempenho por técnico</h2><p id="timingReportPeriod">Período selecionado</p></div></div><div id="timingReport"><div class="empty-state">Carregando…</div></div></div>
+          <div class="timing-status-panel"><div class="timing-panel-heading"><span class="timing-panel-icon">◕</span><div><h2>Status geral dos exames</h2><p>Visão dos protocolos exibidos</p></div></div><div class="timing-status-body"><div class="timing-donut" id="timingDonut"><div><strong id="timingDonutTotal">0</strong><span>exames</span></div></div><div class="timing-status-legend"><span><i class="green"></i>No prazo <b id="legendOnTime">0</b></span><span><i class="yellow"></i>No limite <b id="legendWarning">0</b></span><span><i class="red"></i>Atrasados <b id="legendLate">0</b></span></div></div></div>
+        </section>`:''}
+      </div>
+      <section class="timing-board-shell">
+        <div class="timing-board-title"><div><h2 id="timingBoardTitle">Exames não concluídos</h2><p id="timingBoardSubtitle"></p></div><span id="timingListCount" class="timing-list-count"></span></div>
+        <div id="timingScrollArea" class="timing-scroll-area"><div id="timingBoard" class="timing-board timing-board-tv"><div class="empty-state">Carregando…</div></div></div>
+      </section>
+    </main>${admin?`<aside id="timingSettingsPanel" class="timing-settings-drawer hidden">${timingSettingsHtml(settings)}</aside>`:''}`;
   document.body.appendChild(panel);
-  const updateClock=()=>{const el=$('#timingLiveClock');if(el)el.textContent=new Date().toLocaleString('pt-BR',{hour:'2-digit',minute:'2-digit',second:'2-digit',day:'2-digit',month:'2-digit'})};updateClock();state.timingClockTimer=setInterval(updateClock,1000);
+
+  const localIso=d=>{const y=d.getFullYear(),m=String(d.getMonth()+1).padStart(2,'0'),day=String(d.getDate()).padStart(2,'0');return `${y}-${m}-${day}`};
+  const setPeriod=(preset,load=true)=>{
+    const now=new Date();let from='',to='';
+    if(preset==='today'){from=to=localIso(now)}
+    else if(preset==='yesterday'){const d=new Date(now);d.setDate(d.getDate()-1);from=to=localIso(d)}
+    else if(preset==='month'){from=localIso(new Date(now.getFullYear(),now.getMonth(),1));to=localIso(now)}
+    else if(preset==='lastMonth'){from=localIso(new Date(now.getFullYear(),now.getMonth()-1,1));to=localIso(new Date(now.getFullYear(),now.getMonth(),0))}
+    else if(preset==='year'){from=`${now.getFullYear()}-01-01`;to=localIso(now)}
+    if(preset!=='custom'){$('#timingFrom').value=from;$('#timingTo').value=to}
+    $$('.timing-period-presets [data-period]').forEach(x=>x.classList.toggle('active',x.dataset.period===preset));
+    if(preset==='custom')$('#timingFrom')?.focus();
+    if(load)loadBoard();
+  };
+  setPeriod('today',false);
+
+  const updateClock=()=>{const el=$('#timingLiveClock');if(el)el.textContent=new Date().toLocaleString('pt-BR',{hour:'2-digit',minute:'2-digit',day:'2-digit',month:'2-digit',year:'numeric'})};updateClock();state.timingClockTimer=setInterval(updateClock,1000);
   const close=()=>closeExamTimingFullscreen(true);$('#closeTimingFullscreen')?.addEventListener('click',close);
   state.timingEscHandler=e=>{if(e.key!=='Escape')return;const drawer=$('#timingSettingsPanel');if(drawer&&!drawer.classList.contains('hidden'))drawer.classList.add('hidden');else close()};document.addEventListener('keydown',state.timingEscHandler);
   $('#openTimingSettings')?.addEventListener('click',()=>$('#timingSettingsPanel')?.classList.remove('hidden'));$('#closeTimingSettings')?.addEventListener('click',()=>$('#timingSettingsPanel')?.classList.add('hidden'));
@@ -719,16 +776,51 @@ async function renderExamTiming(){
   const selectedCodes=()=>$$('.timing-exam-check:checked').map(x=>x.value);
   $('#applyBulkTime')?.addEventListener('click',async()=>{const examCodes=selectedCodes();if(!examCodes.length)return toast('Selecione pelo menos um exame.','error');try{const r=await api('/api/exam-timing/settings',{method:'PUT',json:{mode:'bulk',examCodes,turnaroundMinutes:unitToMinutes($('#bulkTimeValue').value,$('#bulkTimeUnit').value)}});toast(r.message);await renderExamTiming()}catch(er){toast(er.message,'error')}});
   $('#removeBulkTime')?.addEventListener('click',async()=>{const examCodes=selectedCodes();if(!examCodes.length)return toast('Selecione pelo menos um exame.','error');try{const r=await api('/api/exam-timing/settings',{method:'PUT',json:{mode:'remove',examCodes}});toast(r.message);await renderExamTiming()}catch(er){toast(er.message,'error')}});
-  const bindBoardActions=()=>{
-    $$('[data-finish-exam]').forEach(b=>b.addEventListener('click',async()=>{if(!confirm('Marcar este exame como concluído agora?'))return;try{const x=await api(`/api/exam-timing/exams/${b.dataset.finishExam}/complete`,{method:'POST'});toast(x.message);await loadBoard()}catch(er){toast(er.message,'error')}}));
-    $$('[data-open-request]').forEach(b=>b.addEventListener('click',async()=>{const id=Number(b.dataset.openRequest);closeExamTimingFullscreen(false);await navigate(state.timingReturnPage||'dashboard');await openRequest(id)}));
-    $$('[data-send-result]').forEach(b=>b.addEventListener('click',async()=>{const id=Number(b.dataset.sendResult);closeExamTimingFullscreen(false);await navigate(state.timingReturnPage||'dashboard');await openRequest(id)}));
+
+  const board=$('#timingBoard');
+  board?.addEventListener('click',async e=>{
+    const finish=e.target.closest('[data-finish-exam]');if(finish){if(!confirm('Marcar este exame como concluído agora?'))return;try{const x=await api(`/api/exam-timing/exams/${finish.dataset.finishExam}/complete`,{method:'POST'});toast(x.message);await loadBoard()}catch(er){toast(er.message,'error')}return}
+    const send=e.target.closest('[data-send-result]');if(send){const id=Number(send.dataset.sendResult);closeExamTimingFullscreen(false);await navigate(state.timingReturnPage||'dashboard');await openRequest(id,{focusResults:true});return}
+    const open=e.target.closest('[data-open-request]');if(open){const id=Number(open.dataset.openRequest);closeExamTimingFullscreen(false);await navigate(state.timingReturnPage||'dashboard');await openRequest(id);return}
+  });
+
+  const bucketTitles={completed:'Exames concluídos',on_time:'Exames no prazo',warning:'Exames no limite',late:'Exames atrasados agora','':'Exames não concluídos'};
+  const appendBatch=()=>{
+    const rows=state.timingBoardRows||[];if(!board||state.timingVisibleCount>=rows.length)return;
+    const start=state.timingVisibleCount,end=Math.min(rows.length,start+40),bucket=state.timingBucket||'';
+    board.insertAdjacentHTML('beforeend',rows.slice(start,end).map(x=>timingRequestCard(x,bucket)).join(''));
+    state.timingVisibleCount=end;
+    const c=$('#timingListCount');if(c)c.textContent=rows.length?`${Math.min(state.timingVisibleCount,rows.length)} de ${rows.length}`:'';
   };
-  const bucketTitles={completed:['Exames concluídos','Clique no cliente ou em “Enviar resultado” para abrir a solicitação e liberar o resultado.'],on_time:['Exames no prazo','Protocolos ainda dentro do tempo definido.'],warning:['Exames no limite',`Faltam até ${settings.warningMinutes} minutos para o vencimento.`],late:['Exames atrasados agora','Mostra quanto tempo cada exame já ultrapassou o prazo.'],'':['Exames não concluídos','Atrasados aparecem primeiro, depois os que estão no limite e os que seguem no prazo.']};
-  const loadBoard=async()=>{if(!$('#timingFullscreen'))return;const qs=new URLSearchParams(new FormData($('#timingFilters')));for(const[k,v]of[...qs])if(!v)qs.delete(k);qs.set('scope',state.timingScope||'unfinished');if(state.timingBucket)qs.set('bucket',state.timingBucket);const d=await api(`/api/exam-timing/board?${qs}`);if(!$('#timingFullscreen'))return;$('#kpiCompleted').textContent=d.counts.completedRequests??d.counts.completed??0;$('#kpiOnTime').textContent=d.counts.onTimeRequests??d.counts.onTime??0;$('#kpiWarning').textContent=d.counts.warningRequests??d.counts.warning??0;$('#kpiLate').textContent=d.counts.lateRequests??d.counts.late??0;const bt=bucketTitles[state.timingBucket||''];$('#timingBoardTitle').textContent=bt[0];$('#timingBoardSubtitle').textContent=bt[1];$$('[data-timing-bucket]').forEach(x=>x.classList.toggle('selected',x.dataset.timingBucket===state.timingBucket));const requests=d.requests||[];$('#timingBoard').innerHTML=requests.length?requests.map(timingRequestCard).join(''):'<div class="empty-state timing-empty-tv">Nenhum exame neste filtro.</div>';bindBoardActions()};
+  $('#timingScrollArea')?.addEventListener('scroll',e=>{const el=e.currentTarget;if(el.scrollTop+el.clientHeight>=el.scrollHeight-260)appendBatch()});
+
+  const loadReport=async(qs)=>{
+    if(!admin||!$('#timingReport'))return;
+    const rp=new URLSearchParams();if(qs.get('from'))rp.set('from',qs.get('from'));if(qs.get('to'))rp.set('to',qs.get('to'));
+    try{const r=await api(`/api/exam-timing/report?${rp}`);$('#timingReport').innerHTML=timingReportHtml(r);const from=qs.get('from'),to=qs.get('to');$('#timingReportPeriod').textContent=from&&to?`${fmtDate(from+'T12:00:00')} a ${fmtDate(to+'T12:00:00')}`:'Período selecionado'}catch(e){$('#timingReport').innerHTML='<div class="empty-state">Não foi possível carregar o relatório.</div>'}
+  };
+  const updateDonut=d=>{
+    if(!admin)return;
+    const a=Number(d.counts?.onTimeRequests||0),w=Number(d.counts?.warningRequests||0),l=Number(d.counts?.lateRequests||0),total=a+w+l;
+    const g=total?a/total*360:0,y=total?w/total*360:0;
+    const donut=$('#timingDonut');if(donut)donut.style.background=total?`conic-gradient(#28a85b 0 ${g}deg,#f4b91c ${g}deg ${g+y}deg,#ed3d43 ${g+y}deg 360deg)`:'#e9e3ec';
+    if($('#timingDonutTotal'))$('#timingDonutTotal').textContent=total;if($('#legendOnTime'))$('#legendOnTime').textContent=a;if($('#legendWarning'))$('#legendWarning').textContent=w;if($('#legendLate'))$('#legendLate').textContent=l;
+  };
+  const loadBoard=async()=>{
+    if(!$('#timingFullscreen'))return;
+    const qs=new URLSearchParams(new FormData($('#timingFilters')));for(const[k,v]of[...qs])if(!v)qs.delete(k);qs.set('scope',state.timingScope||'unfinished');if(state.timingBucket)qs.set('bucket',state.timingBucket);
+    const d=await api(`/api/exam-timing/board?${qs}`);if(!$('#timingFullscreen'))return;
+    $('#kpiCompleted').textContent=d.counts.completedRequests??0;$('#kpiOnTime').textContent=d.counts.onTimeRequests??0;$('#kpiWarning').textContent=d.counts.warningRequests??0;$('#kpiLate').textContent=d.counts.lateRequests??0;
+    const lateCard=$('.timing-kpi.late');lateCard?.classList.toggle('alarm-active',Number(d.counts.lateRequests||0)>0);
+    if($('#timingWarningLabel'))$('#timingWarningLabel').textContent=`faltam até ${Number(d.warningMinutes||warningInitial)} min`;
+    $('#timingBoardTitle').textContent=bucketTitles[state.timingBucket||''];$('#timingBoardSubtitle').textContent='';$$('[data-timing-bucket]').forEach(x=>x.classList.toggle('selected',x.dataset.timingBucket===state.timingBucket));
+    state.timingBoardRows=d.requests||[];state.timingVisibleCount=0;board.innerHTML=state.timingBoardRows.length?'':'<div class="empty-state timing-empty-tv">Nenhum exame neste filtro.</div>';appendBatch();$('#timingScrollArea').scrollTop=0;
+    updateDonut(d);await loadReport(qs);
+  };
   $$('[data-timing-bucket]').forEach(b=>b.addEventListener('click',()=>{const next=state.timingBucket===b.dataset.timingBucket?'':b.dataset.timingBucket;state.timingBucket=next;if(next==='completed'){state.timingScope='all';$$('[data-timing-scope]').forEach(x=>x.classList.toggle('active',x.dataset.timingScope==='all'))}loadBoard()}));
   $$('[data-timing-scope]').forEach(b=>b.addEventListener('click',()=>{state.timingScope=b.dataset.timingScope;$$('[data-timing-scope]').forEach(x=>x.classList.toggle('active',x===b));if(state.timingScope!=='all'&&state.timingBucket==='completed')state.timingBucket='';loadBoard()}));
-  $('#timingFilters')?.addEventListener('submit',e=>{e.preventDefault();loadBoard()});$('#refreshTiming')?.addEventListener('click',loadBoard);
+  $$('.timing-period-presets [data-period]').forEach(b=>b.addEventListener('click',()=>setPeriod(b.dataset.period,true)));
+  $('#timingFilters')?.addEventListener('submit',e=>{e.preventDefault();$$('.timing-period-presets [data-period]').forEach(x=>x.classList.remove('active'));loadBoard()});$('#refreshTiming')?.addEventListener('click',loadBoard);
   await loadBoard();state.timingAutoRefresh=setInterval(()=>{if($('#timingFullscreen'))loadBoard();else clearInterval(state.timingAutoRefresh)},20000);
 }
 
