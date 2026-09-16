@@ -839,11 +839,20 @@ async function resetClient(id){const password=prompt('Digite a nova senha tempor
 async function deleteClient(id){if(!confirm('Desativar este cliente? O histórico será preservado.'))return;try{const r=await api(`/api/clients/${id}`,{method:'DELETE'});toast(r.message);renderClients()}catch(e){toast(e.message,'error')}}
 
 async function renderCouriers(){
-  const d=await api('/api/couriers');state.couriers=d.couriers||[];const admin=state.me.role==='admin';
-  $('#topActions').innerHTML=admin?`<button class="btn primary" id="addCourier">＋ Entregador</button>`:'';
-  $('#content').innerHTML=`<div class="card">${!admin?'<p class="muted">Consulta dos entregadores e respectivos termômetros. Alterações ficam exclusivas do administrador.</p>':'<p class="muted">Cada entregador possui usuário e senha próprios para acessar o painel móvel e, futuramente, o APK.</p>'}<div class="table-wrap"><table><thead><tr><th>Entregador</th><th>Telefone</th><th>Usuário</th><th>Termômetro</th><th>Status</th>${admin?'<th>Ações</th>':''}</tr></thead><tbody>${state.couriers.map(c=>`<tr><td><strong>${esc(c.name)}</strong></td><td>${esc(c.phone||'')}</td><td>${c.account_id?esc(c.username_display||''):'<span class="danger-text">Sem login</span>'}</td><td><strong>${esc(c.thermometer_code||'—')}</strong></td><td><span class="badge ${c.active?'concluido':'cancelado'}">${c.active?'Ativo':'Inativo'}</span></td>${admin?`<td><div class="actions"><button class="btn soft small" data-edit-courier="${c.id}">Editar</button>${c.account_id?`<button class="btn ghost small" data-reset-courier="${c.id}">Senha</button>`:''}</div></td>`:''}</tr>`).join('')}</tbody></table></div></div>`;
+  const d=await api('/api/couriers');
+  state.couriers=d.couriers||[];
+  const admin=state.me?.role==='admin';
+  $('#topActions').innerHTML=admin?`<button class="btn primary" id="addCourier">＋ Cadastrar entregador</button>`:'';
+  const helper=admin
+    ? '<p class="muted courier-admin-note">Como administrador, você pode editar nome, telefone, usuário, termômetro, status e redefinir a senha de acesso de cada entregador.</p>'
+    : '<p class="muted">Consulta dos entregadores e respectivos termômetros. Edição de cadastro e alteração de senha ficam exclusivas do administrador do laboratório.</p>';
+  $('#content').innerHTML=`<div class="card">${helper}<div class="table-wrap"><table><thead><tr><th>Entregador</th><th>Telefone</th><th>Usuário</th><th>Termômetro</th><th>Status</th><th>Acesso</th>${admin?'<th>Ações</th>':''}</tr></thead><tbody>${state.couriers.map(c=>{
+    const accessLabel=!c.account_id?'Sem login':(!c.account_active?'Acesso inativo':(c.force_password_change?'Troca de senha pendente':'Liberado'));
+    const accessClass=!c.account_id||!c.account_active?'cancelado':(c.force_password_change?'coletado':'concluido');
+    return `<tr><td><strong>${esc(c.name)}</strong></td><td>${esc(c.phone||'—')}</td><td>${c.account_id?esc(c.username_display||''):'<span class="danger-text">Sem login</span>'}</td><td><strong>${esc(c.thermometer_code||'—')}</strong></td><td><span class="badge ${c.active?'concluido':'cancelado'}">${c.active?'Ativo':'Inativo'}</span></td><td><span class="badge ${accessClass}">${esc(accessLabel)}</span></td>${admin?`<td><div class="actions courier-admin-actions"><button class="btn soft small" data-edit-courier="${c.id}">Editar cadastro</button>${c.account_id?`<button class="btn ghost small" data-reset-courier="${c.id}">Alterar senha</button>`:`<button class="btn ghost small" data-edit-courier="${c.id}">Criar acesso</button>`}</div></td>`:''}</tr>`;
+  }).join('')}</tbody></table></div></div>`;
   if(admin){
-    $('#addCourier').addEventListener('click',()=>courierForm());
+    $('#addCourier')?.addEventListener('click',()=>courierForm());
     $$('[data-edit-courier]').forEach(b=>b.addEventListener('click',()=>courierForm(state.couriers.find(x=>x.id===Number(b.dataset.editCourier)))));
     $$('[data-reset-courier]').forEach(b=>b.addEventListener('click',()=>resetCourierPassword(Number(b.dataset.resetCourier))));
   }
@@ -851,15 +860,22 @@ async function renderCouriers(){
 
 function courierForm(c=null){
   const hasLogin=!!c?.account_id;
-  modal(`<h3>${c?'Editar entregador':'Cadastrar entregador'}</h3><p class="muted">O entregador usará este usuário e senha no painel móvel e no futuro aplicativo.</p><form id="courierForm" class="stack"><label>Nome<input name="name" value="${esc(c?.name||'')}" required></label><label>Telefone<input name="phone" value="${esc(c?.phone||'')}"></label><label>Usuário de acesso<input name="username" value="${esc(c?.username_display||'')}" required placeholder="Ex.: thales.alcantara"></label>${!hasLogin?`<label>Senha inicial<input name="password" type="password" minlength="8" required><small>Mínimo 8 caracteres. O entregador deverá trocar no primeiro acesso.</small></label>`:''}<label>Número do termômetro<input name="thermometerCode" value="${esc(c?.thermometer_code||'TER-001')}" placeholder="TER-001" required><small>Use o padrão TER-001, TER-002, TER-003...</small></label>${c?`<label>Ativo<select name="active"><option value="1" ${c.active?'selected':''}>Sim</option><option value="0" ${!c.active?'selected':''}>Não</option></select></label>`:''}<div class="actions"><button class="btn primary">Salvar</button><button type="button" class="btn ghost" data-close-modal>Cancelar</button></div></form>`);
+  modal(`<h3>${c?'Editar entregador':'Cadastrar entregador'}</h3><p class="muted">${c?'Altere os dados do entregador. O usuário de acesso também pode ser corrigido aqui.':'Cadastre os dados e crie o acesso próprio do entregador ao painel móvel.'}</p><form id="courierForm" class="stack"><div class="form-grid"><label class="field span2">Nome<input name="name" value="${esc(c?.name||'')}" required></label><label class="field">Telefone<input name="phone" value="${esc(c?.phone||'')}"></label><label class="field">Usuário de acesso<input name="username" value="${esc(c?.username_display||'')}" required placeholder="Ex.: thales.alcantara"></label>${!hasLogin?`<label class="field">Senha inicial<input name="password" type="password" minlength="8" required autocomplete="new-password"><small>Mínimo 8 caracteres. No primeiro acesso o entregador deverá criar a senha pessoal.</small></label>`:''}<label class="field">Número do termômetro<input name="thermometerCode" value="${esc(c?.thermometer_code||'TER-001')}" placeholder="TER-001" required><small>Use o padrão TER-001, TER-002, TER-003...</small></label>${c?`<label class="field">Status<select name="active"><option value="1" ${c.active?'selected':''}>Ativo</option><option value="0" ${!c.active?'selected':''}>Inativo</option></select><small>Ao inativar, o acesso do entregador também é bloqueado.</small></label>`:''}</div><div class="actions"><button class="btn primary">Salvar alterações</button>${c&&hasLogin?`<button type="button" class="btn soft" id="courierPasswordFromEdit">Alterar senha</button>`:''}<button type="button" class="btn ghost" data-close-modal>Cancelar</button></div></form>`);
+  $('#courierPasswordFromEdit')?.addEventListener('click',()=>{const id=c.id;closeModal();resetCourierPassword(id)});
   $('#courierForm').addEventListener('submit',async e=>{
     e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));if('active'in b)b.active=b.active==='1';
     try{const r=await api(c?`/api/couriers/${c.id}`:'/api/couriers',{method:c?'PATCH':'POST',json:b});toast(r.message);closeModal();renderCouriers()}catch(er){toast(er.message,'error')}
   });
 }
-async function resetCourierPassword(id){
-  const password=prompt('Digite a nova senha temporária do entregador (mínimo 8 caracteres):');if(password===null)return;
-  try{const r=await api(`/api/couriers/${id}/reset-password`,{json:{password}});toast(r.message)}catch(e){toast(e.message,'error')}
+function resetCourierPassword(id){
+  const courier=state.couriers.find(x=>x.id===Number(id));
+  modal(`<h3>Alterar senha do entregador</h3><p class="muted">Defina uma nova senha temporária para <strong>${esc(courier?.name||'este entregador')}</strong>. As sessões atuais serão encerradas e, no próximo acesso, ele deverá trocar a senha.</p><form id="courierResetPasswordForm" class="stack"><label>Nova senha temporária<input name="password" type="password" minlength="8" autocomplete="new-password" required></label><label>Confirmar senha<input name="confirmPassword" type="password" minlength="8" autocomplete="new-password" required></label><div class="actions"><button class="btn primary">Salvar nova senha</button><button type="button" class="btn ghost" data-close-modal>Cancelar</button></div></form>`);
+  $('#courierResetPasswordForm').addEventListener('submit',async e=>{
+    e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));
+    if(String(b.password||'').length<8)return toast('A senha precisa ter pelo menos 8 caracteres.','error');
+    if(b.password!==b.confirmPassword)return toast('As senhas não coincidem.','error');
+    try{const r=await api(`/api/couriers/${id}/reset-password`,{json:{password:b.password}});toast(r.message);closeModal();renderCouriers()}catch(er){toast(er.message,'error')}
+  });
 }
 
 async function renderReceivers(){
