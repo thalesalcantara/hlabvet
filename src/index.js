@@ -1208,7 +1208,7 @@ async function createRequisition(request,env,user){
     .bind(tempProto,clientId,priority,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),birthDate,ageText,collectionDate,clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
   const id=ins.meta.last_row_id, proto=protocolCode(id,new Date());
   const statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,id)];
-  if(quoteToLink)statements.push(env.DB.prepare('UPDATE quotes SET requisition_id=?,patient_name=COALESCE(NULLIF(patient_name,''),?),updated_at=? WHERE id=?').bind(id,patient,nowIso(),quoteId));
+  if(quoteToLink)statements.push(env.DB.prepare(`UPDATE quotes SET requisition_id=?,patient_name=COALESCE(NULLIF(patient_name,''),?),updated_at=? WHERE id=?`).bind(id,patient,nowIso(),quoteId));
   let missingPriceCount=0;
   for(const e of selected){
     const price=await resolveExamPrice(env,clientId,e.code);
