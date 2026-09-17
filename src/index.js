@@ -200,6 +200,18 @@ async function api(request, env, url) {
 
   if (path === '/api/temperature-sheet' && method === 'GET') return requireAdmin(user, () => temperatureSheet(env, user, url));
   if (path === '/api/cancellations' && method === 'GET') return requireAdmin(user, () => listCancellations(env, url));
+
+  // Orçamentos e serviços: valores ficam visíveis apenas ao administrador ou ao próprio cliente.
+  if (path === '/api/services' && method === 'GET') return requireAdminOnly(user, () => listServices(env, false));
+  if (path === '/api/services' && method === 'POST') return requireAdminOnly(user, () => createService(request, env, user));
+  m = path.match(/^\/api\/services\/(\d+)$/);
+  if (m && method === 'PATCH') return requireAdminOnly(user, () => updateService(request, env, user, Number(m[1])));
+  if (path === '/api/quotes/catalog' && method === 'GET') return quoteCatalog(env, user, url);
+  if (path === '/api/quotes' && method === 'GET') return listQuotes(env, user, url);
+  if (path === '/api/quotes' && method === 'POST') return saveQuote(request, env, user);
+  m = path.match(/^\/api\/quotes\/(\d+)$/);
+  if (m && method === 'GET') return getQuote(env, user, Number(m[1]));
+
   if (path === '/api/prices' && method === 'GET') return requireAdminOnly(user, () => listPrices(env, url));
   if (path === '/api/prices/general' && method === 'POST') return requireAdminOnly(user, () => setGeneralPrice(request, env, user));
   if (path === '/api/prices/client' && method === 'POST') return requireAdminOnly(user, () => setClientPrice(request, env, user));
@@ -1182,12 +1194,21 @@ async function createRequisition(request,env,user){
   if(birthDate&&collectionDate&&!exactAgeText(birthDate,collectionDate))return err('A data de nascimento não pode ser posterior à data prevista da coleta.');
   const ageText=clampString(b.ageText,60)||exactAgeText(birthDate,collectionDate||fortalezaToday());
 
+  const quoteId=Number(b.quoteId||0);
+  let quoteToLink=null;
+  if(quoteId){
+    quoteToLink=await env.DB.prepare('SELECT id,client_id,requisition_id FROM quotes WHERE id=?').bind(quoteId).first();
+    if(!quoteToLink||Number(quoteToLink.client_id)!==clientId)return err('O orçamento informado não pertence a este cliente.',409);
+    if(quoteToLink.requisition_id)return err('Este orçamento já está vinculado a outra solicitação.',409);
+  }
+
   const tempProto=`TEMP-${crypto.randomUUID()}`;
   const requesterName=member?.name||user.username_display;
   const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,priority,clinic_name,veterinarian_name,crmv,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at,requested_by_user_id,requested_by_name) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
     .bind(tempProto,clientId,priority,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),birthDate,ageText,collectionDate,clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
   const id=ins.meta.last_row_id, proto=protocolCode(id,new Date());
   const statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,id)];
+  if(quoteToLink)statements.push(env.DB.prepare('UPDATE quotes SET requisition_id=?,patient_name=COALESCE(NULLIF(patient_name,''),?),updated_at=? WHERE id=?').bind(id,patient,nowIso(),quoteId));
   let missingPriceCount=0;
   for(const e of selected){
     const price=await resolveExamPrice(env,clientId,e.code);
@@ -1216,7 +1237,12 @@ async function getRequisition(env,user,id){
     env.DB.prepare(`SELECT rf.id,rf.original_name,rf.mime_type,rf.size_bytes,rf.created_at,CASE WHEN EXISTS(SELECT 1 FROM result_analyses ra WHERE ra.result_file_id=rf.id) THEN 1 ELSE 0 END analysis_exists FROM result_files rf WHERE rf.requisition_id=? ORDER BY rf.created_at DESC`).bind(id).all()
   ]);
   const visibleFiles=(user.role==='client'&&r.status==='cancelado')?[]:(files.results||[]);
-  return ok({requisition:r,exams:ex.results||[],materials:(mat.results||[]).map(x=>x.material_name),events:(events.results||[]).map(e=>({...e,details:parseJson(e.details_json)})),files:visibleFiles});
+  let quote=null;
+  if(user.role==='admin'||user.role==='client'){
+    const q=await env.DB.prepare('SELECT id FROM quotes WHERE requisition_id=? ORDER BY id DESC LIMIT 1').bind(id).first();
+    if(q)quote=await quoteDetailRow(env,Number(q.id));
+  }
+  return ok({requisition:r,exams:ex.results||[],materials:(mat.results||[]).map(x=>x.material_name),events:(events.results||[]).map(e=>({...e,details:parseJson(e.details_json)})),files:visibleFiles,quote});
 }
 
 async function deleteRequisitionExam(env,user,requisitionId,examId){
@@ -1266,11 +1292,30 @@ async function assignCourier(request,env,user,id){
   const [r,c]=await Promise.all([env.DB.prepare('SELECT * FROM requisitions WHERE id=?').bind(id).first(),env.DB.prepare('SELECT * FROM couriers WHERE id=? AND active=1').bind(courierId).first()]);
   if(!r)return err('Requisição não encontrada.',404); if(!c)return err('Entregador não encontrado ou inativo.',404); if(['recebido','em_analise','concluido','cancelado'].includes(r.status))return err('Não é possível atribuir entregador nesse status.');
   if(!r.accepted_at)return err('Aceite a solicitação antes de atribuir o entregador.');
-  const ts=nowIso(); await env.DB.batch([
-    env.DB.prepare(`UPDATE requisitions SET assigned_courier_id=?,assigned_at=?,courier_accepted_at=NULL,courier_accepted_name=NULL,status='atribuido',updated_at=? WHERE id=?`).bind(courierId,ts,ts,id),
-    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({courier:c.name,thermometer:c.thermometer_code}),ts)
+  const ts=nowIso();
+  let paymentStatus=r.payment_status||'not_set',paymentMethod=r.payment_method||null,paymentInstallments=r.payment_installments||null,paymentAmount=r.payment_amount_cents||null,paidAt=r.paid_at||null;
+  if(user.role==='admin' && b?.paymentStatus!=null){
+    paymentStatus=['not_set','paid','collect'].includes(String(b.paymentStatus))?String(b.paymentStatus):'not_set';
+    const q=await env.DB.prepare('SELECT id,total_cents FROM quotes WHERE requisition_id=? ORDER BY id DESC LIMIT 1').bind(id).first();
+    paymentAmount=q?Number(q.total_cents):null;
+    if(paymentStatus==='collect'){
+      if(!q)return err('Gere e salve o orçamento desta solicitação antes de enviar cobrança ao entregador.');
+      paymentMethod=['credit','debit','pix','cash'].includes(String(b.paymentMethod))?String(b.paymentMethod):'';
+      if(!paymentMethod)return err('Informe a forma de pagamento da cobrança.');
+      paymentInstallments=paymentMethod==='credit'?Math.max(1,Math.min(24,Math.floor(Number(b.paymentInstallments||1)))):1;
+      paidAt=null;
+    }else if(paymentStatus==='paid'){
+      paymentMethod=null;paymentInstallments=null;paidAt=ts;
+    }else{
+      paymentMethod=null;paymentInstallments=null;paymentAmount=null;paidAt=null;
+    }
+  }
+  await env.DB.batch([
+    env.DB.prepare(`UPDATE requisitions SET assigned_courier_id=?,assigned_at=?,courier_accepted_at=NULL,courier_accepted_name=NULL,status='atribuido',payment_status=?,payment_method=?,payment_installments=?,payment_amount_cents=?,paid_at=?,payment_updated_at=?,payment_updated_by_name=?,updated_at=? WHERE id=?`)
+      .bind(courierId,ts,paymentStatus,paymentMethod,paymentInstallments,paymentAmount,paidAt,user.role==='admin'?ts:r.payment_updated_at,user.role==='admin'?user.username_display:r.payment_updated_by_name,ts,id),
+    env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({courier:c.name,thermometer:c.thermometer_code,paymentStatus}),ts)
   ]);
-  await audit(env,user,'atribuiu_entregador','requisition',id,{courierId,courier:c.name,thermometer:c.thermometer_code});return ok({message:`${c.name} atribuído à coleta (${c.thermometer_code||'sem termômetro'}).`});
+  await audit(env,user,'atribuiu_entregador','requisition',id,{courierId,courier:c.name,thermometer:c.thermometer_code,paymentStatus});return ok({message:`${c.name} atribuído à coleta (${c.thermometer_code||'sem termômetro'}).`});
 }
 
 async function receiveAtLab(request,env,user,id){
@@ -1589,6 +1634,137 @@ async function temperatureSheet(env,user,url){
 }
 
 
+
+function quoteAccessClientId(user,requestedClientId=0){
+  if(user.role==='client')return Number(user.client_id||0);
+  if(user.role==='admin')return Number(requestedClientId||0);
+  return 0;
+}
+function quoteNumber(id,createdAt=nowIso()){
+  const y=new Date(createdAt).getUTCFullYear();
+  return `ORC-${y}-${String(id).padStart(6,'0')}`;
+}
+async function listServices(env,onlyActive=true){
+  const sql=`SELECT id,name,description,price_cents,active,created_at,updated_at FROM service_prices ${onlyActive?'WHERE active=1':''} ORDER BY active DESC,name COLLATE NOCASE`;
+  const rows=await env.DB.prepare(sql).all();
+  return ok({services:rows.results||[]});
+}
+async function createService(request,env,user){
+  const b=await safeBody(request),name=clampString(b?.name,180),priceCents=moneyInputToCents(b?.price);
+  if(!name)return err('Informe o nome do serviço.');
+  if(priceCents==null)return err('Informe um valor válido para o serviço.');
+  const ts=nowIso();
+  const ins=await env.DB.prepare(`INSERT INTO service_prices(name,description,price_cents,active,created_at,updated_at) VALUES(?,?,?,1,?,?)`)
+    .bind(name,clampString(b?.description,500),priceCents,ts,ts).run();
+  await audit(env,user,'criou_servico','service_price',ins.meta.last_row_id,{name,priceCents});
+  return ok({message:'Serviço cadastrado com sucesso.',id:ins.meta.last_row_id});
+}
+async function updateService(request,env,user,id){
+  const old=await env.DB.prepare('SELECT * FROM service_prices WHERE id=?').bind(id).first();
+  if(!old)return err('Serviço não encontrado.',404);
+  const b=await safeBody(request),name=clampString(b?.name,180)||old.name;
+  let priceCents=old.price_cents;
+  if(b?.price!=null&&String(b.price).trim()!==''){
+    priceCents=moneyInputToCents(b.price);if(priceCents==null)return err('Informe um valor válido.');
+  }
+  const active=b?.active==null?Number(old.active):boolInt(b.active);
+  await env.DB.prepare(`UPDATE service_prices SET name=?,description=?,price_cents=?,active=?,updated_at=? WHERE id=?`)
+    .bind(name,b?.description==null?old.description:clampString(b.description,500),priceCents,active,nowIso(),id).run();
+  await audit(env,user,'alterou_servico','service_price',id,{name,priceCents,active});
+  return ok({message:'Serviço atualizado.'});
+}
+async function quoteCatalog(env,user,url){
+  const clientId=quoteAccessClientId(user,Number(url.searchParams.get('clientId')||0));
+  if(!clientId)return err(user.role==='staff'?'Técnicos não têm acesso a valores e orçamentos.':'Selecione o cliente.',403);
+  const client=await env.DB.prepare('SELECT id,name,legal_name,document,phone,address,city,state FROM clients WHERE id=? AND active=1').bind(clientId).first();
+  if(!client)return err('Cliente não encontrado ou inativo.',404);
+  const [g,c,sv]=await Promise.all([
+    env.DB.prepare('SELECT exam_code,exam_name,price_cents,active FROM exam_prices WHERE active=1').all(),
+    env.DB.prepare('SELECT exam_code,exam_name,price_cents FROM client_exam_prices WHERE client_id=?').bind(clientId).all(),
+    env.DB.prepare('SELECT id,name,description,price_cents FROM service_prices WHERE active=1 ORDER BY name COLLATE NOCASE').all()
+  ]);
+  const general=new Map((g.results||[]).map(x=>[x.exam_code,x]));
+  const custom=new Map((c.results||[]).map(x=>[x.exam_code,x]));
+  const exams=[];
+  for(const group of catalogWithCodes())for(const e of group.items){
+    const cp=custom.get(e.code),gp=general.get(e.code),cents=cp?Number(cp.price_cents):(gp?Number(gp.price_cents):null);
+    exams.push({category:group.category,examCode:e.code,examName:e.name,priceCents:cents,source:cp?'client':gp?'general':null});
+  }
+  return ok({client,exams,services:sv.results||[]});
+}
+async function quoteDetailRow(env,id){
+  const q=await env.DB.prepare(`SELECT q.*,c.name client_name,c.legal_name,c.document,c.phone client_phone,c.address client_address,c.city client_city,c.state client_state,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE q.id=?`).bind(id).first();
+  if(!q)return null;
+  const items=await env.DB.prepare(`SELECT id,item_type,item_ref,description,quantity,unit_price_cents,total_cents,sort_order FROM quote_items WHERE quote_id=? ORDER BY sort_order,id`).bind(id).all();
+  return {...q,items:items.results||[]};
+}
+function canAccessQuote(user,q){return user.role==='admin'||(user.role==='client'&&Number(user.client_id)===Number(q.client_id));}
+async function getQuote(env,user,id){
+  if(!['admin','client'].includes(user.role))return err('Sem acesso a orçamentos.',403);
+  const q=await quoteDetailRow(env,id);if(!q)return err('Orçamento não encontrado.',404);if(!canAccessQuote(user,q))return err('Sem acesso a este orçamento.',403);
+  return ok({quote:q});
+}
+async function listQuotes(env,user,url){
+  if(!['admin','client'].includes(user.role))return err('Sem acesso a orçamentos.',403);
+  const clientId=quoteAccessClientId(user,Number(url.searchParams.get('clientId')||0));
+  const reqId=Number(url.searchParams.get('requisitionId')||0);
+  let sql=`SELECT q.id,q.quote_number,q.client_id,q.requisition_id,q.patient_name,q.total_cents,q.status,q.valid_until,q.created_at,q.updated_at,c.name client_name,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE 1=1`;
+  const p=[];
+  if(user.role==='client'){sql+=' AND q.client_id=?';p.push(Number(user.client_id));}
+  else if(clientId){sql+=' AND q.client_id=?';p.push(clientId);}
+  if(reqId){sql+=' AND q.requisition_id=?';p.push(reqId);}
+  sql+=' ORDER BY q.updated_at DESC,q.id DESC LIMIT 100';
+  const rows=await env.DB.prepare(sql).bind(...p).all();return ok({quotes:rows.results||[]});
+}
+async function saveQuote(request,env,user){
+  if(!['admin','client'].includes(user.role))return err('Sem permissão para gerar orçamento.',403);
+  const b=await safeBody(request);if(!b)return err('Dados inválidos.');
+  const quoteId=Number(b.quoteId||0),requisitionId=Number(b.requisitionId||0);
+  let existing=quoteId?await env.DB.prepare('SELECT * FROM quotes WHERE id=?').bind(quoteId).first():null;
+  let clientId=user.role==='client'?Number(user.client_id):Number(b.clientId||existing?.client_id||0);
+  if(!clientId)return err('Selecione o cliente.');
+  const client=await env.DB.prepare('SELECT id,name FROM clients WHERE id=? AND active=1').bind(clientId).first();if(!client)return err('Cliente não encontrado ou inativo.',404);
+  if(existing&&!canAccessQuote(user,existing))return err('Sem acesso a este orçamento.',403);
+  if(requisitionId){
+    const req=await env.DB.prepare('SELECT id,client_id,status,patient_name FROM requisitions WHERE id=?').bind(requisitionId).first();
+    if(!req)return err('Solicitação não encontrada.',404);if(Number(req.client_id)!==clientId)return err('A solicitação não pertence ao cliente selecionado.',409);if(req.status==='cancelado')return err('Não é possível gerar orçamento para solicitação cancelada.');
+    const linked=await env.DB.prepare('SELECT id FROM quotes WHERE requisition_id=?').bind(requisitionId).first();
+    if(linked&&!existing){existing=await env.DB.prepare('SELECT * FROM quotes WHERE id=?').bind(linked.id).first();}
+  }
+  const requestedExamCodes=[...new Set((Array.isArray(b.examCodes)?b.examCodes:[]).map(String))];
+  const requestedServices=Array.isArray(b.services)?b.services:[];
+  if(!requestedExamCodes.length&&!requestedServices.length)return err('Selecione pelo menos um exame ou serviço.');
+  const catalog=new Map();for(const g of catalogWithCodes())for(const e of g.items)catalog.set(e.code,{...e,category:g.category});
+  const items=[];let total=0,sort=0;
+  for(const code of requestedExamCodes){
+    const exam=catalog.get(code);if(!exam)continue;const p=await resolveExamPrice(env,clientId,code);if(p.priceCents==null)return err(`O exame “${exam.name}” ainda não possui preço cadastrado.`);
+    items.push({type:'exam',ref:code,description:exam.name,quantity:1,unit:p.priceCents,total:p.priceCents,sort:sort++});total+=p.priceCents;
+  }
+  for(const raw of requestedServices){
+    const serviceId=Number(raw?.id||0),qty=Math.max(1,Math.min(999,Math.floor(Number(raw?.quantity||1))));if(!serviceId)continue;
+    const sv=await env.DB.prepare('SELECT id,name,price_cents FROM service_prices WHERE id=? AND active=1').bind(serviceId).first();if(!sv)return err('Um dos serviços selecionados não está mais disponível.');
+    const itemTotal=Number(sv.price_cents)*qty;items.push({type:'service',ref:String(sv.id),description:sv.name,quantity:qty,unit:Number(sv.price_cents),total:itemTotal,sort:sort++});total+=itemTotal;
+  }
+  if(!items.length)return err('Nenhum item válido foi selecionado.');
+  const ts=nowIso(),patient=clampString(b.patientName,160),notes=clampString(b.notes,2000),validUntil=clampString(b.validUntil,20)||null;
+  let id;
+  if(existing){
+    id=Number(existing.id);
+    await env.DB.prepare(`UPDATE quotes SET client_id=?,requisition_id=?,patient_name=?,total_cents=?,notes=?,valid_until=?,status='active',updated_at=? WHERE id=?`)
+      .bind(clientId,requisitionId||existing.requisition_id||null,patient||existing.patient_name||null,total,notes,validUntil,ts,id).run();
+    await env.DB.prepare('DELETE FROM quote_items WHERE quote_id=?').bind(id).run();
+  }else{
+    const temp=`TEMP-${crypto.randomUUID()}`;
+    const ins=await env.DB.prepare(`INSERT INTO quotes(quote_number,client_id,requisition_id,patient_name,total_cents,notes,valid_until,created_by_user_id,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
+      .bind(temp,clientId,requisitionId||null,patient,total,notes,validUntil,user.id,user.username_display,ts,ts).run();id=Number(ins.meta.last_row_id);
+    await env.DB.prepare('UPDATE quotes SET quote_number=? WHERE id=?').bind(quoteNumber(id,ts),id).run();
+  }
+  const stmts=items.map(x=>env.DB.prepare(`INSERT INTO quote_items(quote_id,item_type,item_ref,description,quantity,unit_price_cents,total_cents,sort_order) VALUES(?,?,?,?,?,?,?,?)`).bind(id,x.type,x.ref,x.description,x.quantity,x.unit,x.total,x.sort));
+  if(stmts.length)await env.DB.batch(stmts);
+  await audit(env,user,existing?'alterou_orcamento':'criou_orcamento','quote',id,{clientId,requisitionId:requisitionId||null,totalCents:total});
+  const quote=await quoteDetailRow(env,id);return ok({message:'Orçamento salvo com sucesso.',quote});
+}
+
 function moneyInputToCents(v){
   if(v==null||v==='')return null;
   let raw=String(v).trim().replace(/R\$/gi,'').replace(/\s+/g,'');
@@ -1814,7 +1990,7 @@ async function courierTaskApi(request,env,url,courier,rest){
   const method=request.method.toUpperCase();
   if((rest===''||rest==='tasks')&&method==='GET'){
     const from=url.searchParams.get('from'),to=url.searchParams.get('to'),tab=url.searchParams.get('tab')||'pending';
-    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.courier_accepted_at,r.courier_accepted_name,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,c.name client_name,c.address,c.city,c.state,c.phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
+    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.courier_accepted_at,r.courier_accepted_name,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,r.payment_status,r.payment_method,r.payment_installments,r.payment_amount_cents,c.name client_name,c.address,c.city,c.state,c.phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
     const p=[courier.id];
     if(tab==='collected')sql+=` AND r.status IN ('coletado','recebido','em_analise','concluido')`;else sql+=` AND r.status='atribuido'`;
     if(from){sql+=' AND date(COALESCE(r.collected_at,r.assigned_at,r.created_at))>=date(?)';p.push(from);}
@@ -1847,9 +2023,11 @@ async function courierTaskApi(request,env,url,courier,rest){
     if(r.status!=='atribuido')return err('Essa coleta já foi movimentada ou não está mais pendente.');
     if(!r.courier_accepted_at)return err('Aceite a coleta antes de registrar a retirada.',409);
     const ts=nowIso(),sentBy=clampString(b.sentByName,160)||'Responsável no local',loc=clampString(b.sentFromLocation,250)||r.client_name;
+    const mustCollectPayment=r.payment_status==='collect';
+    if(mustCollectPayment&&!boolInt(b?.paymentReceived))return err('Confirme o recebimento do pagamento antes de finalizar a coleta.');
     await env.DB.batch([
-      env.DB.prepare(`UPDATE requisitions SET status='coletado',collected_at=?,collection_temperature=?,sent_by_name=?,sent_from_location=?,transport_courier_name=?,transport_thermometer_code=?,updated_at=? WHERE id=?`)
-        .bind(ts,temp,sentBy,loc,courier.name,r.thermometer_code||null,ts,id),
+      env.DB.prepare(`UPDATE requisitions SET status='coletado',collected_at=?,collection_temperature=?,sent_by_name=?,sent_from_location=?,transport_courier_name=?,transport_thermometer_code=?,payment_status=?,paid_at=CASE WHEN ? THEN ? ELSE paid_at END,payment_updated_at=CASE WHEN ? THEN ? ELSE payment_updated_at END,payment_updated_by_name=CASE WHEN ? THEN ? ELSE payment_updated_by_name END,updated_at=? WHERE id=?`)
+        .bind(ts,temp,sentBy,loc,courier.name,r.thermometer_code||null,mustCollectPayment?'paid':r.payment_status,mustCollectPayment?1:0,ts,mustCollectPayment?1:0,ts,mustCollectPayment?1:0,courier.name,ts,id),
       env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'coletado',NULL,?,?,?)`)
         .bind(id,courier.name,JSON.stringify({temperature:temp,sentBy,location:loc}),ts)
     ]);
