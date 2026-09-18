@@ -299,6 +299,9 @@ async function api(request, env, url) {
   if (path === '/api/quotes' && method === 'POST') return saveQuote(request, env, user);
   m = path.match(/^\/api\/quotes\/(\d+)$/);
   if (m && method === 'GET') return getQuote(env, user, Number(m[1]));
+  if (m && method === 'DELETE') return deleteQuote(env,user,Number(m[1]));
+  m = path.match(/^\/api\/quotes\/(\d+)\/convert$/);
+  if (m && method === 'POST') return convertQuoteByLab(request,env,user,Number(m[1]));
   m = path.match(/^\/api\/quotes\/(\d+)\/lead-status$/);
   if (m && method === 'PATCH') return updateQuoteLeadStatus(request,env,user,Number(m[1]));
 
@@ -1948,6 +1951,75 @@ async function upsertSitePet(env,siteCustomerId,{name,birthDate,species,breed,se
     .bind(siteCustomerId,petName,birth,clampString(species,100),clampString(breed,120),clampString(sex,20),ts,ts).run();
   return env.DB.prepare('SELECT * FROM site_pets WHERE id=?').bind(Number(ins.meta.last_row_id)).first();
 }
+async function legacySitePet(env,siteCustomerId,{name,birthDate,species,breed,sex}){
+  const petName=clampString(name,160);if(!petName)return null;
+  const existing=await env.DB.prepare(`SELECT * FROM site_pets WHERE site_customer_id=? AND lower(trim(name))=lower(trim(?)) ORDER BY CASE WHEN birth_date IS NOT NULL THEN 0 ELSE 1 END,id DESC LIMIT 1`).bind(siteCustomerId,petName).first();
+  const ts=nowIso(),birth=parseCalendarDate(birthDate)?clampString(birthDate,20):null;
+  if(existing){
+    await env.DB.prepare(`UPDATE site_pets SET name=?,birth_date=COALESCE(?,birth_date),species=COALESCE(NULLIF(?,''),species),breed=COALESCE(NULLIF(?,''),breed),sex=COALESCE(NULLIF(?,''),sex),updated_at=? WHERE id=?`)
+      .bind(petName,birth,clampString(species,100)||'',clampString(breed,120)||'',clampString(sex,20)||'',ts,existing.id).run();
+    return env.DB.prepare('SELECT * FROM site_pets WHERE id=?').bind(existing.id).first();
+  }
+  const ins=await env.DB.prepare(`INSERT INTO site_pets(site_customer_id,name,birth_date,species,breed,sex,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`)
+    .bind(siteCustomerId,petName,birth,clampString(species,100),clampString(breed,120),clampString(sex,20),ts,ts).run();
+  return env.DB.prepare('SELECT * FROM site_pets WHERE id=?').bind(Number(ins.meta.last_row_id)).first();
+}
+async function onlineQuoteWithSiteData(env,id){
+  return env.DB.prepare(`SELECT q.*,sc.name customer_name,sc.phone_display,sc.email customer_email,sc.address customer_address,sc.city customer_city,sc.state customer_state,sc.zip_code customer_zip,sc.tutor_account_id,sp.name pet_name,sp.birth_date,sp.species,sp.breed,sp.sex
+    FROM quotes q LEFT JOIN site_customers sc ON sc.id=q.site_customer_id LEFT JOIN site_pets sp ON sp.id=q.site_pet_id WHERE q.id=? AND q.source='online'`).bind(id).first();
+}
+async function ensureOnlineQuoteSiteProfile(env,q,b={}){
+  if(!q||q.source!=='online')throw new Error('Orçamento online não encontrado.');
+  const name=clampString(b.name??q.customer_name??q.walk_in_name,180)||'Cliente do site';
+  const phone=clampString(b.phone??q.phone_display??q.walk_in_phone,40),phoneKey=normalizePublicPhone(phone);
+  if(!validPublicPhone(phoneKey))throw new Error('Informe um WhatsApp válido com DDD para vincular este orçamento ao cliente.');
+  const email=clampString(b.email??q.customer_email??q.lead_email,200),address=clampString(b.collectionAddress??b.address??q.customer_address,300),city=clampString(b.city??q.customer_city,120),state=clampString(b.state??q.customer_state,30)||'RN',zipCode=clampString(b.zipCode??q.customer_zip,20);
+  const customer=await upsertSiteCustomer(env,{name,phone,email,address,city,state,zipCode});
+  const patient=clampString(b.patientName??q.pet_name??q.patient_name,160);
+  let pet=null;
+  if(patient)pet=await legacySitePet(env,customer.id,{name:patient,birthDate:b.birthDate??q.birth_date,species:b.species??q.species,breed:b.breed??q.breed,sex:b.sex??q.sex});
+  await env.DB.prepare(`UPDATE quotes SET site_customer_id=?,site_pet_id=?,walk_in_name=?,walk_in_phone=?,patient_name=COALESCE(NULLIF(?,''),patient_name),lead_email=COALESCE(NULLIF(?,''),lead_email),updated_at=? WHERE id=?`)
+    .bind(customer.id,pet?.id||q.site_pet_id||null,name,phone,patient||'',email||'',nowIso(),q.id).run();
+  return onlineQuoteWithSiteData(env,q.id);
+}
+async function linkLegacyOnlineQuotesForCustomer(env,customer){
+  const rows=(await env.DB.prepare(`SELECT id,walk_in_name,walk_in_phone,patient_name,lead_email FROM quotes WHERE source='online' AND site_customer_id IS NULL ORDER BY id DESC LIMIT 1000`).all()).results||[];
+  for(const q of rows){
+    if(normalizePublicPhone(q.walk_in_phone)!==customer.phone_key)continue;
+    let pet=null;if(q.patient_name)pet=await legacySitePet(env,customer.id,{name:q.patient_name});
+    await env.DB.prepare(`UPDATE quotes SET site_customer_id=?,site_pet_id=COALESCE(site_pet_id,?),updated_at=? WHERE id=?`).bind(customer.id,pet?.id||null,nowIso(),q.id).run();
+  }
+}
+async function convertOnlineQuoteToRequisition(env,q,b={},actor={name:'Site HLab Vet',userId:null}){
+  if(!q)return {error:'Cotação não encontrada.',status:404};
+  if(q.requisition_id){const r=await env.DB.prepare('SELECT id,protocol,status FROM requisitions WHERE id=?').bind(q.requisition_id).first();return {existing:true,...r};}
+  let hydrated;try{hydrated=await ensureOnlineQuoteSiteProfile(env,q,b);}catch(e){return {error:e.message||'Não foi possível vincular o cadastro do cliente.',status:400};}
+  const patient=clampString(b.patientName??hydrated.pet_name??hydrated.patient_name,160);if(!patient)return {error:'Informe o nome do animal.',status:400};
+  const birthDate=clampString(b.birthDate??hydrated.birth_date,20);if(!parseCalendarDate(birthDate))return {error:'Informe a data de nascimento do animal para criar a solicitação.',status:400};
+  const age=exactAgeText(birthDate,fortalezaToday());if(!age)return {error:'A data de nascimento do animal não pode ser futura.',status:400};
+  const address=clampString(b.collectionAddress??hydrated.customer_address,300);if(!address)return {error:'Informe o endereço onde o material será coletado.',status:400};
+  const mapRaw=clampString(b.collectionMapUrl,800),collectionMapUrl=mapRaw?cleanMapsUrl(mapRaw):null;if(mapRaw&&!collectionMapUrl)return {error:'O link de localização deve ser um link válido do Google Maps.',status:400};
+  const items=(await env.DB.prepare(`SELECT * FROM quote_items WHERE quote_id=? ORDER BY sort_order,id`).bind(q.id).all()).results||[];
+  const examItems=items.filter(x=>x.item_type==='exam');if(!examItems.length)return {error:'Para criar a solicitação, o orçamento precisa ter pelo menos um exame.',status:409};
+  const customer=await env.DB.prepare('SELECT * FROM site_customers WHERE id=?').bind(hydrated.site_customer_id).first();
+  const pet=await legacySitePet(env,customer.id,{name:patient,birthDate,species:b.species??hydrated.species,breed:b.breed??hydrated.breed,sex:b.sex??hydrated.sex});
+  const ts=nowIso();
+  await env.DB.prepare(`UPDATE site_customers SET address=?,city=COALESCE(NULLIF(?,''),city),state=COALESCE(NULLIF(?,''),state),zip_code=COALESCE(NULLIF(?,''),zip_code),updated_at=? WHERE id=?`)
+    .bind(address,clampString(b.city,120)||'',clampString(b.state,30)||'',clampString(b.zipCode,20)||'',ts,customer.id).run();
+  await env.DB.prepare(`UPDATE quotes SET site_pet_id=?,patient_name=?,updated_at=? WHERE id=?`).bind(pet.id,patient,ts,q.id).run();
+  const services=items.filter(x=>x.item_type==='service').map(x=>`${x.description}${Number(x.quantity)>1?` x${x.quantity}`:''}`);
+  const observations=services.length?`Serviços do orçamento: ${services.join(', ')}.`:null;
+  const walk=await walkInClientId(env),tempProto=`TEMP-${crypto.randomUUID()}`;
+  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,priority,clinic_name,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_address,collection_map_url,observations,request_kind,requested_by_user_id,requested_by_name,site_customer_id,site_pet_id,request_source) VALUES(?,?,'solicitado','normal',?,?,?,?,?,?,?,?,?,?,?,?, 'immediate',?,?,?,?,'public_site')`)
+    .bind(tempProto,walk,'Cliente do site',customer.name,customer.tutor_account_id||null,patient,pet.species,pet.breed,pet.sex,birthDate,age,address,collectionMapUrl,observations,actor.userId||null,actor.name||'Site HLab Vet',customer.id,pet.id).run();
+  const reqId=Number(ins.meta.last_row_id),proto=protocolCode(reqId,new Date()),statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,reqId)];
+  for(const item of examItems){const exam=await findCatalogExam(env,String(item.item_ref));statements.push(env.DB.prepare(`INSERT INTO requisition_exams(requisition_id,category,exam_code,exam_name,unit_price_cents,price_source) VALUES(?,?,?,?,?,?)`).bind(reqId,exam?.category||'Outros',String(item.item_ref||''),item.description,Number(item.unit_price_cents),'quote'));}
+  statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'solicitado',?,?,?,?)`).bind(reqId,actor.userId||null,actor.name||'Site HLab Vet',JSON.stringify({message:'Orçamento online convertido em solicitação.',quoteId:q.id,collectionAddress:address}),ts));
+  statements.push(env.DB.prepare(`UPDATE quotes SET requisition_id=?,lead_status='converted',contacted_at=COALESCE(contacted_at,?),contacted_by_name=COALESCE(contacted_by_name,?),updated_at=? WHERE id=?`).bind(reqId,ts,actor.name||'Site HLab Vet',ts,q.id));
+  await env.DB.batch(statements);
+  return {id:reqId,protocol:proto,status:'solicitado',siteCustomerId:customer.id};
+}
+
 async function createPublicQuote(request,env){
   const cfg=await env.DB.prepare(`SELECT enabled FROM quote_site_settings WHERE id=1`).first();if(!cfg?.enabled)return err('O orçamento online está temporariamente desativado.',404);
   const b=await safeBody(request)||{},name=clampString(b.name,180),phone=clampString(b.phone,40),email=clampString(b.email,200),patient=clampString(b.patientName,160),birthDate=clampString(b.birthDate,20);
@@ -1967,38 +2039,32 @@ async function createPublicQuote(request,env){
   return ok({message:'Cotação enviada ao HLab Vet.',quote});
 }
 async function confirmPublicQuote(request,env,id){
-  const b=await safeBody(request)||{};
-  const q=await env.DB.prepare(`SELECT q.*,sc.name customer_name,sc.phone_display,sc.email,sc.address customer_address,sc.city customer_city,sc.state customer_state,sc.tutor_account_id,sp.name pet_name,sp.birth_date,sp.species,sp.breed,sp.sex FROM quotes q JOIN site_customers sc ON sc.id=q.site_customer_id JOIN site_pets sp ON sp.id=q.site_pet_id WHERE q.id=? AND q.source='online'`).bind(id).first();
-  if(!q)return err('Cotação não encontrada.',404);if(q.requisition_id)return err('Esta cotação já virou uma solicitação.',409);
-  const address=clampString(b.collectionAddress,300)||q.customer_address;if(!address)return err('Informe o endereço onde o material será coletado.');
-  const mapRaw=clampString(b.collectionMapUrl,800),collectionMapUrl=mapRaw?cleanMapsUrl(mapRaw):null;if(mapRaw&&!collectionMapUrl)return err('O link de localização deve ser um link válido do Google Maps.');
-  await env.DB.prepare(`UPDATE site_customers SET address=?,city=COALESCE(NULLIF(?,''),city),state=COALESCE(NULLIF(?,''),state),zip_code=COALESCE(NULLIF(?,''),zip_code),updated_at=? WHERE id=?`)
-    .bind(address,clampString(b.city,120)||'',clampString(b.state,30)||'',clampString(b.zipCode,20)||'',nowIso(),q.site_customer_id).run();
-  const items=(await env.DB.prepare(`SELECT * FROM quote_items WHERE quote_id=? ORDER BY sort_order,id`).bind(id).all()).results||[];
-  const examItems=items.filter(x=>x.item_type==='exam');if(!examItems.length)return err('Para solicitar coleta pelo site, o orçamento precisa ter pelo menos um exame.',409);
-  const walk=await walkInClientId(env),ts=nowIso(),tempProto=`TEMP-${crypto.randomUUID()}`,age=exactAgeText(q.birth_date,fortalezaToday());
-  const services=items.filter(x=>x.item_type==='service').map(x=>`${x.description}${Number(x.quantity)>1?` x${x.quantity}`:''}`);
-  const observations=services.length?`Serviços do orçamento: ${services.join(', ')}.`:null;
-  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,priority,clinic_name,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_address,collection_map_url,observations,request_kind,requested_by_user_id,requested_by_name,site_customer_id,site_pet_id,request_source) VALUES(?,?,'solicitado','normal',?,?,?,?,?,?,?,?,?,?,?,?, 'immediate',NULL,'Site HLab Vet',?,?, 'public_site')`)
-    .bind(tempProto,walk,'Cliente do site',q.customer_name,q.tutor_account_id||null,q.pet_name,q.species,q.breed,q.sex,q.birth_date,age,address,collectionMapUrl,observations,q.site_customer_id,q.site_pet_id).run();
-  const reqId=Number(ins.meta.last_row_id),proto=protocolCode(reqId,new Date()),statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,reqId)];
-  for(const item of examItems){const exam=await findCatalogExam(env,String(item.item_ref));statements.push(env.DB.prepare(`INSERT INTO requisition_exams(requisition_id,category,exam_code,exam_name,unit_price_cents,price_source) VALUES(?,?,?,?,?,?)`).bind(reqId,exam?.category||'Outros',String(item.item_ref||''),item.description,Number(item.unit_price_cents), 'quote'));}
-  statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'solicitado',NULL,'Site HLab Vet',?,?)`).bind(reqId,JSON.stringify({message:'Cliente confirmou a cotação e solicitou a coleta pelo site.',quoteId:id,collectionAddress:address}),ts));
-  statements.push(env.DB.prepare(`UPDATE quotes SET requisition_id=?,lead_status='converted',contacted_at=COALESCE(contacted_at,?),contacted_by_name=COALESCE(contacted_by_name,'Site HLab Vet'),updated_at=? WHERE id=?`).bind(reqId,ts,ts,id));
-  await env.DB.batch(statements);
-  return ok({message:'Solicitação enviada ao laboratório.',id:reqId,protocol:proto,status:'solicitado'});
+  const b=await safeBody(request)||{},q=await onlineQuoteWithSiteData(env,id);
+  if(!q)return err('Cotação não encontrada.',404);
+  const result=await convertOnlineQuoteToRequisition(env,q,b,{name:'Site HLab Vet',userId:null});
+  if(result.error)return err(result.error,result.status||400);
+  if(result.existing)return ok({message:'Esta cotação já está vinculada a uma solicitação.',id:result.id,protocol:result.protocol,status:result.status,alreadyCreated:true});
+  return ok({message:'Solicitação enviada ao laboratório.',id:result.id,protocol:result.protocol,status:result.status});
 }
 async function publicCustomerData(env,siteCustomerId){
   const customer=await env.DB.prepare(`SELECT id,name,phone_display,email,address,city,state,zip_code,tutor_account_id,created_at,updated_at FROM site_customers WHERE id=?`).bind(siteCustomerId).first();if(!customer)return null;
   const pets=(await env.DB.prepare(`SELECT id,name,birth_date,species,breed,sex,created_at,updated_at FROM site_pets WHERE site_customer_id=? ORDER BY name COLLATE NOCASE,id`).bind(siteCustomerId).all()).results||[];
   const reqs=(await env.DB.prepare(`SELECT r.id,r.protocol,r.status,r.patient_name,r.birth_date,r.created_at,r.assigned_at,r.collected_at,r.lab_received_at,r.analysis_started_at,r.completed_at,r.cancellation_reason,q.id quote_id,q.quote_number,q.total_cents FROM requisitions r LEFT JOIN quotes q ON q.requisition_id=r.id WHERE r.site_customer_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT 100`).bind(siteCustomerId).all()).results||[];
   const files=(await env.DB.prepare(`SELECT rf.id,rf.requisition_id,rf.original_name,rf.mime_type,rf.size_bytes,rf.created_at FROM result_files rf JOIN requisitions r ON r.id=rf.requisition_id WHERE r.site_customer_id=? AND r.status<>'cancelado' ORDER BY rf.created_at DESC,rf.id DESC`).bind(siteCustomerId).all()).results||[];
+  const pendingQuotes=(await env.DB.prepare(`SELECT q.id,q.quote_number,q.patient_name,q.total_cents,q.created_at,q.updated_at,q.site_pet_id,sp.birth_date FROM quotes q LEFT JOIN site_pets sp ON sp.id=q.site_pet_id WHERE q.site_customer_id=? AND q.source='online' AND q.requisition_id IS NULL AND COALESCE(q.status,'active')<>'deleted' ORDER BY q.created_at DESC,q.id DESC LIMIT 100`).bind(siteCustomerId).all()).results||[];
   const fileMap=new Map();for(const f of files){if(!fileMap.has(Number(f.requisition_id)))fileMap.set(Number(f.requisition_id),[]);fileMap.get(Number(f.requisition_id)).push(f);}
-  return {customer,pets,requests:reqs.map(r=>({...r,status_label:statusLabel(r.status),files:fileMap.get(Number(r.id))||[]}))};
+  return {customer,pets,pendingQuotes,requests:reqs.map(r=>({...r,status_label:statusLabel(r.status),files:fileMap.get(Number(r.id))||[]}))};
 }
 async function publicCustomerLookup(request,env,url){
   const b=await safeBody(request)||{},phoneKey=normalizePublicPhone(b.phone);if(!validPublicPhone(phoneKey))return err('Informe um WhatsApp válido com DDD.');
-  const customer=await env.DB.prepare('SELECT * FROM site_customers WHERE phone_key=?').bind(phoneKey).first();if(!customer)return err('Não encontramos solicitações para esse telefone.',404);
+  let customer=await env.DB.prepare('SELECT * FROM site_customers WHERE phone_key=?').bind(phoneKey).first();
+  if(!customer){
+    const legacy=(await env.DB.prepare(`SELECT id,walk_in_name,walk_in_phone,lead_email FROM quotes WHERE source='online' AND site_customer_id IS NULL ORDER BY id DESC LIMIT 1000`).all()).results||[];
+    const match=legacy.find(q=>normalizePublicPhone(q.walk_in_phone)===phoneKey);
+    if(match)customer=await upsertSiteCustomer(env,{name:match.walk_in_name||'Cliente do site',phone:match.walk_in_phone,email:match.lead_email});
+  }
+  if(!customer)return err('Não encontramos cadastro ou orçamento para esse telefone.',404);
+  await linkLegacyOnlineQuotesForCustomer(env,customer);
   const sess=await createPublicCustomerSession(env,customer.id),data=await publicCustomerData(env,customer.id);
   return json({ok:true,...data},200,{'set-cookie':publicCustomerSessionCookie(sess.token,sess.expires,url.protocol==='https:'),'cache-control':'no-store'});
 }
@@ -2033,7 +2099,71 @@ async function grantSiteCustomerPanel(request,env,user,id){
   await env.DB.batch([env.DB.prepare('UPDATE site_customers SET tutor_account_id=?,updated_at=? WHERE id=?').bind(tutorId,ts,id),env.DB.prepare('UPDATE requisitions SET tutor_account_id=? WHERE site_customer_id=?').bind(tutorId,id)]);await audit(env,user,'liberou_painel_cliente_site','site_customer',id,{username,tutorId});return ok({message:'Painel liberado. O cliente deverá trocar a senha no primeiro acesso.',username,tutorId});
 }
 async function updateQuoteLeadStatus(request,env,user,id){
-  if(!(await canMakeQuote(env,user)))return err('Sem permissão.',403);const q=await env.DB.prepare('SELECT id,source FROM quotes WHERE id=?').bind(id).first();if(!q)return err('Orçamento não encontrado.',404);if(q.source!=='online')return err('Este orçamento não veio do site.');const b=await safeBody(request)||{},status=String(b.status||'');if(!['new','contacted','converted','closed'].includes(status))return err('Status inválido.');const contacted=status==='contacted'||status==='converted';await env.DB.prepare(`UPDATE quotes SET lead_status=?,contacted_at=CASE WHEN ?=1 THEN COALESCE(contacted_at,?) ELSE contacted_at END,contacted_by_name=CASE WHEN ?=1 THEN COALESCE(contacted_by_name,?) ELSE contacted_by_name END,updated_at=? WHERE id=?`).bind(status,contacted?1:0,nowIso(),contacted?1:0,user.username_display,nowIso(),id).run();await audit(env,user,'alterou_status_orcamento_online','quote',id,{status});return ok({message:'Status do orçamento online atualizado.'});
+  if(!(await canMakeQuote(env,user)))return err('Sem permissão.',403);const q=await env.DB.prepare('SELECT id,source,requisition_id FROM quotes WHERE id=?').bind(id).first();if(!q)return err('Orçamento não encontrado.',404);if(q.source!=='online')return err('Este orçamento não veio do site.');const b=await safeBody(request)||{},status=String(b.status||'');if(!['new','contacted','converted','closed'].includes(status))return err('Status inválido.');if(status==='converted'&&!q.requisition_id)return err('Para marcar como convertido, use “Transformar em venda”. Assim a venda entra corretamente em Solicitações.',409);const contacted=status==='contacted'||status==='converted';await env.DB.prepare(`UPDATE quotes SET lead_status=?,contacted_at=CASE WHEN ?=1 THEN COALESCE(contacted_at,?) ELSE contacted_at END,contacted_by_name=CASE WHEN ?=1 THEN COALESCE(contacted_by_name,?) ELSE contacted_by_name END,updated_at=? WHERE id=?`).bind(status,contacted?1:0,nowIso(),contacted?1:0,user.username_display,nowIso(),id).run();await audit(env,user,'alterou_status_orcamento_online','quote',id,{status});return ok({message:'Status do orçamento online atualizado.'});
+}
+
+async function convertInternalQuoteToRequisition(env,q,b={},actor={name:'HLab Vet',userId:null}){
+  const raw=await env.DB.prepare(`SELECT q.*,c.name client_record_name,c.phone client_record_phone,c.address client_record_address,c.city client_record_city,c.state client_record_state,c.zip_code client_record_zip,c.map_url client_record_map_url,COALESCE(c.is_system,0) is_system FROM quotes q JOIN clients c ON c.id=q.client_id WHERE q.id=?`).bind(q.id).first();
+  if(!raw)return {error:'Orçamento não encontrado.',status:404};
+  if(raw.requisition_id){const r=await env.DB.prepare('SELECT id,protocol,status FROM requisitions WHERE id=?').bind(raw.requisition_id).first();return {existing:true,...r};}
+  const items=(await env.DB.prepare(`SELECT * FROM quote_items WHERE quote_id=? ORDER BY sort_order,id`).bind(q.id).all()).results||[];
+  const examItems=items.filter(x=>x.item_type==='exam');
+  if(!examItems.length)return {error:'Para transformar em venda, o orçamento precisa ter pelo menos um exame.',status:409};
+  const patient=clampString(b.patientName??raw.patient_name,160);if(!patient)return {error:'Informe o nome do animal.',status:400};
+  const tutorName=clampString(b.name??b.tutorName??raw.walk_in_name,180)||clampString(raw.client_record_name,180);if(!tutorName)return {error:'Informe o nome do tutor ou responsável.',status:400};
+  const phone=clampString(b.phone??raw.walk_in_phone??raw.client_record_phone,40);if(!phone)return {error:'Informe o telefone/WhatsApp do responsável.',status:400};
+  const phoneKey=normalizePublicPhone(phone);if(!validPublicPhone(phoneKey))return {error:'Informe um telefone/WhatsApp válido com DDD.',status:400};
+  const birthDate=clampString(b.birthDate,20);if(!parseCalendarDate(birthDate))return {error:'Informe a data de nascimento do animal.',status:400};
+  const age=exactAgeText(birthDate,fortalezaToday());if(!age)return {error:'A data de nascimento do animal não pode ser futura.',status:400};
+  const address=clampString(b.collectionAddress??raw.client_record_address,300);if(!address)return {error:'Informe o endereço onde o material será coletado.',status:400};
+  const city=clampString(b.city??raw.client_record_city,120),state=clampString(b.state??raw.client_record_state,30)||'RN',zipCode=clampString(b.zipCode??raw.client_record_zip,20);
+  const mapRaw=clampString(b.collectionMapUrl??raw.client_record_map_url,800),collectionMapUrl=mapRaw?cleanMapsUrl(mapRaw):null;if(mapRaw&&!collectionMapUrl)return {error:'O link de localização deve ser um link válido do Google Maps.',status:400};
+  const species=clampString(b.species,100),breed=clampString(b.breed,120),sex=clampString(b.sex,20);
+  let siteCustomer=null,sitePet=null;
+  if(Number(raw.is_system)===1){
+    try{
+      siteCustomer=await upsertSiteCustomer(env,{name:tutorName,phone,email:q.lead_email||null,address,city,state,zipCode});
+      sitePet=await upsertSitePet(env,siteCustomer.id,{name:patient,birthDate,species,breed,sex});
+    }catch(e){return {error:e.message||'Não foi possível salvar o cadastro do cliente.',status:400};}
+  }
+  const services=items.filter(x=>x.item_type==='service').map(x=>`${x.description}${Number(x.quantity)>1?` x${x.quantity}`:''}`);
+  const observations=[services.length?`Serviços do orçamento: ${services.join(', ')}.`:null,clampString(raw.notes,2000)].filter(Boolean).join(' ' )||null;
+  const ts=nowIso(),tempProto=`TEMP-${crypto.randomUUID()}`,clinicName=Number(raw.is_system)===1?'Atendimento direto':raw.client_record_name;
+  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,priority,clinic_name,tutor_name,patient_name,species,breed,sex,birth_date,age_text,collection_address,collection_map_url,observations,request_kind,requested_by_user_id,requested_by_name,site_customer_id,site_pet_id,request_source) VALUES(?,?,'solicitado','normal',?,?,?,?,?,?,?,?,?,?,?,'immediate',?,?,?,?,'panel_quote')`)
+    .bind(tempProto,Number(raw.client_id),clinicName,tutorName,patient,species,breed,sex,birthDate,age,address,collectionMapUrl,observations,actor.userId||null,actor.name||'HLab Vet',siteCustomer?.id||null,sitePet?.id||null).run();
+  const reqId=Number(ins.meta.last_row_id),proto=protocolCode(reqId,new Date());
+  const statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,reqId)];
+  for(const item of examItems){const exam=await findCatalogExam(env,String(item.item_ref));statements.push(env.DB.prepare(`INSERT INTO requisition_exams(requisition_id,category,exam_code,exam_name,unit_price_cents,price_source) VALUES(?,?,?,?,?,?)`).bind(reqId,exam?.category||'Outros',String(item.item_ref||''),item.description,Number(item.unit_price_cents),'quote'));}
+  statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'solicitado',?,?,?,?)`).bind(reqId,actor.userId||null,actor.name||'HLab Vet',JSON.stringify({message:'Orçamento transformado em venda.',quoteId:q.id,collectionAddress:address,awaitingCourierAssignment:true}),ts));
+  statements.push(env.DB.prepare(`UPDATE quotes SET requisition_id=?,walk_in_name=CASE WHEN ?=1 THEN ? ELSE walk_in_name END,walk_in_phone=CASE WHEN ?=1 THEN ? ELSE walk_in_phone END,patient_name=?,site_customer_id=COALESCE(site_customer_id,?),site_pet_id=COALESCE(site_pet_id,?),updated_at=? WHERE id=?`).bind(reqId,Number(raw.is_system),tutorName,Number(raw.is_system),phone,patient,siteCustomer?.id||null,sitePet?.id||null,ts,q.id));
+  await env.DB.batch(statements);
+  return {id:reqId,protocol:proto,status:'solicitado',siteCustomerId:siteCustomer?.id||null};
+}
+
+async function convertQuoteByLab(request,env,user,id){
+  if(!(await canMakeQuote(env,user)))return err('Sem permissão para transformar orçamentos em venda.',403);
+  const q=await quoteDetailRow(env,id);if(!q)return err('Orçamento não encontrado.',404);
+  const b=await safeBody(request)||{};
+  let result;
+  if(q.source==='online'){
+    const online=await onlineQuoteWithSiteData(env,id);if(!online)return err('Orçamento online não encontrado.',404);
+    result=await convertOnlineQuoteToRequisition(env,online,b,{name:user.username_display||'HLab Vet',userId:user.id});
+  }else{
+    result=await convertInternalQuoteToRequisition(env,q,b,{name:user.username_display||'HLab Vet',userId:user.id});
+  }
+  if(result.error)return err(result.error,result.status||400);
+  if(result.existing)return ok({message:'Este orçamento já foi transformado em venda e possui solicitação vinculada.',id:result.id,protocol:result.protocol,status:result.status,alreadyCreated:true});
+  await audit(env,user,'transformou_orcamento_em_venda','quote',id,{requisitionId:result.id,protocol:result.protocol,source:q.source||'internal'});
+  return ok({message:'Venda confirmada. A solicitação foi criada e aguarda atribuição de entregador.',id:result.id,protocol:result.protocol,status:result.status,siteCustomerId:result.siteCustomerId||null});
+}
+async function deleteQuote(env,user,id){
+  const q=await quoteDetailRow(env,id);if(!q)return err('Orçamento não encontrado.',404);
+  if(!(await canAccessQuote(env,user,q)))return err('Sem acesso a este orçamento.',403);
+  if(user.role==='client'&&q.requisition_id)return err('Este orçamento já está vinculado a uma solicitação e não pode ser excluído pelo cliente.',409);
+  const linkedReq=q.requisition_id?await env.DB.prepare('SELECT id,protocol,status FROM requisitions WHERE id=?').bind(q.requisition_id).first():null;
+  await env.DB.prepare('DELETE FROM quotes WHERE id=?').bind(id).run();
+  await audit(env,user,'excluiu_orcamento','quote',id,{quoteNumber:q.quote_number,linkedRequisitionId:linkedReq?.id||null,linkedProtocol:linkedReq?.protocol||null});
+  return ok({message:linkedReq?`Orçamento excluído. A solicitação ${linkedReq.protocol} foi mantida normalmente.`:'Orçamento excluído com sucesso.',linkedRequisition:linkedReq||null});
 }
 
 function quoteAccessClientId(user,requestedClientId=0){
@@ -2093,7 +2223,7 @@ async function quoteDetailRow(env,id){
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,
            q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.status,q.total_cents,q.notes,q.valid_until,
            q.source,q.lead_status,q.lead_email,q.contacted_at,q.contacted_by_name,q.site_customer_id,q.site_pet_id,
-           sc.address site_customer_address,sc.city site_customer_city,sc.state site_customer_state,sc.zip_code site_customer_zip,sc.tutor_account_id site_tutor_account_id,sp.birth_date patient_birth_date,
+           sc.address site_customer_address,sc.city site_customer_city,sc.state site_customer_state,sc.zip_code site_customer_zip,sc.tutor_account_id site_tutor_account_id,sp.birth_date patient_birth_date,sp.species patient_species,sp.breed patient_breed,sp.sex patient_sex,
            q.created_by_user_id,q.created_by_name,q.created_at,q.updated_at,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.legal_name END legal_name,
@@ -2102,6 +2232,8 @@ async function quoteDetailRow(env,id){
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.address END client_address,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.city END client_city,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.state END client_state,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.zip_code END client_zip,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.map_url END client_map_url,
            r.protocol requisition_protocol
     FROM quotes q JOIN clients c ON c.id=q.client_id
     LEFT JOIN requisitions r ON r.id=q.requisition_id
