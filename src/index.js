@@ -107,11 +107,16 @@ export default {
 async function api(request, env, url) {
   const path = url.pathname;
   const method = request.method.toUpperCase();
+  let m;
 
   if (path === '/api/health') return ok({ app: env.APP_NAME || 'HLab Vet Resultados', time: nowIso() });
   if (path === '/api/catalog' && method === 'GET') return ok({ exams: await catalogWithCustom(env), materials: MATERIALS });
   if (path === '/api/public/quote-site' && method === 'GET') return publicQuoteSite(env);
   if (path === '/api/public/quote-catalog' && method === 'GET') return publicQuoteCatalog(env);
+  if (path === '/api/public/site' && method === 'GET') return publicSiteData(env);
+  if (path === '/api/public/quotes' && method === 'POST') return createPublicQuote(request,env);
+  m = path.match(/^\/api\/public\/site-media\/(\d+)$/);
+  if (m && method === 'GET') return publicSiteMedia(env,Number(m[1]));
   // Painel do proprietário: autenticação e rotas totalmente separadas do laboratório.
   if (path === '/api/owner/login' && method === 'POST') return ownerLogin(request, env, url);
   if (path === '/api/owner/logout' && method === 'POST') return ownerLogout(request, env, url);
@@ -151,7 +156,6 @@ async function api(request, env, url) {
     return err('Troque a senha inicial para continuar.', 428, { code: 'PASSWORD_CHANGE_REQUIRED' });
   }
 
-  let m;
   if (path === '/api/me' && method === 'GET') return me(env, user);
   if (path === '/api/change-password' && method === 'POST') return changePassword(request, env, user);
   if (path === '/api/dashboard' && method === 'GET') return dashboard(env, user);
@@ -253,6 +257,14 @@ async function api(request, env, url) {
   if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_manage_prices', () => updateService(request, env, user, Number(m[1])));
   if (path === '/api/quote-site/settings' && method === 'GET') return requireAdminOnly(user, () => quoteSiteSettings(env));
   if (path === '/api/quote-site/settings' && method === 'PUT') return requireAdminOnly(user, () => updateQuoteSiteSettings(request,env,user));
+  if (path === '/api/site/settings' && method === 'GET') return requireAdminOnly(user, () => siteSettings(env));
+  if (path === '/api/site/settings' && method === 'PUT') return requireAdminOnly(user, () => updateSiteSettings(request,env,user));
+  if (path === '/api/site/offers' && method === 'GET') return requireInternalPermission(env,user,'can_make_quotes', () => listSiteOffers(env,false));
+  if (path === '/api/site/offers' && method === 'POST') return requireInternalPermission(env,user,'can_make_quotes', () => createSiteOffer(request,env,user));
+  m = path.match(/^\/api\/site\/offers\/(\d+)$/);
+  if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_make_quotes', () => updateSiteOffer(request,env,user,Number(m[1])));
+  m = path.match(/^\/api\/site\/offers\/(\d+)\/image$/);
+  if (m && method === 'POST') return requireInternalPermission(env,user,'can_make_quotes', () => uploadSiteOfferImage(request,env,user,Number(m[1])));
   if (path === '/api/custom-exams' && method === 'POST') return requireInternalPermission(env,user,'can_manage_prices', () => createCustomExam(request,env,user));
   m = path.match(/^\/api\/custom-exams\/(\d+)$/);
   if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_manage_prices', () => updateCustomExam(request,env,user,Number(m[1])));
@@ -261,6 +273,8 @@ async function api(request, env, url) {
   if (path === '/api/quotes' && method === 'POST') return saveQuote(request, env, user);
   m = path.match(/^\/api\/quotes\/(\d+)$/);
   if (m && method === 'GET') return getQuote(env, user, Number(m[1]));
+  m = path.match(/^\/api\/quotes\/(\d+)\/lead-status$/);
+  if (m && method === 'PATCH') return updateQuoteLeadStatus(request,env,user,Number(m[1]));
 
   if (path === '/api/prices' && method === 'GET') return requireInternalPermission(env,user,'can_view_prices', () => listPrices(env, url));
   if (path === '/api/prices/general' && method === 'POST') return requireInternalPermission(env,user,'can_manage_prices', () => setGeneralPrice(request, env, user));
@@ -477,7 +491,9 @@ async function ownerLogicalSnapshot(env) {
     service_prices:`SELECT * FROM service_prices ORDER BY id`,
     quotes:`SELECT * FROM quotes ORDER BY id`,
     quote_items:`SELECT * FROM quote_items ORDER BY id`,
-    quote_site_settings:`SELECT * FROM quote_site_settings ORDER BY id`
+    quote_site_settings:`SELECT * FROM quote_site_settings ORDER BY id`,
+    public_site_settings:`SELECT * FROM public_site_settings ORDER BY id`,
+    site_offers:`SELECT * FROM site_offers ORDER BY id`
   };
   for(const [name,sql] of Object.entries(specs)){
     try{const r=await env.DB.prepare(sql).all();tables[name]=r.results||[];}catch{tables[name]=[];}
@@ -545,7 +561,7 @@ async function ownerExportZip(request, env, url) {
   const snap=await ownerLogicalSnapshot(env),entries=[];
   entries.push({name:'00_LEIA-ME.txt',data:`Exportação HLabVet\nGerada em: ${snap.createdAt}\nContém dados operacionais em CSV/JSON e arquivos de resultados encontrados no R2.\nSenhas, hashes e sessões não são exportados.\n`});
   entries.push({name:'01_DADOS/dados_completos.json',data:JSON.stringify(snap,null,2)});
-  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',result_analyses:'analises_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',exam_turnaround_settings:'tempos_por_exame',lab_timing_settings:'configuracao_tempo_exames',lab_alerts:'alertas_cancelamentos',custom_exams:'exames_outros',service_prices:'servicos',quotes:'orcamentos',quote_items:'itens_orcamentos',quote_site_settings:'configuracao_site_orcamento'};
+  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',result_analyses:'analises_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',exam_turnaround_settings:'tempos_por_exame',lab_timing_settings:'configuracao_tempo_exames',lab_alerts:'alertas_cancelamentos',custom_exams:'exames_outros',service_prices:'servicos',quotes:'orcamentos',quote_items:'itens_orcamentos',quote_site_settings:'configuracao_site_orcamento',public_site_settings:'configuracao_site_publico',site_offers:'conteudo_site'};
   for(const [table,filename] of Object.entries(map))entries.push({name:`01_DADOS/${filename}.csv`,data:rowsToCsv(snap.tables[table]||[])});
   let total=entries.reduce((n,e)=>n+(typeof e.data==='string'?new TextEncoder().encode(e.data).length:e.data.length),0);
   const maxBytes=80*1024*1024;
@@ -583,8 +599,9 @@ async function ownerResetSystem(request, env) {
   if(!dbOwner||!await verifyPassword(String(body?.password||''),dbOwner.password_hash,dbOwner.password_salt))return err('Senha do proprietário incorreta.',401);
   const deletedFiles=await ownerDeleteAllR2(env);
   const stmts=[
-    'DELETE FROM quote_items','DELETE FROM quotes','DELETE FROM service_prices','DELETE FROM custom_exams',
-    'UPDATE quote_site_settings SET enabled=0,show_prices=1,show_services=1,whatsapp_phone=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=1',
+    'DELETE FROM site_offers','DELETE FROM quote_items','DELETE FROM quotes','DELETE FROM service_prices','DELETE FROM custom_exams',
+    'UPDATE quote_site_settings SET enabled=1,show_prices=1,show_services=1,whatsapp_phone=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=1',
+    "UPDATE public_site_settings SET enabled=1,company_name='HLab Vet Resultados',headline='Diagnóstico veterinário com agilidade, cuidado e confiança',subheadline='Exames, coleta e resultados em um fluxo simples para clínicas, veterinários e tutores.',whatsapp_phone=NULL,contact_email=NULL,careers_email=NULL,address=NULL,map_url=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=1",
     'DELETE FROM lab_alerts','DELETE FROM result_analyses','DELETE FROM result_files','DELETE FROM status_events','DELETE FROM requisition_materials','DELETE FROM requisition_exams','DELETE FROM requisitions',
     'DELETE FROM client_exam_prices','DELETE FROM exam_prices','DELETE FROM exam_turnaround_settings','DELETE FROM lab_timing_settings','INSERT INTO lab_timing_settings(id,default_turnaround_minutes,warning_minutes) VALUES(1,1440,10)','DELETE FROM tutors','DELETE FROM client_members','DELETE FROM clients',
     'DELETE FROM courier_sessions','DELETE FROM courier_accounts','DELETE FROM couriers','DELETE FROM receivers','DELETE FROM sessions','DELETE FROM audit_log',
@@ -1707,6 +1724,51 @@ async function temperatureSheet(env,user,url){
 
 
 
+
+function siteOfferType(value){return ['service','product','promotion'].includes(String(value||''))?String(value):'service';}
+async function publicSiteData(env){
+  const settings=await env.DB.prepare(`SELECT * FROM public_site_settings WHERE id=1`).first();
+  const q=await env.DB.prepare(`SELECT enabled,show_prices,show_services,whatsapp_phone FROM quote_site_settings WHERE id=1`).first();
+  const offers=(await env.DB.prepare(`SELECT id,offer_type,title,description,price_cents,promo_price_cents,badge,button_text,image_r2_key,image_mime,active,sort_order FROM site_offers WHERE active=1 ORDER BY sort_order,id DESC`).all()).results||[];
+  return ok({enabled:settings?.enabled!==0,settings:{companyName:settings?.company_name||'HLab Vet Resultados',headline:settings?.headline||'',subheadline:settings?.subheadline||'',whatsappPhone:settings?.whatsapp_phone||q?.whatsapp_phone||'',contactEmail:settings?.contact_email||'',careersEmail:settings?.careers_email||'',address:settings?.address||'',mapUrl:settings?.map_url||''},quote:{enabled:!!q?.enabled,showPrices:q?.show_prices!==0,showServices:q?.show_services!==0},offers:offers.map(x=>({...x,imageUrl:x.image_r2_key?`/api/public/site-media/${x.id}`:null}))});
+}
+async function publicSiteMedia(env,id){
+  const row=await env.DB.prepare(`SELECT image_r2_key,image_mime FROM site_offers WHERE id=?`).bind(id).first();if(!row?.image_r2_key)return new Response('Imagem não encontrada',{status:404});
+  const obj=await env.FILES.get(row.image_r2_key);if(!obj)return new Response('Imagem não encontrada',{status:404});
+  const h=new Headers();obj.writeHttpMetadata(h);h.set('content-type',row.image_mime||h.get('content-type')||'application/octet-stream');h.set('cache-control','public,max-age=3600');return new Response(obj.body,{headers:h});
+}
+async function siteSettings(env){const row=await env.DB.prepare(`SELECT * FROM public_site_settings WHERE id=1`).first();return ok({settings:{enabled:row?.enabled!==0,companyName:row?.company_name||'',headline:row?.headline||'',subheadline:row?.subheadline||'',whatsappPhone:row?.whatsapp_phone||'',contactEmail:row?.contact_email||'',careersEmail:row?.careers_email||'',address:row?.address||'',mapUrl:row?.map_url||''}});}
+async function updateSiteSettings(request,env,user){
+  const b=await safeBody(request)||{},mapUrl=b.mapUrl?cleanMapsUrl(b.mapUrl):null;if(b.mapUrl&&!mapUrl)return err('Informe um link válido do Google Maps.');const ts=nowIso();
+  await env.DB.prepare(`INSERT INTO public_site_settings(id,enabled,company_name,headline,subheadline,whatsapp_phone,contact_email,careers_email,address,map_url,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,company_name=excluded.company_name,headline=excluded.headline,subheadline=excluded.subheadline,whatsapp_phone=excluded.whatsapp_phone,contact_email=excluded.contact_email,careers_email=excluded.careers_email,address=excluded.address,map_url=excluded.map_url,updated_at=excluded.updated_at`)
+    .bind(boolInt(b.enabled),clampString(b.companyName,160)||'HLab Vet Resultados',clampString(b.headline,260)||'Diagnóstico veterinário com agilidade, cuidado e confiança',clampString(b.subheadline,700),clampString(b.whatsappPhone,40),clampString(b.contactEmail,200),clampString(b.careersEmail,200),clampString(b.address,500),mapUrl,ts).run();
+  await audit(env,user,'alterou_site_publico','public_site',1);return ok({message:'Configurações do site salvas.'});
+}
+async function listSiteOffers(env,onlyActive=true){const rows=await env.DB.prepare(`SELECT * FROM site_offers ${onlyActive?'WHERE active=1':''} ORDER BY active DESC,sort_order,id DESC`).all();return ok({offers:(rows.results||[]).map(x=>({...x,imageUrl:x.image_r2_key?`/api/public/site-media/${x.id}`:null}))});}
+async function createSiteOffer(request,env,user){
+  const b=await safeBody(request)||{},title=clampString(b.title,180);if(!title)return err('Informe o título.');const price=moneyInputToCents(b.price),promo=moneyInputToCents(b.promoPrice),ts=nowIso();
+  const ins=await env.DB.prepare(`INSERT INTO site_offers(offer_type,title,description,price_cents,promo_price_cents,badge,button_text,active,sort_order,created_by_user_id,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(siteOfferType(b.offerType),title,clampString(b.description,1500),price,promo,clampString(b.badge,80),clampString(b.buttonText,80)||'Quero saber mais',b.active==null?1:boolInt(b.active),Math.round(Number(b.sortOrder||0)),user.id,user.username_display,ts,ts).run();
+  await audit(env,user,'criou_conteudo_site','site_offer',ins.meta.last_row_id,{title});return ok({id:Number(ins.meta.last_row_id),message:'Conteúdo criado. Agora você pode adicionar a foto.'});
+}
+async function updateSiteOffer(request,env,user,id){
+  const old=await env.DB.prepare('SELECT * FROM site_offers WHERE id=?').bind(id).first();if(!old)return err('Conteúdo não encontrado.',404);const b=await safeBody(request)||{};let price=old.price_cents,promo=old.promo_price_cents;if('price' in b)price=String(b.price??'').trim()===''?null:moneyInputToCents(b.price);if('promoPrice' in b)promo=String(b.promoPrice??'').trim()===''?null:moneyInputToCents(b.promoPrice);
+  await env.DB.prepare(`UPDATE site_offers SET offer_type=?,title=?,description=?,price_cents=?,promo_price_cents=?,badge=?,button_text=?,active=?,sort_order=?,updated_at=? WHERE id=?`).bind(siteOfferType(b.offerType??old.offer_type),clampString(b.title??old.title,180)||old.title,clampString(b.description??old.description,1500),price,promo,clampString(b.badge??old.badge,80),clampString(b.buttonText??old.button_text,80)||'Quero saber mais',b.active==null?Number(old.active):boolInt(b.active),b.sortOrder==null?Number(old.sort_order):Math.round(Number(b.sortOrder||0)),nowIso(),id).run();
+  await audit(env,user,'alterou_conteudo_site','site_offer',id);return ok({message:'Conteúdo atualizado.'});
+}
+async function uploadSiteOfferImage(request,env,user,id){
+  const row=await env.DB.prepare('SELECT * FROM site_offers WHERE id=?').bind(id).first();if(!row)return err('Conteúdo não encontrado.',404);let fd;try{fd=await request.formData()}catch{return err('Envio de imagem inválido.');}const file=fd.get('file');if(!file||typeof file.arrayBuffer!=='function')return err('Selecione uma imagem.');const type=String(file.type||'').toLowerCase();if(!['image/jpeg','image/png','image/webp'].includes(type))return err('Use imagem JPG, PNG ou WEBP.');if(Number(file.size||0)>5*1024*1024)return err('A imagem deve ter no máximo 5 MB.');const ext=type==='image/png'?'png':type==='image/webp'?'webp':'jpg',key=`site/offers/${id}-${crypto.randomUUID()}.${ext}`;await env.FILES.put(key,await file.arrayBuffer(),{httpMetadata:{contentType:type}});if(row.image_r2_key)try{await env.FILES.delete(row.image_r2_key)}catch{}await env.DB.prepare('UPDATE site_offers SET image_r2_key=?,image_mime=?,updated_at=? WHERE id=?').bind(key,type,nowIso(),id).run();await audit(env,user,'enviou_imagem_site','site_offer',id);return ok({message:'Foto atualizada.',imageUrl:`/api/public/site-media/${id}`});
+}
+async function createPublicQuote(request,env){
+  const cfg=await env.DB.prepare(`SELECT enabled FROM quote_site_settings WHERE id=1`).first();if(!cfg?.enabled)return err('O orçamento online está temporariamente desativado.',404);const b=await safeBody(request)||{};const name=clampString(b.name,180),phone=clampString(b.phone,40),email=clampString(b.email,200),patient=clampString(b.patientName,160);if(!name)return err('Informe seu nome ou nome da clínica.');if(!phone)return err('Informe um WhatsApp para o laboratório poder entrar em contato.');
+  const examCodes=[...new Set((Array.isArray(b.examCodes)?b.examCodes:[]).map(String))],services=Array.isArray(b.services)?b.services:[];if(!examCodes.length&&!services.length)return err('Selecione pelo menos um exame ou serviço.');const catalog=new Map();for(const g of await catalogWithCustom(env))for(const e of g.items)catalog.set(e.code,e);const items=[];let total=0,sort=0;
+  for(const code of examCodes){const e=catalog.get(code);if(!e)continue;const pr=await resolveExamPrice(env,null,code);if(pr.priceCents==null)continue;items.push({type:'exam',ref:code,description:e.name,quantity:1,unit:pr.priceCents,total:pr.priceCents,sort:sort++});total+=pr.priceCents;}
+  for(const raw of services){const id=Number(raw?.id||raw||0),qty=Math.max(1,Math.min(99,Math.floor(Number(raw?.quantity||1))));if(!id)continue;const sv=await env.DB.prepare('SELECT id,name,price_cents FROM service_prices WHERE id=? AND active=1').bind(id).first();if(!sv)continue;const it=Number(sv.price_cents)*qty;items.push({type:'service',ref:String(id),description:sv.name,quantity:qty,unit:Number(sv.price_cents),total:it,sort:sort++});total+=it;}
+  if(!items.length)return err('Os itens escolhidos ainda não possuem preço disponível. Entre em contato com o laboratório.');const walk=await walkInClientId(env),ts=nowIso(),temp=`TEMP-${crypto.randomUUID()}`;const ins=await env.DB.prepare(`INSERT INTO quotes(quote_number,client_id,walk_in_name,walk_in_phone,patient_name,total_cents,notes,created_by_user_id,created_by_name,created_at,updated_at,source,lead_status,lead_email) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(temp,walk,name,phone,patient,total,'Cotação solicitada pelo site público.',null,'Site HLab Vet',ts,ts,'online','new',email).run();const id=Number(ins.meta.last_row_id);await env.DB.prepare('UPDATE quotes SET quote_number=? WHERE id=?').bind(quoteNumber(id,ts),id).run();const stmts=items.map(x=>env.DB.prepare(`INSERT INTO quote_items(quote_id,item_type,item_ref,description,quantity,unit_price_cents,total_cents,sort_order) VALUES(?,?,?,?,?,?,?,?)`).bind(id,x.type,x.ref,x.description,x.quantity,x.unit,x.total,x.sort));if(stmts.length)await env.DB.batch(stmts);return ok({message:'Cotação enviada ao HLab Vet. A equipe poderá entrar em contato pelo WhatsApp informado.',quote:await quoteDetailRow(env,id)});
+}
+async function updateQuoteLeadStatus(request,env,user,id){
+  if(!(await canMakeQuote(env,user)))return err('Sem permissão.',403);const q=await env.DB.prepare('SELECT id,source FROM quotes WHERE id=?').bind(id).first();if(!q)return err('Orçamento não encontrado.',404);if(q.source!=='online')return err('Este orçamento não veio do site.');const b=await safeBody(request)||{},status=String(b.status||'');if(!['new','contacted','converted','closed'].includes(status))return err('Status inválido.');const contacted=status==='contacted'||status==='converted';await env.DB.prepare(`UPDATE quotes SET lead_status=?,contacted_at=CASE WHEN ?=1 THEN COALESCE(contacted_at,?) ELSE contacted_at END,contacted_by_name=CASE WHEN ?=1 THEN COALESCE(contacted_by_name,?) ELSE contacted_by_name END,updated_at=? WHERE id=?`).bind(status,contacted?1:0,nowIso(),contacted?1:0,user.username_display,nowIso(),id).run();await audit(env,user,'alterou_status_orcamento_online','quote',id,{status});return ok({message:'Status do orçamento online atualizado.'});
+}
+
 function quoteAccessClientId(user,requestedClientId=0){
   if(user.role==='client')return Number(user.client_id||0);
   if(['admin','staff'].includes(user.role))return Number(requestedClientId||0);
@@ -1726,7 +1788,7 @@ async function publicQuoteSite(env){const row=await env.DB.prepare(`SELECT enabl
 async function publicQuoteCatalog(env){
   const cfg=await env.DB.prepare(`SELECT enabled,show_prices,show_services,whatsapp_phone FROM quote_site_settings WHERE id=1`).first();if(!cfg?.enabled)return err('O orçamento online está temporariamente desativado.',404);
   const general=await env.DB.prepare('SELECT exam_code,exam_name,price_cents FROM exam_prices WHERE active=1').all();const gm=new Map((general.results||[]).map(x=>[x.exam_code,x]));const exams=[];
-  for(const group of await catalogWithCustom(env))for(const e of group.items){const gp=gm.get(e.code);if(gp?.price_cents!=null)exams.push({category:group.category,examCode:e.code,examName:e.name,priceCents:cfg.show_prices?Number(gp.price_cents):null});}
+  for(const group of await catalogWithCustom(env))for(const e of group.items){const gp=gm.get(e.code);exams.push({category:group.category,examCode:e.code,examName:e.name,priceCents:gp?.price_cents!=null?Number(gp.price_cents):null});}
   const services=cfg.show_services?(await env.DB.prepare('SELECT id,name,description,price_cents FROM service_prices WHERE active=1 ORDER BY name COLLATE NOCASE').all()).results||[]:[];
   return ok({showPrices:cfg.show_prices!==0,showServices:cfg.show_services!==0,whatsappPhone:cfg.whatsapp_phone||'',exams,services});
 }
@@ -1763,6 +1825,7 @@ async function quoteDetailRow(env,id){
     SELECT q.id,q.quote_number,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,
            q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.status,q.total_cents,q.notes,q.valid_until,
+           q.source,q.lead_status,q.lead_email,q.contacted_at,q.contacted_by_name,
            q.created_by_user_id,q.created_by_name,q.created_at,q.updated_at,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.legal_name END legal_name,
@@ -1791,14 +1854,25 @@ async function getQuote(env,user,id){
 async function listQuotes(env,user,url){
   if(!(await canMakeQuote(env,user)))return err('Sem acesso a orçamentos.',403);
   const clientId=quoteAccessClientId(user,Number(url.searchParams.get('clientId')||0)),reqId=Number(url.searchParams.get('requisitionId')||0);
-  let sql=`SELECT q.id,q.quote_number,CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.total_cents,q.status,q.valid_until,q.created_at,q.updated_at,CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE 1=1`;
+  const source=String(url.searchParams.get('source')||''),leadStatus=String(url.searchParams.get('leadStatus')||''),from=clampString(url.searchParams.get('from'),20),to=clampString(url.searchParams.get('to'),20);
+  let sql=`SELECT q.id,q.quote_number,CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.lead_email,q.total_cents,q.status,q.source,q.lead_status,q.contacted_at,q.contacted_by_name,q.valid_until,q.created_at,q.updated_at,CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE 1=1`;
   const p=[];
   if(user.role==='client'){sql+=' AND q.client_id=?';p.push(Number(user.client_id));}
   else if(clientId){sql+=' AND q.client_id=?';p.push(clientId);}
   if(reqId){sql+=' AND q.requisition_id=?';p.push(reqId);}
-  sql+=' ORDER BY q.updated_at DESC,q.id DESC LIMIT 100';
-  const rows=await env.DB.prepare(sql).bind(...p).all();return ok({quotes:rows.results||[]});
+  if(source==='online'||source==='internal'){sql+=' AND q.source=?';p.push(source);}
+  if(['new','contacted','converted','closed'].includes(leadStatus)){sql+=' AND q.lead_status=?';p.push(leadStatus);}
+  if(from){sql+=` AND date(datetime(q.created_at,'-3 hours'))>=date(?)`;p.push(from);}
+  if(to){sql+=` AND date(datetime(q.created_at,'-3 hours'))<=date(?)`;p.push(to);}
+  sql+=' ORDER BY CASE WHEN q.source=\'online\' AND COALESCE(q.lead_status,\'new\')=\'new\' THEN 0 ELSE 1 END,q.updated_at DESC,q.id DESC LIMIT 300';
+  const rows=await env.DB.prepare(sql).bind(...p).all();
+  let onlineNewCount=0;
+  if(user.role!=='client'){
+    const c=await env.DB.prepare(`SELECT COUNT(*) n FROM quotes WHERE source='online' AND COALESCE(lead_status,'new')='new'`).first();onlineNewCount=Number(c?.n||0);
+  }
+  return ok({quotes:rows.results||[],onlineNewCount});
 }
+
 async function saveQuote(request,env,user){
   if(!(await canMakeQuote(env,user)))return err('Sem permissão para gerar orçamento.',403);
   const b=await safeBody(request);if(!b)return err('Dados inválidos.');
