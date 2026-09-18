@@ -127,6 +127,8 @@ async function api(request, env, url) {
   if (m && method === 'GET') return publicSiteTabMedia(env,m[1]);
   m = path.match(/^\/api\/public\/site-partner-media\/(\d+)$/);
   if (m && method === 'GET') return publicSitePartnerMedia(env,Number(m[1]));
+  m = path.match(/^\/api\/public\/site-testimonial-media\/(\d+)$/);
+  if (m && method === 'GET') return publicSiteTestimonialMedia(env,Number(m[1]));
   // Painel do proprietário: autenticação e rotas totalmente separadas do laboratório.
   if (path === '/api/owner/login' && method === 'POST') return ownerLogin(request, env, url);
   if (path === '/api/owner/logout' && method === 'POST') return ownerLogout(request, env, url);
@@ -291,6 +293,13 @@ async function api(request, env, url) {
   if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_make_quotes', () => updateSitePartner(request,env,user,Number(m[1])));
   m = path.match(/^\/api\/site\/partners\/(\d+)\/image$/);
   if (m && method === 'POST') return requireInternalPermission(env,user,'can_make_quotes', () => uploadSitePartnerImage(request,env,user,Number(m[1])));
+  if (path === '/api/site/testimonials' && method === 'GET') return requireInternalPermission(env,user,'can_make_quotes', () => listSiteTestimonials(env,false));
+  if (path === '/api/site/testimonials' && method === 'POST') return requireInternalPermission(env,user,'can_make_quotes', () => createSiteTestimonial(request,env,user));
+  m = path.match(/^\/api\/site\/testimonials\/(\d+)$/);
+  if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_make_quotes', () => updateSiteTestimonial(request,env,user,Number(m[1])));
+  if (m && method === 'DELETE') return requireInternalPermission(env,user,'can_make_quotes', () => deleteSiteTestimonial(env,user,Number(m[1])));
+  m = path.match(/^\/api\/site\/testimonials\/(\d+)\/image$/);
+  if (m && method === 'POST') return requireInternalPermission(env,user,'can_make_quotes', () => uploadSiteTestimonialImage(request,env,user,Number(m[1])));
   if (path === '/api/custom-exams' && method === 'POST') return requireInternalPermission(env,user,'can_manage_prices', () => createCustomExam(request,env,user));
   m = path.match(/^\/api\/custom-exams\/(\d+)$/);
   if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_manage_prices', () => updateCustomExam(request,env,user,Number(m[1])));
@@ -1794,6 +1803,8 @@ async function publicSiteData(env){
   const q=await env.DB.prepare(`SELECT enabled,show_prices,show_services,whatsapp_phone FROM quote_site_settings WHERE id=1`).first();
   const offers=(await env.DB.prepare(`SELECT id,offer_type,title,description,price_cents,promo_price_cents,badge,button_text,image_r2_key,image_mime,active,sort_order,COALESCE(show_popup,0) show_popup,COALESCE(popup_seconds,5) popup_seconds FROM site_offers WHERE active=1 ORDER BY sort_order,id DESC`).all()).results||[];
   const partners=(await env.DB.prepare(`SELECT id,name,website_url,logo_r2_key,logo_mime,active,sort_order FROM site_partners WHERE active=1 ORDER BY sort_order,id`).all()).results||[];
+  let testimonials=[];
+  try{testimonials=(await env.DB.prepare(`SELECT id,customer_name,source,testimonial_text,screenshot_r2_key,screenshot_mime,active,sort_order FROM site_testimonials WHERE active=1 ORDER BY sort_order,id`).all()).results||[]}catch{}
   const mediaRows=(await env.DB.prepare(`SELECT slot,image_r2_key FROM public_site_tab_media WHERE image_r2_key IS NOT NULL`).all()).results||[];
   const tabImages={};for(const row of mediaRows)tabImages[row.slot]=`/api/public/site-tab-media/${encodeURIComponent(row.slot)}`;
   let mapEmbedUrl=settings?.map_embed_url||'';
@@ -1801,7 +1812,7 @@ async function publicSiteData(env){
     mapEmbedUrl=await resolveGoogleMapsEmbedUrl(settings?.map_url||'',settings?.address||'');
     if(mapEmbedUrl)try{await env.DB.prepare('UPDATE public_site_settings SET map_embed_url=?,updated_at=? WHERE id=1').bind(mapEmbedUrl,nowIso()).run();}catch{}
   }
-  return ok({enabled:settings?.enabled!==0,settings:{companyName:settings?.company_name||'HLab Vet Resultados',headline:settings?.headline||'',subheadline:settings?.subheadline||'',whatsappPhone:settings?.whatsapp_phone||q?.whatsapp_phone||'',contactEmail:settings?.contact_email||'',careersEmail:settings?.careers_email||'',address:settings?.address||'',mapUrl:settings?.map_url||'',mapEmbedUrl:mapEmbedUrl||''},quote:{enabled:!!q?.enabled,showPrices:q?.show_prices!==0,showServices:q?.show_services!==0},tabImages,offers:offers.map(x=>({...x,imageUrl:x.image_r2_key?`/api/public/site-media/${x.id}`:null})),partners:partners.map(x=>({...x,logoUrl:x.logo_r2_key?`/api/public/site-partner-media/${x.id}`:null}))});
+  return ok({enabled:settings?.enabled!==0,settings:{companyName:settings?.company_name||'HLab Vet Resultados',headline:settings?.headline||'',subheadline:settings?.subheadline||'',whatsappPhone:settings?.whatsapp_phone||q?.whatsapp_phone||'',contactEmail:settings?.contact_email||'',careersEmail:settings?.careers_email||'',address:settings?.address||'',mapUrl:settings?.map_url||'',mapEmbedUrl:mapEmbedUrl||''},quote:{enabled:!!q?.enabled,showPrices:q?.show_prices!==0,showServices:q?.show_services!==0},tabImages,offers:offers.map(x=>({...x,imageUrl:x.image_r2_key?`/api/public/site-media/${x.id}`:null})),partners:partners.map(x=>({...x,logoUrl:x.logo_r2_key?`/api/public/site-partner-media/${x.id}`:null})),testimonials:testimonials.map(x=>({...x,screenshotUrl:x.screenshot_r2_key?`/api/public/site-testimonial-media/${x.id}`:null}))});
 }
 async function publicSiteMedia(env,id){
   const row=await env.DB.prepare(`SELECT image_r2_key,image_mime FROM site_offers WHERE id=?`).bind(id).first();if(!row?.image_r2_key)return new Response('Imagem não encontrada',{status:404});
@@ -1894,6 +1905,39 @@ async function uploadSitePartnerImage(request,env,user,id){
   const file=fd.get('file');if(!file||typeof file.arrayBuffer!=='function')return err('Selecione uma logo.');const type=String(file.type||'').toLowerCase();if(!['image/jpeg','image/png','image/webp'].includes(type))return err('Use logo JPG, PNG ou WEBP.');if(Number(file.size||0)>5*1024*1024)return err('A logo deve ter no máximo 5 MB.');
   const ext=type==='image/png'?'png':type==='image/webp'?'webp':'jpg',key=`site/partners/${id}-${crypto.randomUUID()}.${ext}`;await env.FILES.put(key,await file.arrayBuffer(),{httpMetadata:{contentType:type}});if(row.logo_r2_key)try{await env.FILES.delete(row.logo_r2_key)}catch{}
   await env.DB.prepare('UPDATE site_partners SET logo_r2_key=?,logo_mime=?,updated_at=? WHERE id=?').bind(key,type,nowIso(),id).run();await audit(env,user,'enviou_logo_parceiro_site','site_partner',id);return ok({message:'Logo do parceiro atualizada.',logoUrl:`/api/public/site-partner-media/${id}`});
+}
+
+async function publicSiteTestimonialMedia(env,id){
+  const row=await env.DB.prepare(`SELECT screenshot_r2_key,screenshot_mime FROM site_testimonials WHERE id=?`).bind(id).first();if(!row?.screenshot_r2_key)return new Response('Print não encontrado',{status:404});
+  const obj=await env.FILES.get(row.screenshot_r2_key);if(!obj)return new Response('Print não encontrado',{status:404});
+  const h=new Headers();obj.writeHttpMetadata(h);h.set('content-type',row.screenshot_mime||h.get('content-type')||'application/octet-stream');h.set('cache-control','public,max-age=3600');return new Response(obj.body,{headers:h});
+}
+async function listSiteTestimonials(env,onlyActive=true){
+  const rows=await env.DB.prepare(`SELECT * FROM site_testimonials ${onlyActive?'WHERE active=1':''} ORDER BY active DESC,sort_order,id`).all();
+  return ok({testimonials:(rows.results||[]).map(x=>({...x,screenshotUrl:x.screenshot_r2_key?`/api/public/site-testimonial-media/${x.id}`:null}))});
+}
+async function createSiteTestimonial(request,env,user){
+  const b=await safeBody(request)||{},customerName=clampString(b.customerName,180),testimonialText=clampString(b.testimonialText,1600),source=['whatsapp','google','other'].includes(String(b.source||''))?String(b.source):'whatsapp';
+  if(!customerName)return err('Informe o nome do cliente.');if(!testimonialText)return err('Informe o depoimento do cliente.');
+  const ts=nowIso(),ins=await env.DB.prepare(`INSERT INTO site_testimonials(customer_name,source,testimonial_text,active,sort_order,created_by_user_id,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?)`).bind(customerName,source,testimonialText,b.active==null?1:boolInt(b.active),Math.round(Number(b.sortOrder||0)),user.id,user.username_display,ts,ts).run();
+  await audit(env,user,'criou_depoimento_site','site_testimonial',ins.meta.last_row_id,{customerName,source});return ok({id:Number(ins.meta.last_row_id),message:'Depoimento cadastrado.'});
+}
+async function updateSiteTestimonial(request,env,user,id){
+  const old=await env.DB.prepare('SELECT * FROM site_testimonials WHERE id=?').bind(id).first();if(!old)return err('Depoimento não encontrado.',404);const b=await safeBody(request)||{};
+  const customerName=clampString(b.customerName??old.customer_name,180)||old.customer_name,testimonialText=clampString(b.testimonialText??old.testimonial_text,1600)||old.testimonial_text,source='source' in b?String(b.source||''):old.source;if(!['whatsapp','google','other'].includes(source))return err('Origem do depoimento inválida.');
+  await env.DB.prepare(`UPDATE site_testimonials SET customer_name=?,source=?,testimonial_text=?,active=?,sort_order=?,updated_at=? WHERE id=?`).bind(customerName,source,testimonialText,b.active==null?Number(old.active):boolInt(b.active),b.sortOrder==null?Number(old.sort_order):Math.round(Number(b.sortOrder||0)),nowIso(),id).run();
+  await audit(env,user,'alterou_depoimento_site','site_testimonial',id);return ok({message:'Depoimento atualizado.'});
+}
+async function deleteSiteTestimonial(env,user,id){
+  const row=await env.DB.prepare('SELECT * FROM site_testimonials WHERE id=?').bind(id).first();if(!row)return err('Depoimento não encontrado.',404);
+  if(row.screenshot_r2_key)try{await env.FILES.delete(row.screenshot_r2_key)}catch{}
+  await env.DB.prepare('DELETE FROM site_testimonials WHERE id=?').bind(id).run();await audit(env,user,'excluiu_depoimento_site','site_testimonial',id,{customerName:row.customer_name});return ok({message:'Depoimento excluído.'});
+}
+async function uploadSiteTestimonialImage(request,env,user,id){
+  const row=await env.DB.prepare('SELECT * FROM site_testimonials WHERE id=?').bind(id).first();if(!row)return err('Depoimento não encontrado.',404);let fd;try{fd=await request.formData()}catch{return err('Envio do print inválido.');}
+  const file=fd.get('file');if(!file||typeof file.arrayBuffer!=='function')return err('Selecione o print do depoimento.');const type=String(file.type||'').toLowerCase();if(!['image/jpeg','image/png','image/webp'].includes(type))return err('Use print JPG, PNG ou WEBP.');if(Number(file.size||0)>8*1024*1024)return err('O print deve ter no máximo 8 MB.');
+  const ext=type==='image/png'?'png':type==='image/webp'?'webp':'jpg',key=`site/testimonials/${id}-${crypto.randomUUID()}.${ext}`;await env.FILES.put(key,await file.arrayBuffer(),{httpMetadata:{contentType:type}});if(row.screenshot_r2_key)try{await env.FILES.delete(row.screenshot_r2_key)}catch{}
+  await env.DB.prepare('UPDATE site_testimonials SET screenshot_r2_key=?,screenshot_mime=?,updated_at=? WHERE id=?').bind(key,type,nowIso(),id).run();await audit(env,user,'enviou_print_depoimento_site','site_testimonial',id);return ok({message:'Print do depoimento atualizado.',screenshotUrl:`/api/public/site-testimonial-media/${id}`});
 }
 
 function normalizePublicPhone(value){
