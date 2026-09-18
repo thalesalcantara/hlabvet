@@ -291,6 +291,7 @@ async function api(request, env, url) {
   if (m && method === 'POST') return requireAdminOnly(user, () => grantSiteCustomerPanel(request,env,user,Number(m[1])));
   m = path.match(/^\/api\/site\/partners\/(\d+)$/);
   if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_make_quotes', () => updateSitePartner(request,env,user,Number(m[1])));
+  if (m && method === 'DELETE') return requireInternalPermission(env,user,'can_make_quotes', () => deleteSitePartner(env,user,Number(m[1])));
   m = path.match(/^\/api\/site\/partners\/(\d+)\/image$/);
   if (m && method === 'POST') return requireInternalPermission(env,user,'can_make_quotes', () => uploadSitePartnerImage(request,env,user,Number(m[1])));
   if (path === '/api/site/testimonials' && method === 'GET') return requireInternalPermission(env,user,'can_make_quotes', () => listSiteTestimonials(env,false));
@@ -1879,6 +1880,15 @@ async function updateSiteOffer(request,env,user,id){
 async function uploadSiteOfferImage(request,env,user,id){
   const row=await env.DB.prepare('SELECT * FROM site_offers WHERE id=?').bind(id).first();if(!row)return err('Conteúdo não encontrado.',404);let fd;try{fd=await request.formData()}catch{return err('Envio de imagem inválido.');}const file=fd.get('file');if(!file||typeof file.arrayBuffer!=='function')return err('Selecione uma imagem.');const type=String(file.type||'').toLowerCase();if(!['image/jpeg','image/png','image/webp'].includes(type))return err('Use imagem JPG, PNG ou WEBP.');if(Number(file.size||0)>5*1024*1024)return err('A imagem deve ter no máximo 5 MB.');const ext=type==='image/png'?'png':type==='image/webp'?'webp':'jpg',key=`site/offers/${id}-${crypto.randomUUID()}.${ext}`;await env.FILES.put(key,await file.arrayBuffer(),{httpMetadata:{contentType:type}});if(row.image_r2_key)try{await env.FILES.delete(row.image_r2_key)}catch{}await env.DB.prepare('UPDATE site_offers SET image_r2_key=?,image_mime=?,updated_at=? WHERE id=?').bind(key,type,nowIso(),id).run();await audit(env,user,'enviou_imagem_site','site_offer',id);return ok({message:'Foto atualizada.',imageUrl:`/api/public/site-media/${id}`});
 }
+async function deleteSitePartner(env,user,id){
+  const row=await env.DB.prepare('SELECT * FROM site_partners WHERE id=?').bind(id).first();
+  if(!row)return err('Parceiro não encontrado.',404);
+  if(row.logo_r2_key)try{await env.FILES.delete(row.logo_r2_key)}catch{}
+  await env.DB.prepare('DELETE FROM site_partners WHERE id=?').bind(id).run();
+  await audit(env,user,'excluiu_parceiro_site','site_partner',id,{name:row.name});
+  return ok({message:'Parceiro excluído.'});
+}
+
 async function publicSitePartnerMedia(env,id){
   const row=await env.DB.prepare(`SELECT logo_r2_key,logo_mime FROM site_partners WHERE id=? AND active=1`).bind(id).first();if(!row?.logo_r2_key)return new Response('Logo não encontrada',{status:404});
   const obj=await env.FILES.get(row.logo_r2_key);if(!obj)return new Response('Logo não encontrada',{status:404});
