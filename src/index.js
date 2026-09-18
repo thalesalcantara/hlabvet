@@ -115,6 +115,12 @@ async function api(request, env, url) {
   if (path === '/api/public/quote-catalog' && method === 'GET') return publicQuoteCatalog(env);
   if (path === '/api/public/site' && method === 'GET') return publicSiteData(env);
   if (path === '/api/public/quotes' && method === 'POST') return createPublicQuote(request,env);
+  m = path.match(/^\/api\/public\/quotes\/(\d+)\/confirm$/);
+  if (m && method === 'POST') return confirmPublicQuote(request,env,Number(m[1]));
+  if (path === '/api/public/customer-lookup' && method === 'POST') return publicCustomerLookup(request,env,url);
+  if (path === '/api/public/customer-status' && method === 'GET') return publicCustomerStatus(request,env);
+  m = path.match(/^\/api\/public\/results\/(\d+)\/(download|view)$/);
+  if (m && method === 'GET') return publicDownloadResult(request,env,Number(m[1]),m[2] === 'view');
   m = path.match(/^\/api\/public\/site-media\/(\d+)$/);
   if (m && method === 'GET') return publicSiteMedia(env,Number(m[1]));
   m = path.match(/^\/api\/public\/site-tab-media\/(home|quote|offers|location|careers|contact)$/);
@@ -275,6 +281,12 @@ async function api(request, env, url) {
   if (m && method === 'POST') return requireInternalPermission(env,user,'can_make_quotes', () => uploadSiteOfferImage(request,env,user,Number(m[1])));
   if (path === '/api/site/partners' && method === 'GET') return requireInternalPermission(env,user,'can_make_quotes', () => listSitePartners(env,false));
   if (path === '/api/site/partners' && method === 'POST') return requireInternalPermission(env,user,'can_make_quotes', () => createSitePartner(request,env,user));
+  if (path === '/api/site-customers' && method === 'GET') return requireInternalPermission(env,user,'can_make_quotes', () => listSiteCustomers(env,url));
+  m = path.match(/^\/api\/site-customers\/(\d+)$/);
+  if (m && method === 'GET') return requireInternalPermission(env,user,'can_make_quotes', () => getSiteCustomer(env,Number(m[1])));
+  if (m && method === 'PATCH') return requireAdminOnly(user, () => updateSiteCustomer(request,env,user,Number(m[1])));
+  m = path.match(/^\/api\/site-customers\/(\d+)\/grant-panel$/);
+  if (m && method === 'POST') return requireAdminOnly(user, () => grantSiteCustomerPanel(request,env,user,Number(m[1])));
   m = path.match(/^\/api\/site\/partners\/(\d+)$/);
   if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_make_quotes', () => updateSitePartner(request,env,user,Number(m[1])));
   m = path.match(/^\/api\/site\/partners\/(\d+)\/image$/);
@@ -509,7 +521,9 @@ async function ownerLogicalSnapshot(env) {
     public_site_settings:`SELECT * FROM public_site_settings ORDER BY id`,
     site_offers:`SELECT * FROM site_offers ORDER BY id`,
     site_partners:`SELECT * FROM site_partners ORDER BY id`,
-    public_site_tab_media:`SELECT * FROM public_site_tab_media ORDER BY slot`
+    public_site_tab_media:`SELECT * FROM public_site_tab_media ORDER BY slot`,
+    site_customers:`SELECT * FROM site_customers ORDER BY id`,
+    site_pets:`SELECT * FROM site_pets ORDER BY id`
   };
   for(const [name,sql] of Object.entries(specs)){
     try{const r=await env.DB.prepare(sql).all();tables[name]=r.results||[];}catch{tables[name]=[];}
@@ -577,7 +591,7 @@ async function ownerExportZip(request, env, url) {
   const snap=await ownerLogicalSnapshot(env),entries=[];
   entries.push({name:'00_LEIA-ME.txt',data:`Exportação HLabVet\nGerada em: ${snap.createdAt}\nContém dados operacionais em CSV/JSON e arquivos de resultados encontrados no R2.\nSenhas, hashes e sessões não são exportados.\n`});
   entries.push({name:'01_DADOS/dados_completos.json',data:JSON.stringify(snap,null,2)});
-  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',result_analyses:'analises_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',exam_turnaround_settings:'tempos_por_exame',lab_timing_settings:'configuracao_tempo_exames',lab_alerts:'alertas_cancelamentos',custom_exams:'exames_outros',service_prices:'servicos',quotes:'orcamentos',quote_items:'itens_orcamentos',quote_site_settings:'configuracao_site_orcamento',public_site_settings:'configuracao_site_publico',site_offers:'conteudo_site',site_partners:'parceiros_site',public_site_tab_media:'imagens_abas_site'};
+  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',result_analyses:'analises_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',exam_turnaround_settings:'tempos_por_exame',lab_timing_settings:'configuracao_tempo_exames',lab_alerts:'alertas_cancelamentos',custom_exams:'exames_outros',service_prices:'servicos',quotes:'orcamentos',quote_items:'itens_orcamentos',quote_site_settings:'configuracao_site_orcamento',public_site_settings:'configuracao_site_publico',site_offers:'conteudo_site',site_partners:'parceiros_site',public_site_tab_media:'imagens_abas_site',site_customers:'clientes_site',site_pets:'animais_clientes_site'};
   for(const [table,filename] of Object.entries(map))entries.push({name:`01_DADOS/${filename}.csv`,data:rowsToCsv(snap.tables[table]||[])});
   let total=entries.reduce((n,e)=>n+(typeof e.data==='string'?new TextEncoder().encode(e.data).length:e.data.length),0);
   const maxBytes=80*1024*1024;
@@ -615,7 +629,7 @@ async function ownerResetSystem(request, env) {
   if(!dbOwner||!await verifyPassword(String(body?.password||''),dbOwner.password_hash,dbOwner.password_salt))return err('Senha do proprietário incorreta.',401);
   const deletedFiles=await ownerDeleteAllR2(env);
   const stmts=[
-    'DELETE FROM site_partners','DELETE FROM public_site_tab_media','DELETE FROM site_offers','DELETE FROM quote_items','DELETE FROM quotes','DELETE FROM service_prices','DELETE FROM custom_exams',
+    'DELETE FROM site_partners','DELETE FROM public_site_tab_media','DELETE FROM site_offers','DELETE FROM site_customer_sessions','DELETE FROM site_pets','DELETE FROM quote_items','DELETE FROM quotes','DELETE FROM site_customers','DELETE FROM service_prices','DELETE FROM custom_exams',
     'UPDATE quote_site_settings SET enabled=1,show_prices=1,show_services=1,whatsapp_phone=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=1',
     "UPDATE public_site_settings SET enabled=1,company_name='HLab Vet Resultados',headline='Diagnóstico veterinário com agilidade, cuidado e confiança',subheadline='Exames, coleta e resultados em um fluxo simples para clínicas, veterinários e tutores.',whatsapp_phone=NULL,contact_email=NULL,careers_email=NULL,address=NULL,map_url=NULL,map_embed_url=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=1",
     'DELETE FROM lab_alerts','DELETE FROM result_analyses','DELETE FROM result_files','DELETE FROM status_events','DELETE FROM requisition_materials','DELETE FROM requisition_exams','DELETE FROM requisitions',
@@ -724,7 +738,7 @@ async function labDashboardCharts(env){
     env.DB.prepare(`SELECT date(datetime(created_at,'-3 hours')) day,COUNT(*) n FROM requisitions WHERE status<>'cancelado' AND datetime(created_at,'-3 hours')>=datetime('now','-3 hours','-13 days','start of day') GROUP BY day ORDER BY day`).all(),
     env.DB.prepare(`SELECT status,COUNT(*) n FROM requisitions WHERE datetime(created_at,'-3 hours')>=datetime('now','-3 hours','-29 days','start of day') GROUP BY status ORDER BY n DESC`).all(),
     env.DB.prepare(`SELECT e.exam_name label,COUNT(*) n FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id WHERE r.status<>'cancelado' AND datetime(r.created_at,'-3 hours')>=datetime('now','-3 hours','-29 days','start of day') GROUP BY e.exam_name ORDER BY n DESC,e.exam_name LIMIT 6`).all(),
-    env.DB.prepare(`SELECT c.name label,COUNT(*) n FROM requisitions r JOIN clients c ON c.id=r.client_id WHERE r.status<>'cancelado' AND datetime(r.created_at,'-3 hours')>=datetime('now','-3 hours','-29 days','start of day') GROUP BY c.id,c.name ORDER BY n DESC,c.name LIMIT 6`).all()
+    env.DB.prepare(`SELECT CASE WHEN r.request_source='public_site' THEN COALESCE(sc.name,r.tutor_name,'Cliente do site') ELSE c.name END label,COUNT(*) n FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN site_customers sc ON sc.id=r.site_customer_id WHERE r.status<>'cancelado' AND datetime(r.created_at,'-3 hours')>=datetime('now','-3 hours','-29 days','start of day') GROUP BY CASE WHEN r.request_source='public_site' THEN COALESCE(sc.name,r.tutor_name,'Cliente do site') ELSE c.name END ORDER BY n DESC,label LIMIT 6`).all()
   ]);
   const map=new Map((dailyRows.results||[]).map(x=>[x.day,Number(x.n||0)]));
   const daily=[];
@@ -751,8 +765,9 @@ async function dashboard(env, user) {
   const recent = await env.DB.prepare(`
     SELECT r.id,r.protocol,r.patient_name,r.tutor_name,r.status,r.created_at,r.request_kind,r.scheduled_at,r.accepted_at,
            CASE WHEN r.status='cancelado' THEN 0 ELSE (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) END result_count,
-           c.name client_name
+           CASE WHEN r.request_source='public_site' THEN COALESCE(sc.name,r.tutor_name,'Cliente do site') ELSE c.name END client_name
     FROM requisitions r JOIN clients c ON c.id=r.client_id
+    LEFT JOIN site_customers sc ON sc.id=r.site_customer_id
     ${where}
     ORDER BY COALESCE(r.scheduled_at,r.created_at) DESC LIMIT 20
   `).bind(...p).all();
@@ -1242,7 +1257,7 @@ async function resetTechnicianPassword(request,env,user,id){
 async function listRequisitions(env,user,url){
   if(user.role==='tutor')return err('O tutor acessa somente os resultados liberados.',403);
   const filters={q:url.searchParams.get('q'),status:url.searchParams.get('status'),from:url.searchParams.get('from'),to:url.searchParams.get('to'),patient:url.searchParams.get('patient'),tutor:url.searchParams.get('tutor'),birth:url.searchParams.get('birth'),breed:url.searchParams.get('breed'),clientId:url.searchParams.get('clientId')};
-  let sql=`SELECT r.id,r.protocol,r.status,r.priority,r.patient_name,r.species,r.breed,r.birth_date,r.tutor_name,r.created_at,r.collection_date,r.assigned_at,r.collected_at,r.collection_temperature,r.lab_received_at,r.lab_received_temperature,r.analysis_started_at,r.completed_at,r.request_kind,r.scheduled_at,r.accepted_at,r.accepted_by_name,c.name client_name,co.name courier_name,CASE WHEN r.status='cancelado' THEN 0 ELSE (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) END result_count FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE 1=1`;
+  let sql=`SELECT r.id,r.protocol,r.status,r.priority,r.patient_name,r.species,r.breed,r.birth_date,r.tutor_name,r.created_at,r.collection_date,r.assigned_at,r.collected_at,r.collection_temperature,r.lab_received_at,r.lab_received_temperature,r.analysis_started_at,r.completed_at,r.request_kind,r.scheduled_at,r.accepted_at,r.accepted_by_name,CASE WHEN r.request_source='public_site' THEN COALESCE(sc.name,r.tutor_name,'Cliente do site') ELSE c.name END client_name,co.name courier_name,CASE WHEN r.status='cancelado' THEN 0 ELSE (SELECT COUNT(*) FROM result_files rf WHERE rf.requisition_id=r.id) END result_count FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN site_customers sc ON sc.id=r.site_customer_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE 1=1`;
   const p=[];
   if(user.role==='client'){sql+=' AND r.client_id=?';p.push(user.client_id);} else if(filters.clientId){sql+=' AND r.client_id=?';p.push(Number(filters.clientId));}
   if(filters.status){sql+=' AND r.status=?';p.push(filters.status);}
@@ -1253,7 +1268,7 @@ async function listRequisitions(env,user,url){
   if(filters.tutor){sql+=' AND r.tutor_name LIKE ?';p.push(`%${filters.tutor}%`);}
   if(filters.birth){sql+=' AND r.birth_date=?';p.push(filters.birth);}
   if(filters.breed){sql+=' AND r.breed LIKE ?';p.push(`%${filters.breed}%`);}
-  if(filters.q){sql+=` AND (r.protocol LIKE ? OR r.patient_name LIKE ? OR r.tutor_name LIKE ? OR r.breed LIKE ? OR r.species LIKE ? OR r.sex LIKE ? OR r.clinic_name LIKE ? OR r.veterinarian_name LIKE ? OR r.crmv LIKE ? OR r.age_text LIKE ? OR r.clinical_info LIKE ? OR r.material_other LIKE ? OR c.name LIKE ? OR EXISTS(SELECT 1 FROM requisition_exams e WHERE e.requisition_id=r.id AND e.exam_name LIKE ?) OR EXISTS(SELECT 1 FROM requisition_materials m WHERE m.requisition_id=r.id AND m.material_name LIKE ?))`;p.push(...Array(15).fill(`%${filters.q}%`));}
+  if(filters.q){sql+=` AND (r.protocol LIKE ? OR r.patient_name LIKE ? OR r.tutor_name LIKE ? OR r.breed LIKE ? OR r.species LIKE ? OR r.sex LIKE ? OR r.clinic_name LIKE ? OR r.veterinarian_name LIKE ? OR r.crmv LIKE ? OR r.age_text LIKE ? OR r.clinical_info LIKE ? OR r.material_other LIKE ? OR c.name LIKE ? OR sc.name LIKE ? OR EXISTS(SELECT 1 FROM requisition_exams e WHERE e.requisition_id=r.id AND e.exam_name LIKE ?) OR EXISTS(SELECT 1 FROM requisition_materials m WHERE m.requisition_id=r.id AND m.material_name LIKE ?))`;p.push(...Array(16).fill(`%${filters.q}%`));}
   sql+=' ORDER BY COALESCE(r.scheduled_at,r.created_at) DESC LIMIT 500';
   const rows=await env.DB.prepare(sql).bind(...p).all(); return ok({requisitions:rows.results||[]});
 }
@@ -1334,7 +1349,7 @@ async function canSeeReq(env,user,id){
 
 async function getRequisition(env,user,id){
   const allowed=await canSeeReq(env,user,id); if(allowed===null)return err('Requisição não encontrada.',404); if(!allowed)return err('Sem acesso a essa requisição.',403);
-  const r=await env.DB.prepare(`SELECT r.*,c.name client_name,c.address client_address,c.city client_city,c.state client_state,c.phone client_phone,co.name courier_name FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=?`).bind(id).first();
+  const r=await env.DB.prepare(`SELECT r.*,CASE WHEN r.request_source='public_site' THEN COALESCE(NULLIF(r.tutor_name,''),'Cliente do site') ELSE c.name END client_name,COALESCE(NULLIF(r.collection_address,''),sc.address,c.address) client_address,COALESCE(sc.city,c.city) client_city,COALESCE(sc.state,c.state) client_state,COALESCE(sc.phone_display,c.phone) client_phone,co.name courier_name FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN site_customers sc ON sc.id=r.site_customer_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=?`).bind(id).first();
   const [ex,mat,events,files]=await Promise.all([
     env.DB.prepare('SELECT id,category,exam_code,exam_name,turnaround_minutes,due_at,completed_at,completed_by_name,completed_within_sla FROM requisition_exams WHERE requisition_id=? ORDER BY id').bind(id).all(),
     env.DB.prepare('SELECT material_name FROM requisition_materials WHERE requisition_id=? ORDER BY id').bind(id).all(),
@@ -1878,12 +1893,144 @@ async function uploadSitePartnerImage(request,env,user,id){
   await env.DB.prepare('UPDATE site_partners SET logo_r2_key=?,logo_mime=?,updated_at=? WHERE id=?').bind(key,type,nowIso(),id).run();await audit(env,user,'enviou_logo_parceiro_site','site_partner',id);return ok({message:'Logo do parceiro atualizada.',logoUrl:`/api/public/site-partner-media/${id}`});
 }
 
+function normalizePublicPhone(value){
+  let digits=String(value||'').replace(/\D/g,'');
+  if(digits.length>11&&digits.startsWith('55'))digits=digits.slice(2);
+  return digits;
+}
+function validPublicPhone(phone){return /^\d{10,11}$/.test(String(phone||''));}
+function publicCustomerCookieToken(request){
+  const cookie=request.headers.get('cookie')||'';
+  const m=cookie.match(/(?:^|;\s*)hlab_site_customer=([^;]+)/);
+  return m?decodeURIComponent(m[1]):null;
+}
+function publicCustomerSessionCookie(token,expires,secure=true){
+  return `hlab_site_customer=${encodeURIComponent(token)}; Path=/; HttpOnly; SameSite=Lax; Expires=${new Date(expires).toUTCString()}${secure?'; Secure':''}`;
+}
+async function createPublicCustomerSession(env,siteCustomerId){
+  await env.DB.prepare('DELETE FROM site_customer_sessions WHERE expires_at<=?').bind(nowIso()).run();
+  const token=randomToken(32),tokenHash=await sha256(token),expires=new Date(Date.now()+2*60*60*1000).toISOString();
+  await env.DB.prepare('INSERT INTO site_customer_sessions(token_hash,site_customer_id,expires_at) VALUES(?,?,?)').bind(tokenHash,siteCustomerId,expires).run();
+  return {token,expires};
+}
+async function publicCustomerFromRequest(request,env){
+  const token=publicCustomerCookieToken(request);if(!token)return null;
+  const tokenHash=await sha256(token);
+  const row=await env.DB.prepare(`SELECT sc.*,s.expires_at FROM site_customer_sessions s JOIN site_customers sc ON sc.id=s.site_customer_id WHERE s.token_hash=?`).bind(tokenHash).first();
+  if(!row)return null;
+  if(new Date(row.expires_at).getTime()<=Date.now()){await env.DB.prepare('DELETE FROM site_customer_sessions WHERE token_hash=?').bind(tokenHash).run();return null;}
+  return row;
+}
+async function upsertSiteCustomer(env,{name,phone,email,address,city,state,zipCode}){
+  const phoneKey=normalizePublicPhone(phone);if(!validPublicPhone(phoneKey))throw new Error('Informe um WhatsApp válido com DDD.');
+  const ts=nowIso();
+  let row=await env.DB.prepare('SELECT * FROM site_customers WHERE phone_key=?').bind(phoneKey).first();
+  if(row){
+    await env.DB.prepare(`UPDATE site_customers SET name=?,phone_display=?,email=COALESCE(NULLIF(?,''),email),address=COALESCE(NULLIF(?,''),address),city=COALESCE(NULLIF(?,''),city),state=COALESCE(NULLIF(?,''),state),zip_code=COALESCE(NULLIF(?,''),zip_code),updated_at=? WHERE id=?`)
+      .bind(clampString(name,180)||row.name,clampString(phone,40)||row.phone_display,clampString(email,200)||'',clampString(address,300)||'',clampString(city,120)||'',clampString(state,30)||'',clampString(zipCode,20)||'',ts,row.id).run();
+    return env.DB.prepare('SELECT * FROM site_customers WHERE id=?').bind(row.id).first();
+  }
+  const ins=await env.DB.prepare(`INSERT INTO site_customers(name,phone_key,phone_display,email,address,city,state,zip_code,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)`)
+    .bind(clampString(name,180)||'Cliente do site',phoneKey,clampString(phone,40)||phoneKey,clampString(email,200),clampString(address,300),clampString(city,120),clampString(state,30)||'RN',clampString(zipCode,20),ts,ts).run();
+  return env.DB.prepare('SELECT * FROM site_customers WHERE id=?').bind(Number(ins.meta.last_row_id)).first();
+}
+async function upsertSitePet(env,siteCustomerId,{name,birthDate,species,breed,sex}){
+  const petName=clampString(name,160);if(!petName)throw new Error('Informe o nome do animal.');
+  const birth=clampString(birthDate,20);if(!parseCalendarDate(birth))throw new Error('Informe a data de nascimento do animal.');
+  const existing=await env.DB.prepare(`SELECT * FROM site_pets WHERE site_customer_id=? AND lower(trim(name))=lower(trim(?)) ORDER BY id DESC LIMIT 1`).bind(siteCustomerId,petName).first();
+  const ts=nowIso();
+  if(existing){
+    await env.DB.prepare(`UPDATE site_pets SET name=?,birth_date=?,species=COALESCE(NULLIF(?,''),species),breed=COALESCE(NULLIF(?,''),breed),sex=COALESCE(NULLIF(?,''),sex),updated_at=? WHERE id=?`)
+      .bind(petName,birth,clampString(species,100)||'',clampString(breed,120)||'',clampString(sex,20)||'',ts,existing.id).run();
+    return env.DB.prepare('SELECT * FROM site_pets WHERE id=?').bind(existing.id).first();
+  }
+  const ins=await env.DB.prepare(`INSERT INTO site_pets(site_customer_id,name,birth_date,species,breed,sex,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?)`)
+    .bind(siteCustomerId,petName,birth,clampString(species,100),clampString(breed,120),clampString(sex,20),ts,ts).run();
+  return env.DB.prepare('SELECT * FROM site_pets WHERE id=?').bind(Number(ins.meta.last_row_id)).first();
+}
 async function createPublicQuote(request,env){
-  const cfg=await env.DB.prepare(`SELECT enabled FROM quote_site_settings WHERE id=1`).first();if(!cfg?.enabled)return err('O orçamento online está temporariamente desativado.',404);const b=await safeBody(request)||{};const name=clampString(b.name,180),phone=clampString(b.phone,40),email=clampString(b.email,200),patient=clampString(b.patientName,160);if(!name)return err('Informe seu nome ou nome da clínica.');if(!phone)return err('Informe um WhatsApp para o laboratório poder entrar em contato.');
-  const examCodes=[...new Set((Array.isArray(b.examCodes)?b.examCodes:[]).map(String))],services=Array.isArray(b.services)?b.services:[];if(!examCodes.length&&!services.length)return err('Selecione pelo menos um exame ou serviço.');const catalog=new Map();for(const g of await catalogWithCustom(env))for(const e of g.items)catalog.set(e.code,e);const items=[];let total=0,sort=0;
+  const cfg=await env.DB.prepare(`SELECT enabled FROM quote_site_settings WHERE id=1`).first();if(!cfg?.enabled)return err('O orçamento online está temporariamente desativado.',404);
+  const b=await safeBody(request)||{},name=clampString(b.name,180),phone=clampString(b.phone,40),email=clampString(b.email,200),patient=clampString(b.patientName,160),birthDate=clampString(b.birthDate,20);
+  if(!name)return err('Informe o nome do tutor ou responsável.');if(!phone)return err('Informe seu WhatsApp.');if(!validPublicPhone(normalizePublicPhone(phone)))return err('Informe um WhatsApp válido com DDD.');if(!patient)return err('Informe o nome do animal.');if(!parseCalendarDate(birthDate))return err('Informe a data de nascimento do animal.');if(!exactAgeText(birthDate,fortalezaToday()))return err('A data de nascimento do animal não pode ser futura.');
+  const examCodes=[...new Set((Array.isArray(b.examCodes)?b.examCodes:[]).map(String))],services=Array.isArray(b.services)?b.services:[];if(!examCodes.length&&!services.length)return err('Selecione pelo menos um exame ou serviço.');
+  const catalog=new Map();for(const g of await catalogWithCustom(env))for(const e of g.items)catalog.set(e.code,e);const items=[];let total=0,sort=0;
   for(const code of examCodes){const e=catalog.get(code);if(!e)continue;const pr=await resolveExamPrice(env,null,code);if(pr.priceCents==null)continue;items.push({type:'exam',ref:code,description:e.name,quantity:1,unit:pr.priceCents,total:pr.priceCents,sort:sort++});total+=pr.priceCents;}
   for(const raw of services){const id=Number(raw?.id||raw||0),qty=Math.max(1,Math.min(99,Math.floor(Number(raw?.quantity||1))));if(!id)continue;const sv=await env.DB.prepare('SELECT id,name,price_cents FROM service_prices WHERE id=? AND active=1').bind(id).first();if(!sv)continue;const it=Number(sv.price_cents)*qty;items.push({type:'service',ref:String(id),description:sv.name,quantity:qty,unit:Number(sv.price_cents),total:it,sort:sort++});total+=it;}
-  if(!items.length)return err('Os itens escolhidos ainda não possuem preço disponível. Entre em contato com o laboratório.');const walk=await walkInClientId(env),ts=nowIso(),temp=`TEMP-${crypto.randomUUID()}`;const ins=await env.DB.prepare(`INSERT INTO quotes(quote_number,client_id,walk_in_name,walk_in_phone,patient_name,total_cents,notes,created_by_user_id,created_by_name,created_at,updated_at,source,lead_status,lead_email) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(temp,walk,name,phone,patient,total,'Cotação solicitada pelo site público.',null,'Site HLab Vet',ts,ts,'online','new',email).run();const id=Number(ins.meta.last_row_id);await env.DB.prepare('UPDATE quotes SET quote_number=? WHERE id=?').bind(quoteNumber(id,ts),id).run();const stmts=items.map(x=>env.DB.prepare(`INSERT INTO quote_items(quote_id,item_type,item_ref,description,quantity,unit_price_cents,total_cents,sort_order) VALUES(?,?,?,?,?,?,?,?)`).bind(id,x.type,x.ref,x.description,x.quantity,x.unit,x.total,x.sort));if(stmts.length)await env.DB.batch(stmts);return ok({message:'Cotação enviada ao HLab Vet. A equipe poderá entrar em contato pelo WhatsApp informado.',quote:await quoteDetailRow(env,id)});
+  if(!items.length)return err('Os itens escolhidos ainda não possuem preço disponível. Entre em contato com o laboratório.');
+  let customer,pet;try{customer=await upsertSiteCustomer(env,{name,phone,email});pet=await upsertSitePet(env,customer.id,{name:patient,birthDate,species:b.species,breed:b.breed,sex:b.sex});}catch(e){return err(e.message||'Não foi possível cadastrar seus dados.');}
+  const walk=await walkInClientId(env),ts=nowIso(),temp=`TEMP-${crypto.randomUUID()}`;
+  const ins=await env.DB.prepare(`INSERT INTO quotes(quote_number,client_id,walk_in_name,walk_in_phone,patient_name,total_cents,notes,created_by_user_id,created_by_name,created_at,updated_at,source,lead_status,lead_email,site_customer_id,site_pet_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(temp,walk,name,phone,patient,total,'Cotação solicitada pelo site público.',null,'Site HLab Vet',ts,ts,'online','new',email,customer.id,pet.id).run();
+  const id=Number(ins.meta.last_row_id);await env.DB.prepare('UPDATE quotes SET quote_number=? WHERE id=?').bind(quoteNumber(id,ts),id).run();
+  const stmts=items.map(x=>env.DB.prepare(`INSERT INTO quote_items(quote_id,item_type,item_ref,description,quantity,unit_price_cents,total_cents,sort_order) VALUES(?,?,?,?,?,?,?,?)`).bind(id,x.type,x.ref,x.description,x.quantity,x.unit,x.total,x.sort));if(stmts.length)await env.DB.batch(stmts);
+  const quote=await quoteDetailRow(env,id);quote.customerAddress=customer.address||'';quote.birth_date=pet.birth_date;
+  return ok({message:'Cotação enviada ao HLab Vet.',quote});
+}
+async function confirmPublicQuote(request,env,id){
+  const b=await safeBody(request)||{};
+  const q=await env.DB.prepare(`SELECT q.*,sc.name customer_name,sc.phone_display,sc.email,sc.address customer_address,sc.city customer_city,sc.state customer_state,sc.tutor_account_id,sp.name pet_name,sp.birth_date,sp.species,sp.breed,sp.sex FROM quotes q JOIN site_customers sc ON sc.id=q.site_customer_id JOIN site_pets sp ON sp.id=q.site_pet_id WHERE q.id=? AND q.source='online'`).bind(id).first();
+  if(!q)return err('Cotação não encontrada.',404);if(q.requisition_id)return err('Esta cotação já virou uma solicitação.',409);
+  const address=clampString(b.collectionAddress,300)||q.customer_address;if(!address)return err('Informe o endereço onde o material será coletado.');
+  const mapRaw=clampString(b.collectionMapUrl,800),collectionMapUrl=mapRaw?cleanMapsUrl(mapRaw):null;if(mapRaw&&!collectionMapUrl)return err('O link de localização deve ser um link válido do Google Maps.');
+  await env.DB.prepare(`UPDATE site_customers SET address=?,city=COALESCE(NULLIF(?,''),city),state=COALESCE(NULLIF(?,''),state),zip_code=COALESCE(NULLIF(?,''),zip_code),updated_at=? WHERE id=?`)
+    .bind(address,clampString(b.city,120)||'',clampString(b.state,30)||'',clampString(b.zipCode,20)||'',nowIso(),q.site_customer_id).run();
+  const items=(await env.DB.prepare(`SELECT * FROM quote_items WHERE quote_id=? ORDER BY sort_order,id`).bind(id).all()).results||[];
+  const examItems=items.filter(x=>x.item_type==='exam');if(!examItems.length)return err('Para solicitar coleta pelo site, o orçamento precisa ter pelo menos um exame.',409);
+  const walk=await walkInClientId(env),ts=nowIso(),tempProto=`TEMP-${crypto.randomUUID()}`,age=exactAgeText(q.birth_date,fortalezaToday());
+  const services=items.filter(x=>x.item_type==='service').map(x=>`${x.description}${Number(x.quantity)>1?` x${x.quantity}`:''}`);
+  const observations=services.length?`Serviços do orçamento: ${services.join(', ')}.`:null;
+  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,priority,clinic_name,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_address,collection_map_url,observations,request_kind,requested_by_user_id,requested_by_name,site_customer_id,site_pet_id,request_source) VALUES(?,?,'solicitado','normal',?,?,?,?,?,?,?,?,?,?,?,?, 'immediate',NULL,'Site HLab Vet',?,?, 'public_site')`)
+    .bind(tempProto,walk,'Cliente do site',q.customer_name,q.tutor_account_id||null,q.pet_name,q.species,q.breed,q.sex,q.birth_date,age,address,collectionMapUrl,observations,q.site_customer_id,q.site_pet_id).run();
+  const reqId=Number(ins.meta.last_row_id),proto=protocolCode(reqId,new Date()),statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,reqId)];
+  for(const item of examItems){const exam=await findCatalogExam(env,String(item.item_ref));statements.push(env.DB.prepare(`INSERT INTO requisition_exams(requisition_id,category,exam_code,exam_name,unit_price_cents,price_source) VALUES(?,?,?,?,?,?)`).bind(reqId,exam?.category||'Outros',String(item.item_ref||''),item.description,Number(item.unit_price_cents), 'quote'));}
+  statements.push(env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'solicitado',NULL,'Site HLab Vet',?,?)`).bind(reqId,JSON.stringify({message:'Cliente confirmou a cotação e solicitou a coleta pelo site.',quoteId:id,collectionAddress:address}),ts));
+  statements.push(env.DB.prepare(`UPDATE quotes SET requisition_id=?,lead_status='converted',contacted_at=COALESCE(contacted_at,?),contacted_by_name=COALESCE(contacted_by_name,'Site HLab Vet'),updated_at=? WHERE id=?`).bind(reqId,ts,ts,id));
+  await env.DB.batch(statements);
+  return ok({message:'Solicitação enviada ao laboratório.',id:reqId,protocol:proto,status:'solicitado'});
+}
+async function publicCustomerData(env,siteCustomerId){
+  const customer=await env.DB.prepare(`SELECT id,name,phone_display,email,address,city,state,zip_code,tutor_account_id,created_at,updated_at FROM site_customers WHERE id=?`).bind(siteCustomerId).first();if(!customer)return null;
+  const pets=(await env.DB.prepare(`SELECT id,name,birth_date,species,breed,sex,created_at,updated_at FROM site_pets WHERE site_customer_id=? ORDER BY name COLLATE NOCASE,id`).bind(siteCustomerId).all()).results||[];
+  const reqs=(await env.DB.prepare(`SELECT r.id,r.protocol,r.status,r.patient_name,r.birth_date,r.created_at,r.assigned_at,r.collected_at,r.lab_received_at,r.analysis_started_at,r.completed_at,r.cancellation_reason,q.id quote_id,q.quote_number,q.total_cents FROM requisitions r LEFT JOIN quotes q ON q.requisition_id=r.id WHERE r.site_customer_id=? ORDER BY r.created_at DESC,r.id DESC LIMIT 100`).bind(siteCustomerId).all()).results||[];
+  const files=(await env.DB.prepare(`SELECT rf.id,rf.requisition_id,rf.original_name,rf.mime_type,rf.size_bytes,rf.created_at FROM result_files rf JOIN requisitions r ON r.id=rf.requisition_id WHERE r.site_customer_id=? AND r.status<>'cancelado' ORDER BY rf.created_at DESC,rf.id DESC`).bind(siteCustomerId).all()).results||[];
+  const fileMap=new Map();for(const f of files){if(!fileMap.has(Number(f.requisition_id)))fileMap.set(Number(f.requisition_id),[]);fileMap.get(Number(f.requisition_id)).push(f);}
+  return {customer,pets,requests:reqs.map(r=>({...r,status_label:statusLabel(r.status),files:fileMap.get(Number(r.id))||[]}))};
+}
+async function publicCustomerLookup(request,env,url){
+  const b=await safeBody(request)||{},phoneKey=normalizePublicPhone(b.phone);if(!validPublicPhone(phoneKey))return err('Informe um WhatsApp válido com DDD.');
+  const customer=await env.DB.prepare('SELECT * FROM site_customers WHERE phone_key=?').bind(phoneKey).first();if(!customer)return err('Não encontramos solicitações para esse telefone.',404);
+  const sess=await createPublicCustomerSession(env,customer.id),data=await publicCustomerData(env,customer.id);
+  return json({ok:true,...data},200,{'set-cookie':publicCustomerSessionCookie(sess.token,sess.expires,url.protocol==='https:'),'cache-control':'no-store'});
+}
+async function publicCustomerStatus(request,env){
+  const customer=await publicCustomerFromRequest(request,env);if(!customer)return err('Digite novamente seu telefone para consultar.',401);
+  const data=await publicCustomerData(env,customer.id);return json({ok:true,...data},200,{'cache-control':'no-store'});
+}
+async function publicDownloadResult(request,env,fileId,inline=false){
+  const customer=await publicCustomerFromRequest(request,env);if(!customer)return err('Acesso expirado. Consulte novamente usando seu telefone.',401);
+  const f=await env.DB.prepare(`SELECT rf.*,r.site_customer_id,r.status FROM result_files rf JOIN requisitions r ON r.id=rf.requisition_id WHERE rf.id=?`).bind(fileId).first();
+  if(!f||Number(f.site_customer_id)!==Number(customer.id)||f.status==='cancelado')return err('Resultado não encontrado para este acesso.',404);
+  const obj=await env.FILES.get(f.r2_key);if(!obj)return err('Arquivo não encontrado no armazenamento.',404);
+  const h=new Headers();obj.writeHttpMetadata(h);if(!h.get('content-type'))h.set('content-type',f.mime_type||'application/octet-stream');h.set('content-disposition',`${inline?'inline':'attachment'}; filename*=UTF-8''${encodeURIComponent(f.original_name)}`);h.set('cache-control','private, no-store');h.set('x-content-type-options','nosniff');return new Response(obj.body,{headers:h});
+}
+async function listSiteCustomers(env,url){
+  const q=String(url.searchParams.get('q')||'').trim();let sql=`SELECT sc.*,COUNT(DISTINCT sp.id) pet_count,COUNT(DISTINCT r.id) request_count,MAX(r.created_at) last_request_at FROM site_customers sc LEFT JOIN site_pets sp ON sp.site_customer_id=sc.id LEFT JOIN requisitions r ON r.site_customer_id=sc.id WHERE 1=1`;const p=[];
+  if(q){sql+=` AND (sc.name LIKE ? OR sc.phone_display LIKE ? OR sc.email LIKE ? OR sc.address LIKE ?)`;p.push(...Array(4).fill(`%${q}%`));}
+  sql+=` GROUP BY sc.id ORDER BY COALESCE(last_request_at,sc.updated_at) DESC LIMIT 300`;const rows=await env.DB.prepare(sql).bind(...p).all();return ok({customers:rows.results||[]});
+}
+async function getSiteCustomer(env,id){const data=await publicCustomerData(env,id);if(!data)return err('Cliente do site não encontrado.',404);return ok(data);}
+async function updateSiteCustomer(request,env,user,id){
+  const b=await safeBody(request)||{},row=await env.DB.prepare('SELECT * FROM site_customers WHERE id=?').bind(id).first();if(!row)return err('Cliente do site não encontrado.',404);
+  const phoneDisplay=clampString(b.phone??row.phone_display,40),phoneKey=normalizePublicPhone(phoneDisplay);if(!validPublicPhone(phoneKey))return err('Informe um telefone válido com DDD.');const dup=await env.DB.prepare('SELECT id FROM site_customers WHERE phone_key=? AND id<>?').bind(phoneKey,id).first();if(dup)return err('Esse telefone já pertence a outro cadastro do site.',409);
+  await env.DB.prepare(`UPDATE site_customers SET name=?,phone_key=?,phone_display=?,email=?,address=?,city=?,state=?,zip_code=?,updated_at=? WHERE id=?`).bind(clampString(b.name??row.name,180)||row.name,phoneKey,phoneDisplay,clampString(b.email??row.email,200),clampString(b.address??row.address,300),clampString(b.city??row.city,120),clampString(b.state??row.state,30)||'RN',clampString(b.zipCode??row.zip_code,20),nowIso(),id).run();await audit(env,user,'editou_cliente_site','site_customer',id);return ok({message:'Cadastro do cliente atualizado.'});
+}
+async function grantSiteCustomerPanel(request,env,user,id){
+  const b=await safeBody(request)||{},username=clampString(b.username,120),password=String(b.password||'');if(!username||password.length<8)return err('Informe usuário e senha temporária com pelo menos 8 caracteres.');
+  const sc=await env.DB.prepare('SELECT * FROM site_customers WHERE id=?').bind(id).first();if(!sc)return err('Cliente do site não encontrado.',404);if(sc.tutor_account_id)return err('Este cliente já possui painel liberado.',409);
+  const key=normalizeUsername(username);await clearReusableOrphanUsername(env,key);if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse nome de usuário já existe.',409);
+  const {hash,salt}=await hashPassword(password),walk=await walkInClientId(env),ts=nowIso();const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('client',?,?,?,?,1,1)`).bind(username,key,hash,salt).run();
+  const t=await env.DB.prepare(`INSERT INTO tutors(client_id,user_id,name,phone,email,active,created_at,updated_at) VALUES(?,?,?,?,?,1,?,?)`).bind(walk,u.meta.last_row_id,sc.name,sc.phone_display,sc.email,ts,ts).run();const tutorId=Number(t.meta.last_row_id);
+  await env.DB.batch([env.DB.prepare('UPDATE site_customers SET tutor_account_id=?,updated_at=? WHERE id=?').bind(tutorId,ts,id),env.DB.prepare('UPDATE requisitions SET tutor_account_id=? WHERE site_customer_id=?').bind(tutorId,id)]);await audit(env,user,'liberou_painel_cliente_site','site_customer',id,{username,tutorId});return ok({message:'Painel liberado. O cliente deverá trocar a senha no primeiro acesso.',username,tutorId});
 }
 async function updateQuoteLeadStatus(request,env,user,id){
   if(!(await canMakeQuote(env,user)))return err('Sem permissão.',403);const q=await env.DB.prepare('SELECT id,source FROM quotes WHERE id=?').bind(id).first();if(!q)return err('Orçamento não encontrado.',404);if(q.source!=='online')return err('Este orçamento não veio do site.');const b=await safeBody(request)||{},status=String(b.status||'');if(!['new','contacted','converted','closed'].includes(status))return err('Status inválido.');const contacted=status==='contacted'||status==='converted';await env.DB.prepare(`UPDATE quotes SET lead_status=?,contacted_at=CASE WHEN ?=1 THEN COALESCE(contacted_at,?) ELSE contacted_at END,contacted_by_name=CASE WHEN ?=1 THEN COALESCE(contacted_by_name,?) ELSE contacted_by_name END,updated_at=? WHERE id=?`).bind(status,contacted?1:0,nowIso(),contacted?1:0,user.username_display,nowIso(),id).run();await audit(env,user,'alterou_status_orcamento_online','quote',id,{status});return ok({message:'Status do orçamento online atualizado.'});
@@ -1945,7 +2092,8 @@ async function quoteDetailRow(env,id){
     SELECT q.id,q.quote_number,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,
            q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.status,q.total_cents,q.notes,q.valid_until,
-           q.source,q.lead_status,q.lead_email,q.contacted_at,q.contacted_by_name,
+           q.source,q.lead_status,q.lead_email,q.contacted_at,q.contacted_by_name,q.site_customer_id,q.site_pet_id,
+           sc.address site_customer_address,sc.city site_customer_city,sc.state site_customer_state,sc.zip_code site_customer_zip,sc.tutor_account_id site_tutor_account_id,sp.birth_date patient_birth_date,
            q.created_by_user_id,q.created_by_name,q.created_at,q.updated_at,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.legal_name END legal_name,
@@ -1956,7 +2104,9 @@ async function quoteDetailRow(env,id){
            CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.state END client_state,
            r.protocol requisition_protocol
     FROM quotes q JOIN clients c ON c.id=q.client_id
-    LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE q.id=?
+    LEFT JOIN requisitions r ON r.id=q.requisition_id
+    LEFT JOIN site_customers sc ON sc.id=q.site_customer_id
+    LEFT JOIN site_pets sp ON sp.id=q.site_pet_id WHERE q.id=?
   `).bind(id).first();
   if(!q)return null;
   const items=await env.DB.prepare(`SELECT id,item_type,item_ref,description,quantity,unit_price_cents,total_cents,sort_order FROM quote_items WHERE quote_id=? ORDER BY sort_order,id`).bind(id).all();
@@ -1975,7 +2125,7 @@ async function listQuotes(env,user,url){
   if(!(await canMakeQuote(env,user)))return err('Sem acesso a orçamentos.',403);
   const clientId=quoteAccessClientId(user,Number(url.searchParams.get('clientId')||0)),reqId=Number(url.searchParams.get('requisitionId')||0);
   const source=String(url.searchParams.get('source')||''),leadStatus=String(url.searchParams.get('leadStatus')||''),from=clampString(url.searchParams.get('from'),20),to=clampString(url.searchParams.get('to'),20);
-  let sql=`SELECT q.id,q.quote_number,CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.lead_email,q.total_cents,q.status,q.source,q.lead_status,q.contacted_at,q.contacted_by_name,q.valid_until,q.created_at,q.updated_at,CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE 1=1`;
+  let sql=`SELECT q.id,q.quote_number,CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.lead_email,q.total_cents,q.status,q.source,q.lead_status,q.contacted_at,q.contacted_by_name,q.valid_until,q.created_at,q.updated_at,q.site_customer_id,q.site_pet_id,sc.address site_customer_address,sc.tutor_account_id site_tutor_account_id,sp.birth_date patient_birth_date,CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id LEFT JOIN site_customers sc ON sc.id=q.site_customer_id LEFT JOIN site_pets sp ON sp.id=q.site_pet_id WHERE 1=1`;
   const p=[];
   if(user.role==='client'){sql+=' AND q.client_id=?';p.push(Number(user.client_id));}
   else if(clientId){sql+=' AND q.client_id=?';p.push(clientId);}
@@ -2124,7 +2274,7 @@ async function financeReport(env,url){
 
 async function listCancellations(env,url){
   const from=url.searchParams.get('from'),to=url.searchParams.get('to'),clientId=Number(url.searchParams.get('clientId')||0);
-  let sql=`SELECT r.id,r.protocol,r.patient_name,r.cancelled_at,r.cancelled_by_name,r.cancelled_by_role,r.cancellation_reason,r.created_at,c.name client_name FROM requisitions r JOIN clients c ON c.id=r.client_id WHERE r.status='cancelado'`;
+  let sql=`SELECT r.id,r.protocol,r.patient_name,r.cancelled_at,r.cancelled_by_name,r.cancelled_by_role,r.cancellation_reason,r.created_at,CASE WHEN r.request_source='public_site' THEN COALESCE(sc.name,r.tutor_name,'Cliente do site') ELSE c.name END client_name FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN site_customers sc ON sc.id=r.site_customer_id WHERE r.status='cancelado'`;
   const p=[];
   if(from){sql+=` AND date(datetime(r.cancelled_at,'-3 hours'))>=date(?)`;p.push(from);}if(to){sql+=` AND date(datetime(r.cancelled_at,'-3 hours'))<=date(?)`;p.push(to);}if(clientId){sql+=' AND r.client_id=?';p.push(clientId);}sql+=' ORDER BY r.cancelled_at DESC LIMIT 1000';
   const rows=await env.DB.prepare(sql).bind(...p).all();return ok({cancellations:rows.results||[]});
@@ -2234,7 +2384,7 @@ async function courierTaskApi(request,env,url,courier,rest){
   const method=request.method.toUpperCase();
   if((rest===''||rest==='tasks')&&method==='GET'){
     const from=url.searchParams.get('from'),to=url.searchParams.get('to'),tab=url.searchParams.get('tab')||'pending';
-    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.courier_accepted_at,r.courier_accepted_name,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,r.payment_status,r.payment_method,r.payment_installments,r.payment_amount_cents,COALESCE(NULLIF(r.collection_map_url,''),c.map_url) map_url,c.name client_name,c.address,c.city,c.state,c.phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
+    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.courier_accepted_at,r.courier_accepted_name,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,r.payment_status,r.payment_method,r.payment_installments,r.payment_amount_cents,COALESCE(NULLIF(r.collection_map_url,''),c.map_url) map_url,CASE WHEN r.request_source='public_site' THEN COALESCE(NULLIF(r.tutor_name,''),'Cliente do site') ELSE c.name END client_name,COALESCE(NULLIF(r.collection_address,''),sc.address,c.address) address,COALESCE(sc.city,c.city) city,COALESCE(sc.state,c.state) state,COALESCE(sc.phone_display,c.phone) phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN site_customers sc ON sc.id=r.site_customer_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
     const p=[courier.id];
     if(tab==='collected')sql+=` AND r.status IN ('coletado','recebido','em_analise','concluido')`;else sql+=` AND r.status='atribuido'`;
     if(from){sql+=' AND date(COALESCE(r.collected_at,r.assigned_at,r.created_at))>=date(?)';p.push(from);}
@@ -2262,7 +2412,7 @@ async function courierTaskApi(request,env,url,courier,rest){
   if(m&&method==='POST'){
     const id=Number(m[1]),b=await safeBody(request),temp=parseNumber(b?.temperature);
     if(temp==null)return err('Informe a temperatura da coleta.');
-    const r=await env.DB.prepare(`SELECT r.*,c.name client_name,c.address,c.city,c.state,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=? AND r.assigned_courier_id=?`).bind(id,courier.id).first();
+    const r=await env.DB.prepare(`SELECT r.*,CASE WHEN r.request_source='public_site' THEN COALESCE(NULLIF(r.tutor_name,''),'Cliente do site') ELSE c.name END client_name,COALESCE(NULLIF(r.collection_address,''),sc.address,c.address) address,COALESCE(sc.city,c.city) city,COALESCE(sc.state,c.state) state,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN site_customers sc ON sc.id=r.site_customer_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.id=? AND r.assigned_courier_id=?`).bind(id,courier.id).first();
     if(!r)return err('Coleta não encontrada para este entregador.',404);
     if(r.status!=='atribuido')return err('Essa coleta já foi movimentada ou não está mais pendente.');
     if(!r.courier_accepted_at)return err('Aceite a coleta antes de registrar a retirada.',409);
