@@ -40,6 +40,49 @@ function exactAgeText(birthDate,referenceDate){
   return `${parts[0]}, ${parts[1]} e ${parts[2]}`;
 }
 
+
+function cleanMapsUrl(value){
+  const raw=String(value||'').trim();if(!raw)return null;
+  try{
+    const u=new URL(raw);const host=u.hostname.toLowerCase();
+    const allowed=host==='maps.app.goo.gl'||host==='goo.gl'||host.endsWith('.google.com')||host==='google.com'||host.endsWith('.google.com.br')||host==='google.com.br';
+    if(!allowed)return null;
+    return u.toString();
+  }catch{return null;}
+}
+
+async function catalogWithCustom(env){
+  const groups=catalogWithCodes().map(g=>({category:g.category,items:g.items.map(x=>({...x}))}));
+  let rows=[];try{const r=await env.DB.prepare(`SELECT exam_code,exam_name FROM custom_exams WHERE active=1 ORDER BY exam_name COLLATE NOCASE`).all();rows=r.results||[]}catch{}
+  if(rows.length){let other=groups.find(g=>String(g.category).toLowerCase()==='outros');if(!other){other={category:'Outros',items:[]};groups.push(other)}
+    const known=new Set(groups.flatMap(g=>g.items.map(x=>x.code)));
+    for(const x of rows)if(!known.has(x.exam_code))other.items.push({code:x.exam_code,name:x.exam_name});
+  }
+  return groups;
+}
+async function findCatalogExam(env,code){for(const g of await catalogWithCustom(env)){const e=g.items.find(x=>x.code===code);if(e)return {...e,category:g.category}}return null;}
+
+async function internalPermissions(env,user){
+  if(user?.role==='admin')return {can_view_prices:1,can_make_quotes:1,can_manage_payments:1,can_manage_prices:1,profile_type:'admin'};
+  if(user?.role!=='staff')return null;
+  try{return await env.DB.prepare(`SELECT profile_type,can_view_prices,can_make_quotes,can_manage_payments,can_manage_prices FROM receivers WHERE user_id=? AND active=1`).bind(user.id).first()}catch{return {profile_type:'technician',can_view_prices:1,can_make_quotes:1,can_manage_payments:1,can_manage_prices:0}}
+}
+async function requireInternalPermission(env,user,field,fn){const p=await internalPermissions(env,user);return p&&Number(p[field])===1?fn():err('Seu acesso não possui esta permissão.',403);}
+async function canMakeQuote(env,user){if(user?.role==='client')return true;const p=await internalPermissions(env,user);return !!(p&&Number(p.can_make_quotes)===1)}
+
+async function clearReusableOrphanUsername(env,key){
+  const u=await env.DB.prepare(`SELECT id,role,username_key FROM users WHERE username_key=?`).bind(key).first();if(!u||u.username_key==='hlabvet'||u.username_key==='__hlabvet_walkin__'||u.role==='admin')return false;
+  const refs=await Promise.all([
+    env.DB.prepare('SELECT id FROM clients WHERE user_id=? LIMIT 1').bind(u.id).first(),
+    env.DB.prepare('SELECT id FROM client_members WHERE user_id=? LIMIT 1').bind(u.id).first(),
+    env.DB.prepare('SELECT id FROM tutors WHERE user_id=? LIMIT 1').bind(u.id).first(),
+    env.DB.prepare('SELECT id FROM receivers WHERE user_id=? LIMIT 1').bind(u.id).first()
+  ]);
+  if(refs.some(Boolean))return false;
+  await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(u.id).run();
+  await env.DB.prepare('DELETE FROM users WHERE id=?').bind(u.id).run();return true;
+}
+
 export default {
   async fetch(request, env) {
     const url = new URL(request.url);
@@ -66,7 +109,9 @@ async function api(request, env, url) {
   const method = request.method.toUpperCase();
 
   if (path === '/api/health') return ok({ app: env.APP_NAME || 'HLab Vet Resultados', time: nowIso() });
-  if (path === '/api/catalog' && method === 'GET') return ok({ exams: catalogWithCodes(), materials: MATERIALS });
+  if (path === '/api/catalog' && method === 'GET') return ok({ exams: await catalogWithCustom(env), materials: MATERIALS });
+  if (path === '/api/public/quote-site' && method === 'GET') return publicQuoteSite(env);
+  if (path === '/api/public/quote-catalog' && method === 'GET') return publicQuoteCatalog(env);
   // Painel do proprietário: autenticação e rotas totalmente separadas do laboratório.
   if (path === '/api/owner/login' && method === 'POST') return ownerLogin(request, env, url);
   if (path === '/api/owner/logout' && method === 'POST') return ownerLogout(request, env, url);
@@ -201,20 +246,25 @@ async function api(request, env, url) {
   if (path === '/api/temperature-sheet' && method === 'GET') return requireAdmin(user, () => temperatureSheet(env, user, url));
   if (path === '/api/cancellations' && method === 'GET') return requireAdmin(user, () => listCancellations(env, url));
 
-  // Orçamentos e serviços: valores ficam visíveis apenas ao administrador ou ao próprio cliente.
-  if (path === '/api/services' && method === 'GET') return requireAdminOnly(user, () => listServices(env, false));
-  if (path === '/api/services' && method === 'POST') return requireAdminOnly(user, () => createService(request, env, user));
+  // Comercial: técnico/vendedor pode receber permissões individuais do administrador.
+  if (path === '/api/services' && method === 'GET') return requireInternalPermission(env,user,'can_view_prices', () => listServices(env, false));
+  if (path === '/api/services' && method === 'POST') return requireInternalPermission(env,user,'can_manage_prices', () => createService(request, env, user));
   m = path.match(/^\/api\/services\/(\d+)$/);
-  if (m && method === 'PATCH') return requireAdminOnly(user, () => updateService(request, env, user, Number(m[1])));
+  if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_manage_prices', () => updateService(request, env, user, Number(m[1])));
+  if (path === '/api/quote-site/settings' && method === 'GET') return requireAdminOnly(user, () => quoteSiteSettings(env));
+  if (path === '/api/quote-site/settings' && method === 'PUT') return requireAdminOnly(user, () => updateQuoteSiteSettings(request,env,user));
+  if (path === '/api/custom-exams' && method === 'POST') return requireInternalPermission(env,user,'can_manage_prices', () => createCustomExam(request,env,user));
+  m = path.match(/^\/api\/custom-exams\/(\d+)$/);
+  if (m && method === 'PATCH') return requireInternalPermission(env,user,'can_manage_prices', () => updateCustomExam(request,env,user,Number(m[1])));
   if (path === '/api/quotes/catalog' && method === 'GET') return quoteCatalog(env, user, url);
   if (path === '/api/quotes' && method === 'GET') return listQuotes(env, user, url);
   if (path === '/api/quotes' && method === 'POST') return saveQuote(request, env, user);
   m = path.match(/^\/api\/quotes\/(\d+)$/);
   if (m && method === 'GET') return getQuote(env, user, Number(m[1]));
 
-  if (path === '/api/prices' && method === 'GET') return requireAdminOnly(user, () => listPrices(env, url));
-  if (path === '/api/prices/general' && method === 'POST') return requireAdminOnly(user, () => setGeneralPrice(request, env, user));
-  if (path === '/api/prices/client' && method === 'POST') return requireAdminOnly(user, () => setClientPrice(request, env, user));
+  if (path === '/api/prices' && method === 'GET') return requireInternalPermission(env,user,'can_view_prices', () => listPrices(env, url));
+  if (path === '/api/prices/general' && method === 'POST') return requireInternalPermission(env,user,'can_manage_prices', () => setGeneralPrice(request, env, user));
+  if (path === '/api/prices/client' && method === 'POST') return requireInternalPermission(env,user,'can_manage_prices', () => setClientPrice(request, env, user));
   if (path === '/api/finance/clients' && method === 'GET') return requireAdminOnly(user, () => financeClients(env, url));
   if (path === '/api/finance/report' && method === 'GET') return requireAdminOnly(user, () => financeReport(env, url));
   if (path === '/api/audit' && method === 'GET') return requireAdminOnly(user, () => listAudit(env, url));
@@ -338,7 +388,7 @@ async function ownerDashboard(request, env, url) {
   await env.DB.prepare('SELECT 1 AS ok').first();
   const dbLatencyMs=Math.max(0,Math.round((performance.now()-t0)*10)/10);
   const [clients,activeClients,requests,exams,results,tutors,couriers,staff,dbBytes,r2]=await Promise.all([
-    env.DB.prepare(`SELECT COUNT(*) n,SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) active_n FROM clients`).first(),
+    env.DB.prepare(`SELECT COUNT(*) n,SUM(CASE WHEN active=1 THEN 1 ELSE 0 END) active_n FROM clients WHERE COALESCE(is_system,0)=0`).first(),
     env.DB.prepare(`SELECT COUNT(DISTINCT client_id) n FROM requisitions WHERE status<>'cancelado' AND strftime('%Y-%m',datetime(created_at,'-3 hours'))=?`).bind(month).first(),
     env.DB.prepare(`SELECT COUNT(*) n FROM requisitions WHERE status<>'cancelado' AND strftime('%Y-%m',datetime(created_at,'-3 hours'))=?`).bind(month).first(),
     env.DB.prepare(`SELECT COUNT(*) n FROM requisition_exams e JOIN requisitions r ON r.id=e.requisition_id WHERE r.status<>'cancelado' AND strftime('%Y-%m',datetime(r.created_at,'-3 hours'))=?`).bind(month).first(),
@@ -422,7 +472,12 @@ async function ownerLogicalSnapshot(env) {
     client_exam_prices:`SELECT * FROM client_exam_prices ORDER BY id`,
     exam_turnaround_settings:`SELECT * FROM exam_turnaround_settings ORDER BY exam_name`,
     lab_timing_settings:`SELECT * FROM lab_timing_settings ORDER BY id`,
-    lab_alerts:`SELECT * FROM lab_alerts ORDER BY id`
+    lab_alerts:`SELECT * FROM lab_alerts ORDER BY id`,
+    custom_exams:`SELECT * FROM custom_exams ORDER BY id`,
+    service_prices:`SELECT * FROM service_prices ORDER BY id`,
+    quotes:`SELECT * FROM quotes ORDER BY id`,
+    quote_items:`SELECT * FROM quote_items ORDER BY id`,
+    quote_site_settings:`SELECT * FROM quote_site_settings ORDER BY id`
   };
   for(const [name,sql] of Object.entries(specs)){
     try{const r=await env.DB.prepare(sql).all();tables[name]=r.results||[];}catch{tables[name]=[];}
@@ -490,7 +545,7 @@ async function ownerExportZip(request, env, url) {
   const snap=await ownerLogicalSnapshot(env),entries=[];
   entries.push({name:'00_LEIA-ME.txt',data:`Exportação HLabVet\nGerada em: ${snap.createdAt}\nContém dados operacionais em CSV/JSON e arquivos de resultados encontrados no R2.\nSenhas, hashes e sessões não são exportados.\n`});
   entries.push({name:'01_DADOS/dados_completos.json',data:JSON.stringify(snap,null,2)});
-  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',result_analyses:'analises_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',exam_turnaround_settings:'tempos_por_exame',lab_timing_settings:'configuracao_tempo_exames',lab_alerts:'alertas_cancelamentos'};
+  const map={clients:'clientes',client_members:'usuarios_clientes',tutors:'tutores',couriers:'entregadores',receivers:'tecnicos_laboratorio',requisitions:'solicitacoes',requisition_exams:'exames_solicitados',requisition_materials:'materiais',status_events:'historico_status',result_files:'indice_resultados',result_analyses:'analises_resultados',exam_prices:'precos_gerais',client_exam_prices:'precos_por_cliente',exam_turnaround_settings:'tempos_por_exame',lab_timing_settings:'configuracao_tempo_exames',lab_alerts:'alertas_cancelamentos',custom_exams:'exames_outros',service_prices:'servicos',quotes:'orcamentos',quote_items:'itens_orcamentos',quote_site_settings:'configuracao_site_orcamento'};
   for(const [table,filename] of Object.entries(map))entries.push({name:`01_DADOS/${filename}.csv`,data:rowsToCsv(snap.tables[table]||[])});
   let total=entries.reduce((n,e)=>n+(typeof e.data==='string'?new TextEncoder().encode(e.data).length:e.data.length),0);
   const maxBytes=80*1024*1024;
@@ -528,11 +583,15 @@ async function ownerResetSystem(request, env) {
   if(!dbOwner||!await verifyPassword(String(body?.password||''),dbOwner.password_hash,dbOwner.password_salt))return err('Senha do proprietário incorreta.',401);
   const deletedFiles=await ownerDeleteAllR2(env);
   const stmts=[
+    'DELETE FROM quote_items','DELETE FROM quotes','DELETE FROM service_prices','DELETE FROM custom_exams',
+    'UPDATE quote_site_settings SET enabled=0,show_prices=1,show_services=1,whatsapp_phone=NULL,updated_at=CURRENT_TIMESTAMP WHERE id=1',
     'DELETE FROM lab_alerts','DELETE FROM result_analyses','DELETE FROM result_files','DELETE FROM status_events','DELETE FROM requisition_materials','DELETE FROM requisition_exams','DELETE FROM requisitions',
     'DELETE FROM client_exam_prices','DELETE FROM exam_prices','DELETE FROM exam_turnaround_settings','DELETE FROM lab_timing_settings','INSERT INTO lab_timing_settings(id,default_turnaround_minutes,warning_minutes) VALUES(1,1440,10)','DELETE FROM tutors','DELETE FROM client_members','DELETE FROM clients',
     'DELETE FROM courier_sessions','DELETE FROM courier_accounts','DELETE FROM couriers','DELETE FROM receivers','DELETE FROM sessions','DELETE FROM audit_log',
-    `DELETE FROM users WHERE username_key<>'hlabvet'`,
+    `DELETE FROM users WHERE username_key NOT IN ('hlabvet','__hlabvet_walkin__')`,
     `UPDATE users SET role='admin',username_display='HLabVet',username_key='hlabvet',password_hash='TwP_yjkuugIsPRV71Z4e0rVeTcmPgXU7YImyBgrCPLI',password_salt='pinBnr9TtE24ToDkIXYa6g',force_password_change=1,active=1,updated_at=CURRENT_TIMESTAMP WHERE username_key='hlabvet'`,
+    `UPDATE users SET role='client',username_display='HLabVet Avulso',password_hash='DISABLED',password_salt='DISABLED',force_password_change=0,active=0,updated_at=CURRENT_TIMESTAMP WHERE username_key='__hlabvet_walkin__'`,
+    `INSERT INTO clients(user_id,name,active,is_system) SELECT id,'Cliente avulso',1,1 FROM users WHERE username_key='__hlabvet_walkin__'`,
     'DELETE FROM owner_backup_log'
   ].map(sql=>env.DB.prepare(sql));
   await env.DB.batch(stmts);
@@ -590,10 +649,10 @@ async function me(env, user) {
   let clientMember = null;
   let tutorProfile = null;
   if (user.role === 'client') {
-    profile = await env.DB.prepare(`SELECT id,name,legal_name,document,phone,email,address,city,state,zip_code,active FROM clients WHERE id=?`).bind(user.client_id).first();
+    profile = await env.DB.prepare(`SELECT id,name,legal_name,document,phone,email,address,city,state,zip_code,map_url,active FROM clients WHERE id=?`).bind(user.client_id).first();
     clientMember = await env.DB.prepare(`SELECT id,name,can_manage_users,is_technician,function_title,council_name,council_number,council_state,stamp_color,active FROM client_members WHERE user_id=?`).bind(user.id).first();
   } else if (user.role === 'staff') {
-    technician = await env.DB.prepare(`SELECT id,name,location,active FROM receivers WHERE user_id=?`).bind(user.id).first();
+    technician = await env.DB.prepare(`SELECT id,name,location,profile_type,can_view_prices,can_make_quotes,can_manage_payments,can_manage_prices,active FROM receivers WHERE user_id=?`).bind(user.id).first();
   } else if (user.role === 'tutor') {
     tutorProfile = await env.DB.prepare(`SELECT t.id,t.client_id,t.name,t.document,t.phone,t.email,t.active,c.name AS client_name FROM tutors t JOIN clients c ON c.id=t.client_id WHERE t.id=?`).bind(user.tutor_id).first();
   }
@@ -608,6 +667,7 @@ async function me(env, user) {
     clientCouncilNumber: clientMember?.council_number || user.council_number || null,
     clientCouncilState: clientMember?.council_state || user.council_state || null,
     technicianId: technician?.id || null, technicianName: technician?.name || null, technicianLocation: technician?.location || null,
+    internalProfileType: technician?.profile_type || (user.role==='staff'?'technician':null), canViewPrices: user.role==='admin'||!!technician?.can_view_prices, canMakeQuotes: user.role==='admin'||!!technician?.can_make_quotes, canManagePayments: user.role==='admin'||!!technician?.can_manage_payments, canManagePrices: user.role==='admin'||!!technician?.can_manage_prices,
     tutorId: tutorProfile?.id || user.tutor_id || null, tutorName: tutorProfile?.name || user.tutor_name || null,
     tutorClientId: tutorProfile?.client_id || user.tutor_client_id || null, tutorClientName: tutorProfile?.client_name || null
   }, profile, clientMember, tutorProfile });
@@ -724,7 +784,7 @@ async function acknowledgeAlert(env,user,id){
 async function listClients(env, url) {
   const q = (url.searchParams.get('q') || '').trim();
   const active = url.searchParams.get('active');
-  let sql = `SELECT c.*,u.username_display,u.force_password_change,u.active AS user_active FROM clients c JOIN users u ON u.id=c.user_id WHERE 1=1`;
+  let sql = `SELECT c.*,u.username_display,u.force_password_change,u.active AS user_active FROM clients c JOIN users u ON u.id=c.user_id WHERE COALESCE(c.is_system,0)=0`;
   const params = [];
   if (q) { sql += ` AND (c.name LIKE ? OR c.legal_name LIKE ? OR c.document LIKE ? OR u.username_display LIKE ?)`; params.push(...Array(4).fill(`%${q}%`)); }
   if (active === '1' || active === '0') { sql += ` AND c.active=?`; params.push(Number(active)); }
@@ -738,14 +798,16 @@ async function createClient(request, env, admin) {
   const name = clampString(b?.name, 200), username = clampString(b?.username, 120), password = String(b?.password || '');
   if (!name || !username || password.length < 8) return err('Nome, usuário e senha inicial (mínimo 8 caracteres) são obrigatórios.');
   const key = normalizeUsername(username);
+  await clearReusableOrphanUsername(env,key);
   const exists = await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first();
   if (exists) return err('Esse nome de usuário já existe, inclusive desconsiderando maiúsculas/minúsculas e acentos.', 409);
   const { hash, salt } = await hashPassword(password);
   const u = await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('client',?,?,?,?,1,1)`)
     .bind(username, key, hash, salt).run();
   const userId = u.meta.last_row_id;
-  const c = await env.DB.prepare(`INSERT INTO clients(user_id,name,legal_name,document,phone,email,address,city,state,zip_code,stamp_name,stamp_line2,stamp_line3,stamp_line4,stamp_color) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .bind(userId,name,clampString(b.legalName,200),clampString(b.document,50),clampString(b.phone,40),clampString(b.email,200),clampString(b.address,300),clampString(b.city,120),clampString(b.state,30)||'RN',clampString(b.zipCode,20),null,null,null,null,'#5c2a72').run();
+  const mapUrlRaw=clampString(b.mapUrl,800),mapUrl=mapUrlRaw?cleanMapsUrl(mapUrlRaw):null;if(mapUrlRaw&&!mapUrl)return err('A localização deve ser um link válido do Google Maps.');
+  const c = await env.DB.prepare(`INSERT INTO clients(user_id,name,legal_name,document,phone,email,address,city,state,zip_code,map_url,stamp_name,stamp_line2,stamp_line3,stamp_line4,stamp_color) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(userId,name,clampString(b.legalName,200),clampString(b.document,50),clampString(b.phone,40),clampString(b.email,200),clampString(b.address,300),clampString(b.city,120),clampString(b.state,30)||'RN',clampString(b.zipCode,20),mapUrl,null,null,null,null,'#5c2a72').run();
   await env.DB.prepare(`INSERT INTO client_members(client_id,user_id,name,can_manage_users,is_technician,council_name,council_state,active) VALUES(?,?,?,1,0,'CRMV',?,1)`)
     .bind(c.meta.last_row_id,userId,name,clampString(b.state,30)||'RN').run();
   await audit(env, admin, 'criou_cliente', 'client', c.meta.last_row_id, { name, username });
@@ -761,10 +823,13 @@ async function updateClient(request, env, admin, id) {
   const dup = await env.DB.prepare('SELECT id FROM users WHERE username_key=? AND id<>?').bind(key,current.user_id).first();
   if (dup) return err('Esse nome de usuário já está em uso.',409);
   const active = b.active == null ? current.active : boolInt(b.active);
+  const mapUrlRaw=b.mapUrl===undefined?String(current.map_url||'').trim():String(b.mapUrl||'').trim();
+  const mapUrl=mapUrlRaw?cleanMapsUrl(mapUrlRaw):null;
+  if(mapUrlRaw&&!mapUrl)return err('A localização deve ser um link válido do Google Maps.');
   await env.DB.batch([
     env.DB.prepare(`UPDATE users SET username_display=?,username_key=?,active=?,updated_at=? WHERE id=?`).bind(username,key,active,nowIso(),current.user_id),
-    env.DB.prepare(`UPDATE clients SET name=?,legal_name=?,document=?,phone=?,email=?,address=?,city=?,state=?,zip_code=?,stamp_name=?,stamp_line2=?,stamp_line3=?,stamp_line4=?,stamp_color=?,active=?,updated_at=? WHERE id=?`)
-      .bind(clampString(b.name ?? current.name,200),clampString(b.legalName ?? current.legal_name,200),clampString(b.document ?? current.document,50),clampString(b.phone ?? current.phone,40),clampString(b.email ?? current.email,200),clampString(b.address ?? current.address,300),clampString(b.city ?? current.city,120),clampString(b.state ?? current.state,30),clampString(b.zipCode ?? current.zip_code,20),clampString(b.stampName ?? current.stamp_name,120),clampString(b.stampLine2 ?? current.stamp_line2,120),clampString(b.stampLine3 ?? current.stamp_line3,120),clampString(b.stampLine4 ?? current.stamp_line4,120),clampString(b.stampColor ?? current.stamp_color,20)||'#5c2a72',active,nowIso(),id)
+    env.DB.prepare(`UPDATE clients SET name=?,legal_name=?,document=?,phone=?,email=?,address=?,city=?,state=?,zip_code=?,map_url=?,stamp_name=?,stamp_line2=?,stamp_line3=?,stamp_line4=?,stamp_color=?,active=?,updated_at=? WHERE id=?`)
+      .bind(clampString(b.name ?? current.name,200),clampString(b.legalName ?? current.legal_name,200),clampString(b.document ?? current.document,50),clampString(b.phone ?? current.phone,40),clampString(b.email ?? current.email,200),clampString(b.address ?? current.address,300),clampString(b.city ?? current.city,120),clampString(b.state ?? current.state,30),clampString(b.zipCode ?? current.zip_code,20),mapUrl,clampString(b.stampName ?? current.stamp_name,120),clampString(b.stampLine2 ?? current.stamp_line2,120),clampString(b.stampLine3 ?? current.stamp_line3,120),clampString(b.stampLine4 ?? current.stamp_line4,120),clampString(b.stampColor ?? current.stamp_color,20)||'#5c2a72',active,nowIso(),id)
   ]);
   if(!active){
     await env.DB.batch([
@@ -812,8 +877,9 @@ async function updateMyClientProfile(request,env,user){
   if(!Number(user.can_manage_client_users)) return err('Somente o usuário principal pode alterar os dados da clínica.',403);
   const b=await safeBody(request); const c=await env.DB.prepare('SELECT * FROM clients WHERE id=?').bind(user.client_id).first();
   if(!c) return err('Cliente não encontrado.',404);
-  await env.DB.prepare(`UPDATE clients SET phone=?,email=?,updated_at=? WHERE id=?`)
-    .bind(clampString(b.phone??c.phone,40),clampString(b.email??c.email,200),nowIso(),user.client_id).run();
+  const mapUrlRaw=b.mapUrl===undefined?c.map_url:String(b.mapUrl||'').trim(),mapUrl=mapUrlRaw?cleanMapsUrl(mapUrlRaw):null;if(mapUrlRaw&&!mapUrl)return err('A localização deve ser um link válido do Google Maps.');
+  await env.DB.prepare(`UPDATE clients SET phone=?,email=?,map_url=?,updated_at=? WHERE id=?`)
+    .bind(clampString(b.phone??c.phone,40),clampString(b.email??c.email,200),mapUrl,nowIso(),user.client_id).run();
   await audit(env,user,'atualizou_dados_cliente','client',user.client_id);
   return ok({message:'Dados de contato atualizados.'});
 }
@@ -836,6 +902,7 @@ async function createClientUser(request,env,user){
   const name=clampString(b?.name,160),username=clampString(b?.username,120),password=String(b?.password||'');
   if(!name||!username||password.length<8)return err('Nome, usuário e senha inicial com pelo menos 8 caracteres são obrigatórios.');
   const key=normalizeUsername(username);
+  await clearReusableOrphanUsername(env,key);
   if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse nome de usuário já existe.',409);
   const isTechnician=boolInt(b?.isTechnician);
   const {hash,salt}=await hashPassword(password);
@@ -901,6 +968,7 @@ async function createTutor(request,env,user){
   const name=clampString(b?.name,160),username=clampString(b?.username,120),password=String(b?.password||'');
   if(!name||!username||password.length<8)return err('Nome, usuário e senha inicial com pelo menos 8 caracteres são obrigatórios.');
   const key=normalizeUsername(username);
+  await clearReusableOrphanUsername(env,key);
   if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse nome de usuário já existe.',409);
   const {hash,salt}=await hashPassword(password);
   const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('client',?,?,?,?,1,1)`)
@@ -1003,6 +1071,7 @@ function normalizeThermometer(v){
 }
 
 async function courierUsernameExists(env,key,excludeAccountId=null){
+  await clearReusableOrphanUsername(env,key);
   if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return true;
   const row=excludeAccountId
     ? await env.DB.prepare('SELECT id FROM courier_accounts WHERE username_key=? AND id<>?').bind(key,excludeAccountId).first()
@@ -1107,28 +1176,30 @@ async function listReceivers(env){
 }
 async function createReceiver(request,env,user){
   const b=await safeBody(request),name=clampString(b?.name,160),username=clampString(b?.username,120),password=String(b?.password||'');
-  if(!name||!username||password.length<8)return err('Nome, usuário e senha inicial do técnico (mínimo 8 caracteres) são obrigatórios.');
-  const key=normalizeUsername(username);if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse usuário já existe.',409);
+  if(!name||!username||password.length<8)return err('Nome, usuário e senha inicial (mínimo 8 caracteres) são obrigatórios.');
+  const key=normalizeUsername(username);await clearReusableOrphanUsername(env,key);if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse usuário já existe.',409);
   const {hash,salt}=await hashPassword(password);
   const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('staff',?,?,?,?,1,1)`).bind(username,key,hash,salt).run();
-  const r=await env.DB.prepare('INSERT INTO receivers(user_id,name,location,active) VALUES(?,?,?,1)').bind(u.meta.last_row_id,name,clampString(b.location,200)||'HLab Vet').run();
-  await audit(env,user,'criou_tecnico','technician',r.meta.last_row_id,{name,username});return ok({id:r.meta.last_row_id,message:'Técnico cadastrado. No primeiro login ele deverá trocar a senha.'});
+  const profile=['technician','seller','other'].includes(String(b?.profileType||''))?String(b.profileType):'technician';
+  const r=await env.DB.prepare(`INSERT INTO receivers(user_id,name,location,profile_type,can_view_prices,can_make_quotes,can_manage_payments,can_manage_prices,active) VALUES(?,?,?,?,?,?,?,?,1)`).bind(u.meta.last_row_id,name,clampString(b.location,200)||'HLab Vet',profile,b.canViewPrices==null?1:boolInt(b.canViewPrices),b.canMakeQuotes==null?1:boolInt(b.canMakeQuotes),b.canManagePayments==null?1:boolInt(b.canManagePayments),boolInt(b.canManagePrices)).run();
+  await audit(env,user,'criou_usuario_interno','technician',r.meta.last_row_id,{name,username,profile});return ok({id:r.meta.last_row_id,message:'Usuário interno cadastrado. No primeiro login deverá trocar a senha.'});
 }
 async function updateReceiver(request,env,user,id){
-  const b=await safeBody(request),r=await env.DB.prepare(`SELECT r.*,u.username_display FROM receivers r LEFT JOIN users u ON u.id=r.user_id WHERE r.id=?`).bind(id).first();if(!r)return err('Técnico não encontrado.',404);
+  const b=await safeBody(request),r=await env.DB.prepare(`SELECT r.*,u.username_display FROM receivers r LEFT JOIN users u ON u.id=r.user_id WHERE r.id=?`).bind(id).first();if(!r)return err('Usuário interno não encontrado.',404);
   let userId=r.user_id,username=clampString(b.username??r.username_display,120),active=b.active==null?r.active:boolInt(b.active);
   if(!userId){
-    const password=String(b.password||'');if(!username||password.length<8)return err('Para ativar o login deste técnico, informe usuário e senha temporária com pelo menos 8 caracteres.');
-    const key=normalizeUsername(username);if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse usuário já existe.',409);
+    const password=String(b.password||'');if(!username||password.length<8)return err('Informe usuário e senha temporária com pelo menos 8 caracteres.');
+    const key=normalizeUsername(username);await clearReusableOrphanUsername(env,key);if(await env.DB.prepare('SELECT id FROM users WHERE username_key=?').bind(key).first())return err('Esse usuário já existe.',409);
     const {hash,salt}=await hashPassword(password);const u=await env.DB.prepare(`INSERT INTO users(role,username_display,username_key,password_hash,password_salt,force_password_change,active) VALUES('staff',?,?,?,?,1,?)`).bind(username,key,hash,salt,active).run();userId=u.meta.last_row_id;
   }else{
     const key=normalizeUsername(username);const dup=await env.DB.prepare('SELECT id FROM users WHERE username_key=? AND id<>?').bind(key,userId).first();if(dup)return err('Esse usuário já está em uso.',409);
-    await env.DB.prepare('UPDATE users SET username_display=?,username_key=?,active=?,updated_at=? WHERE id=?').bind(username,key,active,nowIso(),userId).run();
-    if(!active)await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(userId).run();
+    await env.DB.prepare('UPDATE users SET username_display=?,username_key=?,active=?,updated_at=? WHERE id=?').bind(username,key,active,nowIso(),userId).run();if(!active)await env.DB.prepare('DELETE FROM sessions WHERE user_id=?').bind(userId).run();
   }
-  await env.DB.prepare('UPDATE receivers SET user_id=?,name=?,location=?,active=?,updated_at=? WHERE id=?').bind(userId,clampString(b.name??r.name,160),clampString(b.location??r.location,200)||'HLab Vet',active,nowIso(),id).run();
-  await audit(env,user,'editou_tecnico','technician',id);return ok({message:'Técnico atualizado.'});
+  const profile=['technician','seller','other'].includes(String(b?.profileType||r.profile_type||''))?String(b?.profileType||r.profile_type):'technician';
+  await env.DB.prepare(`UPDATE receivers SET user_id=?,name=?,location=?,profile_type=?,can_view_prices=?,can_make_quotes=?,can_manage_payments=?,can_manage_prices=?,active=?,updated_at=? WHERE id=?`).bind(userId,clampString(b.name??r.name,160),clampString(b.location??r.location,200)||'HLab Vet',profile,b.canViewPrices==null?Number(r.can_view_prices??1):boolInt(b.canViewPrices),b.canMakeQuotes==null?Number(r.can_make_quotes??1):boolInt(b.canMakeQuotes),b.canManagePayments==null?Number(r.can_manage_payments??1):boolInt(b.canManagePayments),b.canManagePrices==null?Number(r.can_manage_prices??0):boolInt(b.canManagePrices),active,nowIso(),id).run();
+  await audit(env,user,'editou_usuario_interno','technician',id,{profile});return ok({message:'Usuário interno atualizado.'});
 }
+
 async function resetTechnicianPassword(request,env,user,id){
   const b=await safeBody(request),pwd=String(b?.password||'');if(pwd.length<8)return err('A senha temporária deve ter pelo menos 8 caracteres.');
   const r=await env.DB.prepare('SELECT user_id,name FROM receivers WHERE id=?').bind(id).first();if(!r||!r.user_id)return err('Técnico sem login cadastrado.',404);
@@ -1162,7 +1233,7 @@ async function createRequisition(request,env,user){
   const client=await env.DB.prepare('SELECT * FROM clients WHERE id=? AND active=1').bind(clientId).first(); if(!client)return err('Cliente não encontrado ou inativo.',404);
   const patient=clampString(b.patientName,160); if(!patient)return err('Nome do paciente é obrigatório.');
   const exams=Array.isArray(b.exams)?b.exams:[]; if(!exams.length)return err('Marque pelo menos um exame.');
-  const catalog=new Map(); for(const g of catalogWithCodes()) for(const e of g.items) catalog.set(e.code,{...e,category:g.category});
+  const catalog=new Map(); for(const g of await catalogWithCustom(env)) for(const e of g.items) catalog.set(e.code,{...e,category:g.category});
   const selected=[]; for(const code of exams){const e=catalog.get(String(code));if(e)selected.push(e);} if(!selected.length)return err('Nenhum exame válido foi selecionado.');
   const materials=Array.isArray(b.materials)?b.materials.filter(x=>MATERIALS.includes(x)):[];
 
@@ -1202,10 +1273,11 @@ async function createRequisition(request,env,user){
     if(quoteToLink.requisition_id)return err('Este orçamento já está vinculado a outra solicitação.',409);
   }
 
+  const mapRaw=clampString(b.collectionMapUrl,800)||client.map_url||null;const collectionMapUrl=mapRaw?cleanMapsUrl(mapRaw):null;if(mapRaw&&!collectionMapUrl)return err('A localização da coleta deve ser um link válido do Google Maps.');
   const tempProto=`TEMP-${crypto.randomUUID()}`;
   const requesterName=member?.name||user.username_display;
-  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,priority,clinic_name,veterinarian_name,crmv,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_date,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at,requested_by_user_id,requested_by_name) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
-    .bind(tempProto,clientId,priority,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),birthDate,ageText,collectionDate,clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
+  const ins=await env.DB.prepare(`INSERT INTO requisitions(protocol,client_id,status,priority,clinic_name,veterinarian_name,crmv,tutor_name,tutor_account_id,patient_name,species,breed,sex,birth_date,age_text,collection_date,collection_map_url,clinical_info,material_other,stamp_snapshot_json,observations,request_kind,scheduled_at,requested_by_user_id,requested_by_name) VALUES(?,?,'solicitado',?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`)
+    .bind(tempProto,clientId,priority,clampString(b.clinicName,200)||client.name,veterinarianName,crmv,tutorName,tutorAccount?.id||null,patient,clampString(b.species,100),clampString(b.breed,120),clampString(b.sex,20),birthDate,ageText,collectionDate,collectionMapUrl,clampString(b.clinicalInfo,5000),clampString(b.materialOther,500),Object.keys(stamp).length?JSON.stringify(stamp):null,clampString(b.observations,2000),requestKind,scheduledAt,user.id,requesterName).run();
   const id=ins.meta.last_row_id, proto=protocolCode(id,new Date());
   const statements=[env.DB.prepare('UPDATE requisitions SET protocol=? WHERE id=?').bind(proto,id)];
   if(quoteToLink)statements.push(env.DB.prepare(`UPDATE quotes SET requisition_id=?,patient_name=COALESCE(NULLIF(patient_name,''),?),updated_at=? WHERE id=?`).bind(id,patient,nowIso(),quoteId));
@@ -1292,9 +1364,9 @@ async function assignCourier(request,env,user,id){
   const [r,c]=await Promise.all([env.DB.prepare('SELECT * FROM requisitions WHERE id=?').bind(id).first(),env.DB.prepare('SELECT * FROM couriers WHERE id=? AND active=1').bind(courierId).first()]);
   if(!r)return err('Requisição não encontrada.',404); if(!c)return err('Entregador não encontrado ou inativo.',404); if(['recebido','em_analise','concluido','cancelado'].includes(r.status))return err('Não é possível atribuir entregador nesse status.');
   if(!r.accepted_at)return err('Aceite a solicitação antes de atribuir o entregador.');
-  const ts=nowIso();
+  const ts=nowIso(),perms=await internalPermissions(env,user),canPayment=user.role==='admin'||Number(perms?.can_manage_payments)===1;
   let paymentStatus=r.payment_status||'not_set',paymentMethod=r.payment_method||null,paymentInstallments=r.payment_installments||null,paymentAmount=r.payment_amount_cents||null,paidAt=r.paid_at||null;
-  if(user.role==='admin' && b?.paymentStatus!=null){
+  if(canPayment && b?.paymentStatus!=null){
     paymentStatus=['not_set','paid','collect'].includes(String(b.paymentStatus))?String(b.paymentStatus):'not_set';
     const q=await env.DB.prepare('SELECT id,total_cents FROM quotes WHERE requisition_id=? ORDER BY id DESC LIMIT 1').bind(id).first();
     paymentAmount=q?Number(q.total_cents):null;
@@ -1312,7 +1384,7 @@ async function assignCourier(request,env,user,id){
   }
   await env.DB.batch([
     env.DB.prepare(`UPDATE requisitions SET assigned_courier_id=?,assigned_at=?,courier_accepted_at=NULL,courier_accepted_name=NULL,status='atribuido',payment_status=?,payment_method=?,payment_installments=?,payment_amount_cents=?,paid_at=?,payment_updated_at=?,payment_updated_by_name=?,updated_at=? WHERE id=?`)
-      .bind(courierId,ts,paymentStatus,paymentMethod,paymentInstallments,paymentAmount,paidAt,user.role==='admin'?ts:r.payment_updated_at,user.role==='admin'?user.username_display:r.payment_updated_by_name,ts,id),
+      .bind(courierId,ts,paymentStatus,paymentMethod,paymentInstallments,paymentAmount,paidAt,canPayment?ts:r.payment_updated_at,canPayment?user.username_display:r.payment_updated_by_name,ts,id),
     env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({courier:c.name,thermometer:c.thermometer_code,paymentStatus}),ts)
   ]);
   await audit(env,user,'atribuiu_entregador','requisition',id,{courierId,courier:c.name,thermometer:c.thermometer_code,paymentStatus});return ok({message:`${c.name} atribuído à coleta (${c.thermometer_code||'sem termômetro'}).`});
@@ -1498,7 +1570,7 @@ function timingStatusForExam(row,warningMinutes,nowMs=Date.now()){
 async function examTimingSettings(env){
   const base=await env.DB.prepare('SELECT default_turnaround_minutes,warning_minutes FROM lab_timing_settings WHERE id=1').first();
   const rows=await env.DB.prepare('SELECT exam_code,exam_name,turnaround_minutes,active FROM exam_turnaround_settings WHERE active=1 ORDER BY exam_name COLLATE NOCASE').all();
-  return ok({defaultTurnaroundMinutes:Number(base?.default_turnaround_minutes||1440),warningMinutes:Number(base?.warning_minutes||10),overrides:rows.results||[],catalog:catalogWithCodes()});
+  return ok({defaultTurnaroundMinutes:Number(base?.default_turnaround_minutes||1440),warningMinutes:Number(base?.warning_minutes||10),overrides:rows.results||[],catalog:await catalogWithCustom(env)});
 }
 
 async function updateExamTimingSettings(request,env,user){
@@ -1523,7 +1595,7 @@ async function updateExamTimingSettings(request,env,user){
   const codes=Array.isArray(b.examCodes)?[...new Set(b.examCodes.map(String).filter(Boolean))]:[];
   if(!codes.length)return err('Selecione um ou mais exames.');
   if(!Number.isFinite(minutes)||minutes<1||minutes>60*24*30)return err('Informe um tempo válido para os exames selecionados.');
-  const catalog=new Map();for(const g of catalogWithCodes())for(const e of g.items)catalog.set(e.code,e.name);
+  const catalog=new Map();for(const g of await catalogWithCustom(env))for(const e of g.items)catalog.set(e.code,e.name);
   const ts=nowIso(),stmts=[];for(const code of codes){const name=catalog.get(code);if(!name)continue;stmts.push(env.DB.prepare(`INSERT INTO exam_turnaround_settings(exam_code,exam_name,turnaround_minutes,active,created_at,updated_at) VALUES(?,?,?,1,?,?) ON CONFLICT(exam_code) DO UPDATE SET exam_name=excluded.exam_name,turnaround_minutes=excluded.turnaround_minutes,active=1,updated_at=excluded.updated_at`).bind(code,name,minutes,ts,ts));}
   if(!stmts.length)return err('Nenhum exame válido foi selecionado.');
   await env.DB.batch(stmts);await audit(env,user,'definiu_tempo_exames','timing_settings','bulk',{examCodes:codes,minutes});
@@ -1637,78 +1709,89 @@ async function temperatureSheet(env,user,url){
 
 function quoteAccessClientId(user,requestedClientId=0){
   if(user.role==='client')return Number(user.client_id||0);
-  if(user.role==='admin')return Number(requestedClientId||0);
+  if(['admin','staff'].includes(user.role))return Number(requestedClientId||0);
   return 0;
 }
-function quoteNumber(id,createdAt=nowIso()){
-  const y=new Date(createdAt).getUTCFullYear();
-  return `ORC-${y}-${String(id).padStart(6,'0')}`;
+function quoteNumber(id,createdAt=nowIso()){const y=new Date(createdAt).getUTCFullYear();return `ORC-${y}-${String(id).padStart(6,'0')}`;}
+async function quoteSiteSettings(env){
+  const row=await env.DB.prepare(`SELECT id,enabled,show_prices,show_services,whatsapp_phone,updated_at FROM quote_site_settings WHERE id=1`).first();
+  return ok({settings:{enabled:!!row?.enabled,showPrices:row?.show_prices!==0,showServices:row?.show_services!==0,whatsappPhone:row?.whatsapp_phone||''}});
 }
-async function listServices(env,onlyActive=true){
-  const sql=`SELECT id,name,description,price_cents,active,created_at,updated_at FROM service_prices ${onlyActive?'WHERE active=1':''} ORDER BY active DESC,name COLLATE NOCASE`;
-  const rows=await env.DB.prepare(sql).all();
-  return ok({services:rows.results||[]});
+async function updateQuoteSiteSettings(request,env,user){
+  const b=await safeBody(request)||{};const phone=clampString(b.whatsappPhone,40);
+  await env.DB.prepare(`INSERT INTO quote_site_settings(id,enabled,show_prices,show_services,whatsapp_phone,updated_at) VALUES(1,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,show_prices=excluded.show_prices,show_services=excluded.show_services,whatsapp_phone=excluded.whatsapp_phone,updated_at=excluded.updated_at`).bind(boolInt(b.enabled),b.showPrices==null?1:boolInt(b.showPrices),b.showServices==null?1:boolInt(b.showServices),phone,nowIso()).run();
+  await audit(env,user,'alterou_site_orcamento','quote_site',1,{enabled:!!b.enabled});return ok({message:'Configuração do site de orçamento salva.'});
 }
-async function createService(request,env,user){
-  const b=await safeBody(request),name=clampString(b?.name,180),priceCents=moneyInputToCents(b?.price);
-  if(!name)return err('Informe o nome do serviço.');
-  if(priceCents==null)return err('Informe um valor válido para o serviço.');
-  const ts=nowIso();
-  const ins=await env.DB.prepare(`INSERT INTO service_prices(name,description,price_cents,active,created_at,updated_at) VALUES(?,?,?,1,?,?)`)
-    .bind(name,clampString(b?.description,500),priceCents,ts,ts).run();
-  await audit(env,user,'criou_servico','service_price',ins.meta.last_row_id,{name,priceCents});
-  return ok({message:'Serviço cadastrado com sucesso.',id:ins.meta.last_row_id});
+async function publicQuoteSite(env){const row=await env.DB.prepare(`SELECT enabled,show_prices,show_services,whatsapp_phone FROM quote_site_settings WHERE id=1`).first();return ok({enabled:!!row?.enabled,showPrices:row?.show_prices!==0,showServices:row?.show_services!==0,whatsappPhone:row?.whatsapp_phone||''});}
+async function publicQuoteCatalog(env){
+  const cfg=await env.DB.prepare(`SELECT enabled,show_prices,show_services,whatsapp_phone FROM quote_site_settings WHERE id=1`).first();if(!cfg?.enabled)return err('O orçamento online está temporariamente desativado.',404);
+  const general=await env.DB.prepare('SELECT exam_code,exam_name,price_cents FROM exam_prices WHERE active=1').all();const gm=new Map((general.results||[]).map(x=>[x.exam_code,x]));const exams=[];
+  for(const group of await catalogWithCustom(env))for(const e of group.items){const gp=gm.get(e.code);if(gp?.price_cents!=null)exams.push({category:group.category,examCode:e.code,examName:e.name,priceCents:cfg.show_prices?Number(gp.price_cents):null});}
+  const services=cfg.show_services?(await env.DB.prepare('SELECT id,name,description,price_cents FROM service_prices WHERE active=1 ORDER BY name COLLATE NOCASE').all()).results||[]:[];
+  return ok({showPrices:cfg.show_prices!==0,showServices:cfg.show_services!==0,whatsappPhone:cfg.whatsapp_phone||'',exams,services});
 }
-async function updateService(request,env,user,id){
-  const old=await env.DB.prepare('SELECT * FROM service_prices WHERE id=?').bind(id).first();
-  if(!old)return err('Serviço não encontrado.',404);
-  const b=await safeBody(request),name=clampString(b?.name,180)||old.name;
-  let priceCents=old.price_cents;
-  if(b?.price!=null&&String(b.price).trim()!==''){
-    priceCents=moneyInputToCents(b.price);if(priceCents==null)return err('Informe um valor válido.');
-  }
-  const active=b?.active==null?Number(old.active):boolInt(b.active);
-  await env.DB.prepare(`UPDATE service_prices SET name=?,description=?,price_cents=?,active=?,updated_at=? WHERE id=?`)
-    .bind(name,b?.description==null?old.description:clampString(b.description,500),priceCents,active,nowIso(),id).run();
-  await audit(env,user,'alterou_servico','service_price',id,{name,priceCents,active});
-  return ok({message:'Serviço atualizado.'});
+async function createCustomExam(request,env,user){
+  const b=await safeBody(request)||{},name=clampString(b.name,180);if(!name)return err('Informe o nome do exame.');
+  const all=await catalogWithCustom(env);if(all.some(g=>g.items.some(e=>e.name.localeCompare(name,'pt-BR',{sensitivity:'base'})===0)))return err('Já existe um exame com esse nome.',409);
+  const code=`OUT_${crypto.randomUUID().replace(/-/g,'').slice(0,10).toUpperCase()}`,ts=nowIso();
+  const ins=await env.DB.prepare(`INSERT INTO custom_exams(exam_code,exam_name,active,created_at,updated_at) VALUES(?,?,1,?,?)`).bind(code,name,ts,ts).run();
+  const stmts=[];const price=moneyInputToCents(b.price);if(price!=null)stmts.push(env.DB.prepare(`INSERT INTO exam_prices(exam_code,exam_name,price_cents,active,created_at,updated_at) VALUES(?,?,?,1,?,?) ON CONFLICT(exam_code) DO UPDATE SET exam_name=excluded.exam_name,price_cents=excluded.price_cents,active=1,updated_at=excluded.updated_at`).bind(code,name,price,ts,ts));
+  const tm=Math.round(Number(b.turnaroundMinutes||0));if(tm>0)stmts.push(env.DB.prepare(`INSERT INTO exam_turnaround_settings(exam_code,exam_name,turnaround_minutes,active,created_at,updated_at) VALUES(?,?,?,1,?,?) ON CONFLICT(exam_code) DO UPDATE SET exam_name=excluded.exam_name,turnaround_minutes=excluded.turnaround_minutes,active=1,updated_at=excluded.updated_at`).bind(code,name,tm,ts,ts));if(stmts.length)await env.DB.batch(stmts);
+  await audit(env,user,'criou_exame_outros','custom_exam',ins.meta.last_row_id,{code,name});return ok({message:'Exame cadastrado em Outros e disponibilizado em todo o sistema.',examCode:code});
 }
+async function updateCustomExam(request,env,user,id){
+  const old=await env.DB.prepare('SELECT * FROM custom_exams WHERE id=?').bind(id).first();if(!old)return err('Exame adicional não encontrado.',404);const b=await safeBody(request)||{};const name=clampString(b.name,180)||old.exam_name,active=b.active==null?Number(old.active):boolInt(b.active),ts=nowIso();
+  await env.DB.prepare('UPDATE custom_exams SET exam_name=?,active=?,updated_at=? WHERE id=?').bind(name,active,ts,id).run();await env.DB.prepare('UPDATE exam_prices SET exam_name=?,active=?,updated_at=? WHERE exam_code=?').bind(name,active,ts,old.exam_code).run();await env.DB.prepare('UPDATE exam_turnaround_settings SET exam_name=?,active=?,updated_at=? WHERE exam_code=?').bind(name,active,ts,old.exam_code).run();return ok({message:'Exame atualizado.'});
+}
+async function listServices(env,onlyActive=true){const sql=`SELECT id,name,description,price_cents,active,created_at,updated_at FROM service_prices ${onlyActive?'WHERE active=1':''} ORDER BY active DESC,name COLLATE NOCASE`;const rows=await env.DB.prepare(sql).all();return ok({services:rows.results||[]});}
+async function createService(request,env,user){const b=await safeBody(request),name=clampString(b?.name,180),priceCents=moneyInputToCents(b?.price);if(!name)return err('Informe o nome do serviço.');if(priceCents==null)return err('Informe um valor válido para o serviço.');const ts=nowIso();const ins=await env.DB.prepare(`INSERT INTO service_prices(name,description,price_cents,active,created_at,updated_at) VALUES(?,?,?,1,?,?)`).bind(name,clampString(b?.description,500),priceCents,ts,ts).run();await audit(env,user,'criou_servico','service_price',ins.meta.last_row_id,{name,priceCents});return ok({message:'Serviço cadastrado com sucesso.',id:ins.meta.last_row_id});}
+async function updateService(request,env,user,id){const old=await env.DB.prepare('SELECT * FROM service_prices WHERE id=?').bind(id).first();if(!old)return err('Serviço não encontrado.',404);const b=await safeBody(request),name=clampString(b?.name,180)||old.name;let priceCents=old.price_cents;if(b?.price!=null&&String(b.price).trim()!==''){priceCents=moneyInputToCents(b.price);if(priceCents==null)return err('Informe um valor válido.');}const active=b?.active==null?Number(old.active):boolInt(b.active);await env.DB.prepare(`UPDATE service_prices SET name=?,description=?,price_cents=?,active=?,updated_at=? WHERE id=?`).bind(name,b?.description==null?old.description:clampString(b.description,500),priceCents,active,nowIso(),id).run();await audit(env,user,'alterou_servico','service_price',id,{name,priceCents,active});return ok({message:'Serviço atualizado.'});}
 async function quoteCatalog(env,user,url){
-  const clientId=quoteAccessClientId(user,Number(url.searchParams.get('clientId')||0));
-  if(!clientId)return err(user.role==='staff'?'Técnicos não têm acesso a valores e orçamentos.':'Selecione o cliente.',403);
-  const client=await env.DB.prepare('SELECT id,name,legal_name,document,phone,address,city,state FROM clients WHERE id=? AND active=1').bind(clientId).first();
-  if(!client)return err('Cliente não encontrado ou inativo.',404);
-  const [g,c,sv]=await Promise.all([
-    env.DB.prepare('SELECT exam_code,exam_name,price_cents,active FROM exam_prices WHERE active=1').all(),
-    env.DB.prepare('SELECT exam_code,exam_name,price_cents FROM client_exam_prices WHERE client_id=?').bind(clientId).all(),
-    env.DB.prepare('SELECT id,name,description,price_cents FROM service_prices WHERE active=1 ORDER BY name COLLATE NOCASE').all()
-  ]);
-  const general=new Map((g.results||[]).map(x=>[x.exam_code,x]));
-  const custom=new Map((c.results||[]).map(x=>[x.exam_code,x]));
-  const exams=[];
-  for(const group of catalogWithCodes())for(const e of group.items){
-    const cp=custom.get(e.code),gp=general.get(e.code),cents=cp?Number(cp.price_cents):(gp?Number(gp.price_cents):null);
-    exams.push({category:group.category,examCode:e.code,examName:e.name,priceCents:cents,source:cp?'client':gp?'general':null});
-  }
-  return ok({client,exams,services:sv.results||[]});
+  if(!(await canMakeQuote(env,user)))return err('Seu acesso não possui permissão para orçamentos.',403);
+  const clientId=quoteAccessClientId(user,Number(url.searchParams.get('clientId')||0));const client=clientId?await env.DB.prepare('SELECT id,name,legal_name,document,phone,address,city,state FROM clients WHERE id=? AND active=1').bind(clientId).first():null;if(clientId&&!client)return err('Cliente não encontrado ou inativo.',404);
+  const [g,c,sv]=await Promise.all([env.DB.prepare('SELECT exam_code,exam_name,price_cents,active FROM exam_prices WHERE active=1').all(),clientId?env.DB.prepare('SELECT exam_code,exam_name,price_cents FROM client_exam_prices WHERE client_id=?').bind(clientId).all():Promise.resolve({results:[]}),env.DB.prepare('SELECT id,name,description,price_cents FROM service_prices WHERE active=1 ORDER BY name COLLATE NOCASE').all()]);
+  const general=new Map((g.results||[]).map(x=>[x.exam_code,x])),custom=new Map((c.results||[]).map(x=>[x.exam_code,x])),exams=[];for(const group of await catalogWithCustom(env))for(const e of group.items){const cp=custom.get(e.code),gp=general.get(e.code),cents=cp?Number(cp.price_cents):(gp?Number(gp.price_cents):null);exams.push({category:group.category,examCode:e.code,examName:e.name,priceCents:cents,source:cp?'client':gp?'general':null});}
+  return ok({client,mode:clientId?'client':'walk_in',exams,services:sv.results||[]});
+}
+async function walkInClientId(env){
+  const row=await env.DB.prepare(`SELECT c.id FROM clients c JOIN users u ON u.id=c.user_id WHERE COALESCE(c.is_system,0)=1 AND u.username_key='__hlabvet_walkin__' LIMIT 1`).first();
+  if(!row)throw new Error('Cliente avulso interno não configurado. Aplique a migration 0016.');
+  return Number(row.id);
 }
 async function quoteDetailRow(env,id){
-  const q=await env.DB.prepare(`SELECT q.*,c.name client_name,c.legal_name,c.document,c.phone client_phone,c.address client_address,c.city client_city,c.state client_state,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE q.id=?`).bind(id).first();
+  const q=await env.DB.prepare(`
+    SELECT q.id,q.quote_number,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,
+           q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.status,q.total_cents,q.notes,q.valid_until,
+           q.created_by_user_id,q.created_by_name,q.created_at,q.updated_at,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.legal_name END legal_name,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.document END document,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN q.walk_in_phone ELSE c.phone END client_phone,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.address END client_address,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.city END client_city,
+           CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE c.state END client_state,
+           r.protocol requisition_protocol
+    FROM quotes q JOIN clients c ON c.id=q.client_id
+    LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE q.id=?
+  `).bind(id).first();
   if(!q)return null;
   const items=await env.DB.prepare(`SELECT id,item_type,item_ref,description,quantity,unit_price_cents,total_cents,sort_order FROM quote_items WHERE quote_id=? ORDER BY sort_order,id`).bind(id).all();
   return {...q,items:items.results||[]};
 }
-function canAccessQuote(user,q){return user.role==='admin'||(user.role==='client'&&Number(user.client_id)===Number(q.client_id));}
+async function canAccessQuote(env,user,q){
+  if(user.role==='client')return Number(user.client_id)===Number(q.client_id);
+  return canMakeQuote(env,user);
+}
 async function getQuote(env,user,id){
-  if(!['admin','client'].includes(user.role))return err('Sem acesso a orçamentos.',403);
-  const q=await quoteDetailRow(env,id);if(!q)return err('Orçamento não encontrado.',404);if(!canAccessQuote(user,q))return err('Sem acesso a este orçamento.',403);
+  const q=await quoteDetailRow(env,id);if(!q)return err('Orçamento não encontrado.',404);
+  if(!(await canAccessQuote(env,user,q)))return err('Sem acesso a este orçamento.',403);
   return ok({quote:q});
 }
 async function listQuotes(env,user,url){
-  if(!['admin','client'].includes(user.role))return err('Sem acesso a orçamentos.',403);
-  const clientId=quoteAccessClientId(user,Number(url.searchParams.get('clientId')||0));
-  const reqId=Number(url.searchParams.get('requisitionId')||0);
-  let sql=`SELECT q.id,q.quote_number,q.client_id,q.requisition_id,q.patient_name,q.total_cents,q.status,q.valid_until,q.created_at,q.updated_at,c.name client_name,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE 1=1`;
+  if(!(await canMakeQuote(env,user)))return err('Sem acesso a orçamentos.',403);
+  const clientId=quoteAccessClientId(user,Number(url.searchParams.get('clientId')||0)),reqId=Number(url.searchParams.get('requisitionId')||0);
+  let sql=`SELECT q.id,q.quote_number,CASE WHEN COALESCE(c.is_system,0)=1 THEN NULL ELSE q.client_id END client_id,q.requisition_id,q.patient_name,q.walk_in_name,q.walk_in_phone,q.total_cents,q.status,q.valid_until,q.created_at,q.updated_at,CASE WHEN COALESCE(c.is_system,0)=1 THEN COALESCE(NULLIF(q.walk_in_name,''),'Cliente avulso') ELSE c.name END client_name,r.protocol requisition_protocol FROM quotes q JOIN clients c ON c.id=q.client_id LEFT JOIN requisitions r ON r.id=q.requisition_id WHERE 1=1`;
   const p=[];
   if(user.role==='client'){sql+=' AND q.client_id=?';p.push(Number(user.client_id));}
   else if(clientId){sql+=' AND q.client_id=?';p.push(clientId);}
@@ -1717,32 +1800,43 @@ async function listQuotes(env,user,url){
   const rows=await env.DB.prepare(sql).bind(...p).all();return ok({quotes:rows.results||[]});
 }
 async function saveQuote(request,env,user){
-  if(!['admin','client'].includes(user.role))return err('Sem permissão para gerar orçamento.',403);
+  if(!(await canMakeQuote(env,user)))return err('Sem permissão para gerar orçamento.',403);
   const b=await safeBody(request);if(!b)return err('Dados inválidos.');
-  const quoteId=Number(b.quoteId||0),requisitionId=Number(b.requisitionId||0);
+  const quoteId=Number(b.quoteId||0),requisitionId=Number(b.requisitionId||0),walkInId=await walkInClientId(env);
   let existing=quoteId?await env.DB.prepare('SELECT * FROM quotes WHERE id=?').bind(quoteId).first():null;
-  let clientId=user.role==='client'?Number(user.client_id):Number(b.clientId||existing?.client_id||0);
-  if(!clientId)return err('Selecione o cliente.');
-  const client=await env.DB.prepare('SELECT id,name FROM clients WHERE id=? AND active=1').bind(clientId).first();if(!client)return err('Cliente não encontrado ou inativo.',404);
-  if(existing&&!canAccessQuote(user,existing))return err('Sem acesso a este orçamento.',403);
+  if(existing&&!(await canAccessQuote(env,user,existing)))return err('Sem acesso a este orçamento.',403);
+  const existingRealClientId=existing&&Number(existing.client_id)!==walkInId?Number(existing.client_id):0;
+  let clientId=user.role==='client'?Number(user.client_id):Number(b.clientId||existingRealClientId||0),client=null;
+  if(clientId){
+    client=await env.DB.prepare('SELECT id,name FROM clients WHERE id=? AND active=1 AND COALESCE(is_system,0)=0').bind(clientId).first();
+    if(!client)return err('Cliente não encontrado ou inativo.',404);
+  }else if(user.role==='client')return err('Cliente não informado.');
+  const storedClientId=clientId||walkInId;
+  const walkInName=clientId?null:(clampString(b.walkInName,180)||clampString(existing?.walk_in_name,180)||'Cliente avulso');
+  const walkInPhone=clientId?null:(clampString(b.walkInPhone,40)||clampString(existing?.walk_in_phone,40));
   if(requisitionId){
+    if(!clientId)return err('Orçamento avulso não pode ser vinculado diretamente a uma solicitação. Selecione um cliente cadastrado.');
     const req=await env.DB.prepare('SELECT id,client_id,status,patient_name FROM requisitions WHERE id=?').bind(requisitionId).first();
-    if(!req)return err('Solicitação não encontrada.',404);if(Number(req.client_id)!==clientId)return err('A solicitação não pertence ao cliente selecionado.',409);if(req.status==='cancelado')return err('Não é possível gerar orçamento para solicitação cancelada.');
+    if(!req)return err('Solicitação não encontrada.',404);
+    if(Number(req.client_id)!==clientId)return err('A solicitação não pertence ao cliente selecionado.',409);
+    if(req.status==='cancelado')return err('Não é possível gerar orçamento para solicitação cancelada.');
     const linked=await env.DB.prepare('SELECT id FROM quotes WHERE requisition_id=?').bind(requisitionId).first();
-    if(linked&&!existing){existing=await env.DB.prepare('SELECT * FROM quotes WHERE id=?').bind(linked.id).first();}
+    if(linked&&!existing)existing=await env.DB.prepare('SELECT * FROM quotes WHERE id=?').bind(linked.id).first();
   }
-  const requestedExamCodes=[...new Set((Array.isArray(b.examCodes)?b.examCodes:[]).map(String))];
-  const requestedServices=Array.isArray(b.services)?b.services:[];
+  const requestedExamCodes=[...new Set((Array.isArray(b.examCodes)?b.examCodes:[]).map(String))],requestedServices=Array.isArray(b.services)?b.services:[];
   if(!requestedExamCodes.length&&!requestedServices.length)return err('Selecione pelo menos um exame ou serviço.');
-  const catalog=new Map();for(const g of catalogWithCodes())for(const e of g.items)catalog.set(e.code,{...e,category:g.category});
+  const catalog=new Map();for(const g of await catalogWithCustom(env))for(const e of g.items)catalog.set(e.code,{...e,category:g.category});
   const items=[];let total=0,sort=0;
   for(const code of requestedExamCodes){
-    const exam=catalog.get(code);if(!exam)continue;const p=await resolveExamPrice(env,clientId,code);if(p.priceCents==null)return err(`O exame “${exam.name}” ainda não possui preço cadastrado.`);
-    items.push({type:'exam',ref:code,description:exam.name,quantity:1,unit:p.priceCents,total:p.priceCents,sort:sort++});total+=p.priceCents;
+    const exam=catalog.get(code);if(!exam)continue;
+    const pr=await resolveExamPrice(env,clientId||null,code);
+    if(pr.priceCents==null)return err(`O exame “${exam.name}” ainda não possui preço cadastrado.`);
+    items.push({type:'exam',ref:code,description:exam.name,quantity:1,unit:pr.priceCents,total:pr.priceCents,sort:sort++});total+=pr.priceCents;
   }
   for(const raw of requestedServices){
     const serviceId=Number(raw?.id||0),qty=Math.max(1,Math.min(999,Math.floor(Number(raw?.quantity||1))));if(!serviceId)continue;
-    const sv=await env.DB.prepare('SELECT id,name,price_cents FROM service_prices WHERE id=? AND active=1').bind(serviceId).first();if(!sv)return err('Um dos serviços selecionados não está mais disponível.');
+    const sv=await env.DB.prepare('SELECT id,name,price_cents FROM service_prices WHERE id=? AND active=1').bind(serviceId).first();
+    if(!sv)return err('Um dos serviços selecionados não está mais disponível.');
     const itemTotal=Number(sv.price_cents)*qty;items.push({type:'service',ref:String(sv.id),description:sv.name,quantity:qty,unit:Number(sv.price_cents),total:itemTotal,sort:sort++});total+=itemTotal;
   }
   if(!items.length)return err('Nenhum item válido foi selecionado.');
@@ -1750,19 +1844,17 @@ async function saveQuote(request,env,user){
   let id;
   if(existing){
     id=Number(existing.id);
-    await env.DB.prepare(`UPDATE quotes SET client_id=?,requisition_id=?,patient_name=?,total_cents=?,notes=?,valid_until=?,status='active',updated_at=? WHERE id=?`)
-      .bind(clientId,requisitionId||existing.requisition_id||null,patient||existing.patient_name||null,total,notes,validUntil,ts,id).run();
+    await env.DB.prepare(`UPDATE quotes SET client_id=?,walk_in_name=?,walk_in_phone=?,requisition_id=?,patient_name=?,total_cents=?,notes=?,valid_until=?,status='active',updated_at=? WHERE id=?`).bind(storedClientId,walkInName,walkInPhone,requisitionId||existing.requisition_id||null,patient||existing.patient_name||null,total,notes,validUntil,ts,id).run();
     await env.DB.prepare('DELETE FROM quote_items WHERE quote_id=?').bind(id).run();
   }else{
     const temp=`TEMP-${crypto.randomUUID()}`;
-    const ins=await env.DB.prepare(`INSERT INTO quotes(quote_number,client_id,requisition_id,patient_name,total_cents,notes,valid_until,created_by_user_id,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)`)
-      .bind(temp,clientId,requisitionId||null,patient,total,notes,validUntil,user.id,user.username_display,ts,ts).run();id=Number(ins.meta.last_row_id);
-    await env.DB.prepare('UPDATE quotes SET quote_number=? WHERE id=?').bind(quoteNumber(id,ts),id).run();
+    const ins=await env.DB.prepare(`INSERT INTO quotes(quote_number,client_id,walk_in_name,walk_in_phone,requisition_id,patient_name,total_cents,notes,valid_until,created_by_user_id,created_by_name,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`).bind(temp,storedClientId,walkInName,walkInPhone,requisitionId||null,patient,total,notes,validUntil,user.id,user.username_display,ts,ts).run();
+    id=Number(ins.meta.last_row_id);await env.DB.prepare('UPDATE quotes SET quote_number=? WHERE id=?').bind(quoteNumber(id,ts),id).run();
   }
   const stmts=items.map(x=>env.DB.prepare(`INSERT INTO quote_items(quote_id,item_type,item_ref,description,quantity,unit_price_cents,total_cents,sort_order) VALUES(?,?,?,?,?,?,?,?)`).bind(id,x.type,x.ref,x.description,x.quantity,x.unit,x.total,x.sort));
   if(stmts.length)await env.DB.batch(stmts);
-  await audit(env,user,existing?'alterou_orcamento':'criou_orcamento','quote',id,{clientId,requisitionId:requisitionId||null,totalCents:total});
-  const quote=await quoteDetailRow(env,id);return ok({message:'Orçamento salvo com sucesso.',quote});
+  await audit(env,user,existing?'alterou_orcamento':'criou_orcamento','quote',id,{clientId:clientId||null,walkInName,totalCents:total});
+  return ok({message:'Orçamento salvo com sucesso.',quote:await quoteDetailRow(env,id)});
 }
 
 function moneyInputToCents(v){
@@ -1787,53 +1879,11 @@ async function resolveExamPrice(env,clientId,examCode){
 }
 
 async function listPrices(env,url){
-  const clientId=Number(url.searchParams.get('clientId')||0);
-  const [g,c]=await Promise.all([
-    env.DB.prepare('SELECT exam_code,exam_name,price_cents,active FROM exam_prices').all(),
-    clientId?env.DB.prepare('SELECT exam_code,exam_name,price_cents FROM client_exam_prices WHERE client_id=?').bind(clientId).all():Promise.resolve({results:[]})
-  ]);
-  const general=new Map((g.results||[]).map(x=>[x.exam_code,x]));
-  const client=new Map((c.results||[]).map(x=>[x.exam_code,x]));
-  const items=[];
-  for(const group of catalogWithCodes())for(const e of group.items){
-    const gp=general.get(e.code),cp=client.get(e.code);
-    items.push({category:group.category,examCode:e.code,examName:e.name,generalPriceCents:gp?.active?Number(gp.price_cents):null,clientPriceCents:cp?Number(cp.price_cents):null,effectivePriceCents:cp?Number(cp.price_cents):(gp?.active?Number(gp.price_cents):null),source:cp?'client':gp?.active?'general':null});
-  }
-  return ok({clientId:clientId||null,items});
+  const clientId=Number(url.searchParams.get('clientId')||0);const [g,c,customRows]=await Promise.all([env.DB.prepare('SELECT exam_code,exam_name,price_cents,active FROM exam_prices').all(),clientId?env.DB.prepare('SELECT exam_code,exam_name,price_cents FROM client_exam_prices WHERE client_id=?').bind(clientId).all():Promise.resolve({results:[]}),env.DB.prepare('SELECT id,exam_code,exam_name,active FROM custom_exams ORDER BY exam_name COLLATE NOCASE').all()]);const general=new Map((g.results||[]).map(x=>[x.exam_code,x])),client=new Map((c.results||[]).map(x=>[x.exam_code,x])),customIds=new Map((customRows.results||[]).map(x=>[x.exam_code,x]));const items=[];for(const group of await catalogWithCustom(env))for(const e of group.items){const gp=general.get(e.code),cp=client.get(e.code),cx=customIds.get(e.code);items.push({category:group.category,examCode:e.code,examName:e.name,customExamId:cx?.id||null,generalPriceCents:gp?.active?Number(gp.price_cents):null,clientPriceCents:cp?Number(cp.price_cents):null,effectivePriceCents:cp?Number(cp.price_cents):(gp?.active?Number(gp.price_cents):null),source:cp?'client':gp?.active?'general':null});}return ok({clientId:clientId||null,items});
 }
+async function setGeneralPrice(request,env,user){const b=await safeBody(request),code=clampString(b?.examCode,40),priceCents=moneyInputToCents(b?.price);if(!code||priceCents==null)return err('Informe o exame e um valor válido.');const exam=await findCatalogExam(env,code);if(!exam)return err('Exame não encontrado.',404);const ts=nowIso();await env.DB.batch([env.DB.prepare(`INSERT INTO exam_prices(exam_code,exam_name,price_cents,active,created_at,updated_at) VALUES(?,?,?,1,?,?) ON CONFLICT(exam_code) DO UPDATE SET exam_name=excluded.exam_name,price_cents=excluded.price_cents,active=1,updated_at=excluded.updated_at`).bind(code,exam.name,priceCents,ts,ts),env.DB.prepare(`UPDATE requisition_exams SET unit_price_cents=?,price_source='general' WHERE exam_code=? AND unit_price_cents IS NULL AND requisition_id IN (SELECT r.id FROM requisitions r WHERE r.status<>'cancelado' AND NOT EXISTS (SELECT 1 FROM client_exam_prices cp WHERE cp.client_id=r.client_id AND cp.exam_code=?))`).bind(priceCents,code,code)]);await audit(env,user,'definiu_preco_geral','exam_price',code,{exam:exam.name,priceCents});return ok({message:`Preço geral de ${exam.name} atualizado.`});}
+async function setClientPrice(request,env,user){const b=await safeBody(request),clientId=Number(b?.clientId),code=clampString(b?.examCode,40);if(!clientId||!code)return err('Cliente e exame são obrigatórios.');const client=await env.DB.prepare('SELECT id,name FROM clients WHERE id=?').bind(clientId).first();if(!client)return err('Cliente não encontrado.',404);const exam=await findCatalogExam(env,code);if(!exam)return err('Exame não encontrado.',404);if(b?.price==null||String(b.price).trim()===''){await env.DB.prepare('DELETE FROM client_exam_prices WHERE client_id=? AND exam_code=?').bind(clientId,code).run();await audit(env,user,'removeu_preco_cliente','client_exam_price',`${clientId}:${code}`,{client:client.name,exam:exam.name});return ok({message:'Preço individual removido. Novas solicitações usarão o preço geral.'});}const priceCents=moneyInputToCents(b.price);if(priceCents==null)return err('Informe um valor válido.');const ts=nowIso();await env.DB.batch([env.DB.prepare(`INSERT INTO client_exam_prices(client_id,exam_code,exam_name,price_cents,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(client_id,exam_code) DO UPDATE SET exam_name=excluded.exam_name,price_cents=excluded.price_cents,updated_at=excluded.updated_at`).bind(clientId,code,exam.name,priceCents,ts,ts),env.DB.prepare(`UPDATE requisition_exams SET unit_price_cents=?,price_source='client' WHERE exam_code=? AND unit_price_cents IS NULL AND requisition_id IN (SELECT id FROM requisitions WHERE client_id=? AND status<>'cancelado')`).bind(priceCents,code,clientId)]);await audit(env,user,'definiu_preco_cliente','client_exam_price',`${clientId}:${code}`,{client:client.name,exam:exam.name,priceCents});return ok({message:`Preço de ${exam.name} para ${client.name} atualizado.`});}
 
-async function setGeneralPrice(request,env,user){
-  const b=await safeBody(request),code=clampString(b?.examCode,30),priceCents=moneyInputToCents(b?.price);
-  if(!code||priceCents==null)return err('Informe o exame e um valor válido.');
-  let exam=null;for(const g of catalogWithCodes()){exam=g.items.find(x=>x.code===code);if(exam)break;}if(!exam)return err('Exame não encontrado.',404);
-  const ts=nowIso();
-  await env.DB.batch([
-    env.DB.prepare(`INSERT INTO exam_prices(exam_code,exam_name,price_cents,active,created_at,updated_at) VALUES(?,?,?,1,?,?) ON CONFLICT(exam_code) DO UPDATE SET exam_name=excluded.exam_name,price_cents=excluded.price_cents,active=1,updated_at=excluded.updated_at`).bind(code,exam.name,priceCents,ts,ts),
-    env.DB.prepare(`UPDATE requisition_exams SET unit_price_cents=?,price_source='general' WHERE exam_code=? AND unit_price_cents IS NULL AND requisition_id IN (SELECT r.id FROM requisitions r WHERE r.status<>'cancelado' AND NOT EXISTS (SELECT 1 FROM client_exam_prices cp WHERE cp.client_id=r.client_id AND cp.exam_code=?))`).bind(priceCents,code,code)
-  ]);
-  await audit(env,user,'definiu_preco_geral','exam_price',code,{exam:exam.name,priceCents});
-  return ok({message:`Preço geral de ${exam.name} atualizado.`});
-}
-
-async function setClientPrice(request,env,user){
-  const b=await safeBody(request),clientId=Number(b?.clientId),code=clampString(b?.examCode,30);
-  if(!clientId||!code)return err('Cliente e exame são obrigatórios.');
-  const client=await env.DB.prepare('SELECT id,name FROM clients WHERE id=?').bind(clientId).first();if(!client)return err('Cliente não encontrado.',404);
-  let exam=null;for(const g of catalogWithCodes()){exam=g.items.find(x=>x.code===code);if(exam)break;}if(!exam)return err('Exame não encontrado.',404);
-  if(b?.price==null||String(b.price).trim()===''){
-    await env.DB.prepare('DELETE FROM client_exam_prices WHERE client_id=? AND exam_code=?').bind(clientId,code).run();
-    await audit(env,user,'removeu_preco_cliente','client_exam_price',`${clientId}:${code}`,{client:client.name,exam:exam.name});
-    return ok({message:'Preço individual removido. Novas solicitações usarão o preço geral.'});
-  }
-  const priceCents=moneyInputToCents(b.price);if(priceCents==null)return err('Informe um valor válido.');
-  const ts=nowIso();
-  await env.DB.batch([
-    env.DB.prepare(`INSERT INTO client_exam_prices(client_id,exam_code,exam_name,price_cents,created_at,updated_at) VALUES(?,?,?,?,?,?) ON CONFLICT(client_id,exam_code) DO UPDATE SET exam_name=excluded.exam_name,price_cents=excluded.price_cents,updated_at=excluded.updated_at`).bind(clientId,code,exam.name,priceCents,ts,ts),
-    env.DB.prepare(`UPDATE requisition_exams SET unit_price_cents=?,price_source='client' WHERE exam_code=? AND unit_price_cents IS NULL AND requisition_id IN (SELECT id FROM requisitions WHERE client_id=? AND status<>'cancelado')`).bind(priceCents,code,clientId)
-  ]);
-  await audit(env,user,'definiu_preco_cliente','client_exam_price',`${clientId}:${code}`,{client:client.name,exam:exam.name,priceCents});
-  return ok({message:`Preço de ${exam.name} para ${client.name} atualizado.`});
-}
 
 function financeDateWhere(url,field='r.lab_received_at'){
   const from=url.searchParams.get('from'),to=url.searchParams.get('to');
@@ -1853,7 +1903,7 @@ async function financeClients(env,url){
     FROM clients c
     LEFT JOIN requisitions r ON r.client_id=c.id AND r.status<>'cancelado' AND r.lab_received_at IS NOT NULL ${d.sql}
     LEFT JOIN requisition_exams e ON e.requisition_id=r.id
-    WHERE c.active=1 OR r.id IS NOT NULL
+    WHERE COALESCE(c.is_system,0)=0 AND (c.active=1 OR r.id IS NOT NULL)
     GROUP BY c.id,c.name
     ORDER BY request_count DESC,total_cents DESC,c.name COLLATE NOCASE
   `).bind(...d.params).all();
@@ -1990,7 +2040,7 @@ async function courierTaskApi(request,env,url,courier,rest){
   const method=request.method.toUpperCase();
   if((rest===''||rest==='tasks')&&method==='GET'){
     const from=url.searchParams.get('from'),to=url.searchParams.get('to'),tab=url.searchParams.get('tab')||'pending';
-    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.courier_accepted_at,r.courier_accepted_name,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,r.payment_status,r.payment_method,r.payment_installments,r.payment_amount_cents,c.name client_name,c.address,c.city,c.state,c.phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
+    let sql=`SELECT r.id,r.protocol,r.status,r.patient_name,r.species,r.tutor_name,r.created_at,r.assigned_at,r.courier_accepted_at,r.courier_accepted_name,r.collected_at,r.collection_temperature,r.sent_by_name,r.sent_from_location,r.payment_status,r.payment_method,r.payment_installments,r.payment_amount_cents,COALESCE(NULLIF(r.collection_map_url,''),c.map_url) map_url,c.name client_name,c.address,c.city,c.state,c.phone,co.thermometer_code FROM requisitions r JOIN clients c ON c.id=r.client_id LEFT JOIN couriers co ON co.id=r.assigned_courier_id WHERE r.assigned_courier_id=?`;
     const p=[courier.id];
     if(tab==='collected')sql+=` AND r.status IN ('coletado','recebido','em_analise','concluido')`;else sql+=` AND r.status='atribuido'`;
     if(from){sql+=' AND date(COALESCE(r.collected_at,r.assigned_at,r.created_at))>=date(?)';p.push(from);}
