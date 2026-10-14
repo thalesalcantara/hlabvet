@@ -25,7 +25,7 @@
     }
   ],
   "vars": {
-    "APP_NAME": "HLab Vet Resultados",
+    "APP_NAME": "LabCenter",
     "SESSION_DAYS": "14"
   }
 }
