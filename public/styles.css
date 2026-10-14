@@ -271,3 +271,11 @@ body.public-site-mode{background:#fff;color:#1a2530}.public-site-mode #courierVi
  body.courier-mobile-mode .courier-filter-grid,body.courier-mobile-mode .courier-info-grid{grid-template-columns:minmax(0,1fr)}
  body.courier-mobile-mode .courier-head{max-width:100%}
 }
+
+/* Cotacao publica em celulares: escolher exames antes de preencher dados e enviar. */
+@media screen and (max-width:760px){
+ .public-quote-layout{display:flex;flex-direction:column;align-items:stretch;gap:16px}
+ .public-quote-catalog{order:1;width:100%;min-width:0}
+ .public-quote-contact{order:2;width:100%;min-width:0;position:static}
+ .public-quote-contact .public-submit-quote{width:100%;min-height:50px}
+}
