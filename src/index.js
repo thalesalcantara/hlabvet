@@ -1417,7 +1417,22 @@ async function acceptRequisition(env,user,id){
   const ts=nowIso();await env.DB.batch([
     env.DB.prepare('UPDATE requisitions SET accepted_at=?,accepted_by_user_id=?,accepted_by_name=?,updated_at=? WHERE id=?').bind(ts,user.id,user.username_display,ts,id),
     env.DB.prepare(`INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'solicitado',?,?,?,?)`).bind(id,user.id,user.username_display,JSON.stringify({message:'Solicitação aceita pelo laboratório'}),ts)
-  ]);await audit(env,user,'aceitou_solicitacao','requisition',id);return ok({message:'Solicitação aceita. O alerta sonoro foi encerrado.'});
+  ]);await audit(env,user,'aceitou_solicitacao','requisition',id);const automatic=await autoAssignSoleCourier(env,id,user);return ok({message:automatic?'Solicitação aceita e entregador atribuído automaticamente.':'Solicitação aceita. O alerta sonoro foi encerrado.'});
+}
+
+async function autoAssignSoleCourier(env,id,user){
+  const setting=await env.DB.prepare("SELECT value FROM labcenter_settings WHERE key='auto_assign_courier'").first();
+  if(setting?.value==='0')return false;
+  const couriers=(await env.DB.prepare('SELECT id,name,thermometer_code FROM couriers WHERE active=1 LIMIT 2').all()).results||[];
+  if(couriers.length!==1)return false;
+  const c=couriers[0],ts=nowIso();
+  const result=await env.DB.prepare("UPDATE requisitions SET assigned_courier_id=?,assigned_at=?,courier_accepted_at=NULL,courier_accepted_name=NULL,status='atribuido',updated_at=? WHERE id=? AND status='solicitado' AND accepted_at IS NOT NULL AND assigned_courier_id IS NULL")
+    .bind(c.id,ts,ts,id).run();
+  if(Number(result.meta?.changes||0)!==1)return false;
+  await env.DB.prepare("INSERT INTO status_events(requisition_id,status,actor_user_id,actor_name,details_json,created_at) VALUES(?,'atribuido',?,?,?,?)")
+    .bind(id,user.id,user.username_display,JSON.stringify({courier:c.name,thermometer:c.thermometer_code,automatic:true}),ts).run();
+  await audit(env,user,'atribuiu_entregador_automaticamente','requisition',id,{courierId:c.id});
+  return true;
 }
 
 async function assignCourier(request,env,user,id){
@@ -1854,7 +1869,7 @@ async function deleteSiteTabMedia(env,user,slot){
 }
 async function siteSettings(env){
   const row=await env.DB.prepare(`SELECT * FROM public_site_settings WHERE id=1`).first();
-  return ok({settings:{enabled:row?.enabled!==0,companyName:row?.company_name||'',headline:row?.headline||'',subheadline:row?.subheadline||'',whatsappPhone:row?.whatsapp_phone||'',contactEmail:row?.contact_email||'',careersEmail:row?.careers_email||'',address:row?.address||'',mapUrl:row?.map_url||'',mapEmbedUrl:row?.map_embed_url||''}});
+  return ok({settings:{enabled:row?.enabled!==0,companyName:row?.company_name||'',headline:row?.headline||'',subheadline:row?.subheadline||'',whatsappPhone:row?.whatsapp_phone||'',contactEmail:row?.contact_email||'',careersEmail:row?.careers_email||'',address:row?.address||'',mapUrl:row?.map_url||'',mapEmbedUrl:row?.map_embed_url||'',autoAssignCourier:(await env.DB.prepare("SELECT value FROM labcenter_settings WHERE key='auto_assign_courier'").first())?.value!=='0'}});
 }
 async function updateSiteSettings(request,env,user){
   const b=await safeBody(request)||{},mapUrl=b.mapUrl?cleanMapsUrl(b.mapUrl):null;if(b.mapUrl&&!mapUrl)return err('Informe um link válido do Google Maps.');
@@ -1862,7 +1877,7 @@ async function updateSiteSettings(request,env,user){
   const address=clampString(b.address,500),mapEmbedUrl=manualEmbed||await resolveGoogleMapsEmbedUrl(mapUrl||'',address||''),ts=nowIso();
   await env.DB.prepare(`INSERT INTO public_site_settings(id,enabled,company_name,headline,subheadline,whatsapp_phone,contact_email,careers_email,address,map_url,map_embed_url,updated_at) VALUES(1,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET enabled=excluded.enabled,company_name=excluded.company_name,headline=excluded.headline,subheadline=excluded.subheadline,whatsapp_phone=excluded.whatsapp_phone,contact_email=excluded.contact_email,careers_email=excluded.careers_email,address=excluded.address,map_url=excluded.map_url,map_embed_url=excluded.map_embed_url,updated_at=excluded.updated_at`)
     .bind(boolInt(b.enabled),clampString(b.companyName,160)||'HLab Vet Resultados',clampString(b.headline,260)||'Diagnóstico veterinário com agilidade, cuidado e confiança',clampString(b.subheadline,700),clampString(b.whatsappPhone,40),clampString(b.contactEmail,200),clampString(b.careersEmail,200),address,mapUrl,mapEmbedUrl,ts).run();
-  await audit(env,user,'alterou_site_publico','public_site',1);return ok({message:'Configurações do site salvas.',mapEmbedUrl});
+  await env.DB.prepare("INSERT INTO labcenter_settings(key,value) VALUES('auto_assign_courier',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").bind(boolInt(b.autoAssignCourier)?'1':'0').run();await audit(env,user,'alterou_site_publico','public_site',1);return ok({message:'Configurações do site salvas.',mapEmbedUrl});
 }
 async function listSiteOffers(env,onlyActive=true){const rows=await env.DB.prepare(`SELECT * FROM site_offers ${onlyActive?'WHERE active=1':''} ORDER BY active DESC,sort_order,id DESC`).all();return ok({offers:(rows.results||[]).map(x=>({...x,imageUrl:x.image_r2_key?`/api/public/site-media/${x.id}`:null}))});}
 async function createSiteOffer(request,env,user){
