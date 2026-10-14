@@ -1,0 +1,19 @@
+{
+  "name": "LabCenter Entregador",
+  "short_name": "LC Entregador",
+  "description": "Painel de coleta e entregas do LabCenter",
+  "id": "/entregador",
+  "start_url": "/entregador",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#092b5b",
+  "icons": [
+    {
+      "src": "/assets/labcenter-logo.png",
+      "sizes": "any",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
