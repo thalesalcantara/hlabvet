@@ -1,0 +1,19 @@
+{
+  "name": "LabCenter",
+  "short_name": "LabCenter",
+  "description": "Laboratório de análises clínicas veterinárias",
+  "id": "/",
+  "start_url": "/",
+  "scope": "/",
+  "display": "standalone",
+  "background_color": "#ffffff",
+  "theme_color": "#092b5b",
+  "icons": [
+    {
+      "src": "/assets/labcenter-logo.png",
+      "sizes": "any",
+      "type": "image/png",
+      "purpose": "any"
+    }
+  ]
+}
