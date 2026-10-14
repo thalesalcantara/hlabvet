@@ -368,7 +368,7 @@ async function renderPublicWebsite(focusQuote=false){
     const groups=new Map();for(const x of quoteData?.exams||[]){if(!groups.has(x.category))groups.set(x.category,[]);groups.get(x.category).push(x)}
     const offers=site.offers||[],partners=site.partners||[],testimonials=site.testimonials||[],tabImages=site.tabImages||{},popupOffer=offers.find(o=>o.offer_type==='promotion'&&Number(o.show_popup)&&o.active!==0)||null;
     $('#courierView').innerHTML=`<div class="hlab-public-site">
-      <header class="public-site-header"><a href="/site" class="public-site-logo" data-public-tab="home"><img src="/assets/labcenter-logo.png" alt="LabCenter"></a><nav><a href="#inicio" data-public-tab="home">Início</a><a href="#cotacao" data-public-tab="cotacao">Faça sua cotação</a><a href="#acompanhamento" data-public-tab="acompanhamento">Acompanhar exames</a>${offers.length?`<a href="#servicos" data-public-tab="servicos">Serviços e promoções</a>`:''}${partners.length?`<a href="#parceiros" data-public-tab="parceiros">Parceiros</a>`:''}${testimonials.length?`<a href="#depoimentos" data-public-tab="depoimentos">Depoimentos</a>`:''}<a href="#localizacao" data-public-tab="localizacao">Localização</a><a href="#trabalhe" data-public-tab="trabalhe">Trabalhe conosco</a><a href="#contato" data-public-tab="contato">Contato</a></nav><a href="/" class="public-client-login">Área do cliente</a></header>
+      <header class="public-site-header"><a href="/" class="public-site-logo" data-public-tab="home"><img src="/assets/labcenter-logo.png" alt="LabCenter"></a><nav><a href="#inicio" data-public-tab="home">Início</a><a href="#cotacao" data-public-tab="cotacao">Faça sua cotação</a><a href="#acompanhamento" data-public-tab="acompanhamento">Acompanhar exames</a>${offers.length?`<a href="#servicos" data-public-tab="servicos">Serviços e promoções</a>`:''}${partners.length?`<a href="#parceiros" data-public-tab="parceiros">Parceiros</a>`:''}${testimonials.length?`<a href="#depoimentos" data-public-tab="depoimentos">Depoimentos</a>`:''}<a href="#localizacao" data-public-tab="localizacao">Localização</a><a href="#trabalhe" data-public-tab="trabalhe">Trabalhe conosco</a><a href="#contato" data-public-tab="contato">Contato</a></nav><a href="/" class="public-client-login">Área do cliente</a></header>
       <main class="public-site-main">
         <section id="inicio" class="public-hero public-site-tab-panel" data-public-panel="home"><div class="public-hero-copy"><span>LABCENTER • DIAGNÓSTICOS VETERINÁRIOS</span><h1>${esc(st.headline||'Diagnóstico veterinário com agilidade, cuidado e confiança')}</h1><p>${esc(st.subheadline||'')}</p><div class="public-hero-actions"><a class="public-cta primary" href="#cotacao" data-public-tab="cotacao">Faça sua cotação</a><a class="public-cta secondary" href="#acompanhamento" data-public-tab="acompanhamento">Acompanhar exame</a>${phone?`<a class="public-cta secondary" href="${wa}" target="_blank" rel="noopener">Falar no WhatsApp</a>`:''}</div><div class="public-trust-row"><div><b>Exames</b><small>Catálogo atualizado</small></div><div><b>Coleta</b><small>Fluxo integrado</small></div><div><b>Resultados</b><small>Acesso digital</small></div></div></div><div class="public-hero-visual">${tabImages.home?`<div class="public-hero-photo"><img src="${esc(tabImages.home)}" alt="LabCenter"></div>`:`<div class="public-hero-mark"><img src="/assets/labcenter-logo.png"><span>Ciência a favor da vida animal</span></div>`}</div></section>
         ${offers.length?`<section id="servicos" class="public-section public-offers-section public-site-tab-panel" data-public-panel="servicos"><div class="public-section-head"><span>DESTAQUES</span><h2>Serviços, produtos e promoções</h2><p>Conteúdos selecionados pelo LabCenter.</p></div>${tabImages.offers?`<div class="public-tab-banner"><img src="${esc(tabImages.offers)}" alt="Serviços e promoções LabCenter"></div>`:''}<div class="public-offer-grid">${offers.map(o=>`<article class="public-offer-card">${o.imageUrl?`<div class="public-offer-image"><img src="${esc(o.imageUrl)}" alt="${esc(o.title)}">${o.badge?`<span>${esc(o.badge)}</span>`:''}</div>`:`<div class="public-offer-image placeholder"><img src="/assets/labcenter-logo.png" alt="LabCenter">${o.badge?`<span>${esc(o.badge)}</span>`:''}</div>`}<div class="public-offer-body"><small>${o.offer_type==='product'?'PRODUTO':o.offer_type==='promotion'?'PROMOÇÃO':'SERVIÇO'}</small><h3>${esc(o.title)}</h3><p>${esc(o.description||'')}</p>${o.promo_price_cents!=null?`<div class="public-offer-price"><del>${o.price_cents!=null?fmtMoney(o.price_cents):''}</del><strong>${fmtMoney(o.promo_price_cents)}</strong></div>`:o.price_cents!=null?`<div class="public-offer-price"><strong>${fmtMoney(o.price_cents)}</strong></div>`:''}<a href="${phone?`${wa}?text=${encodeURIComponent(`Olá! Gostaria de saber mais sobre ${o.title}.`)}`:'#contato'}" ${phone?'target="_blank" rel="noopener"':'data-public-tab="contato"'} class="public-card-cta">${esc(o.button_text||'Quero saber mais')}</a></div></article>`).join('')}</div></section>`:''}
@@ -416,18 +416,18 @@ async function renderPublicWebsite(focusQuote=false){
       });
       update();
     }
-  }catch(e){$('#courierView').innerHTML=`<div class="public-site-offline"><img src="/assets/labcenter-logo.png"><h1>Não foi possível abrir o site</h1><p>${esc(e.message)}</p><a href="/" class="btn primary">Área do cliente</a></div>`}
+  }catch(e){$('#courierView').innerHTML=`<div class="public-site-offline"><img src="/assets/labcenter-logo.png"><h1>Não foi possível abrir o site</h1><p>${esc(e.message)}</p><a href="/sistema" class="btn primary">Área do cliente</a></div>`}
 }
 
 async function boot(){
   const publicPath=location.pathname.replace(/\/+$/,'');
-  if(publicPath==='/site')return renderPublicWebsite(false);
+  if(publicPath===''||publicPath==='/site')return renderPublicWebsite(false);
   if(publicPath==='/orcamento')return renderPublicWebsite(true);
   if(ownerPath()) return ownerBoot();
   const params=new URLSearchParams(location.search);
   const token=params.get('entregador');
   if(token)return renderCourierPortal(token);
-  if(params.get('courier')==='1'){
+  if(publicPath==='/entregador'||params.get('courier')==='1'){
     try{
       const r=await api('/api/courier/me');
       if(r.courier?.forcePasswordChange)return showCourierPasswordChange(true);
@@ -442,7 +442,7 @@ function ensureCourierAccessButton(){
   if($('#courierAccessBtn'))return;
   const form=$('#loginForm');if(!form)return;
   form.insertAdjacentHTML('afterend',`<button id="courierAccessBtn" type="button" class="btn ghost" style="width:100%;margin-top:10px">Acesso do entregador</button>`);
-  $('#courierAccessBtn')?.addEventListener('click',()=>{history.replaceState(null,'',`${location.pathname}?courier=1`);showCourierLogin()});
+  $('#courierAccessBtn')?.addEventListener('click',()=>{history.replaceState(null,'','/entregador');showCourierLogin()});
 }
 function showLogin(){
   document.body.classList.remove('courier-mobile-mode');
@@ -460,7 +460,7 @@ function showCourierLogin(){
     try{
       const r=await api('/api/courier/login',{json:body});
       if(r.forcePasswordChange)return showCourierPasswordChange(true);
-      history.replaceState(null,'',`${location.pathname}?courier=1`);await renderCourierPortal(null);toast('Acesso realizado.');
+      history.replaceState(null,'','/entregador');await renderCourierPortal(null);toast('Acesso realizado.');
     }catch(er){toast(er.message,'error')}
   });
 }
@@ -472,12 +472,12 @@ async function showCourierPasswordChange(force=true){
   $('#courierPasswordForm')?.addEventListener('submit',async e=>{
     e.preventDefault();const b=Object.fromEntries(new FormData(e.currentTarget));
     if(b.newPassword!==b.confirmPassword)return toast('A confirmação da nova senha não confere.','error');
-    try{const r=await api('/api/courier/change-password',{json:{currentPassword:b.currentPassword,newPassword:b.newPassword}});toast(r.message);history.replaceState(null,'',`${location.pathname}?courier=1`);await renderCourierPortal(null)}catch(er){toast(er.message,'error')}
+    try{const r=await api('/api/courier/change-password',{json:{currentPassword:b.currentPassword,newPassword:b.newPassword}});toast(r.message);history.replaceState(null,'','/entregador');await renderCourierPortal(null)}catch(er){toast(er.message,'error')}
   });
 }
 async function courierLogout(){
   try{await api('/api/courier/logout',{method:'POST'})}catch{}
-  location.href=`${location.pathname}?courier=1`;
+  location.href='/entregador';
 }
 async function showApp(){
   $('#loginView').classList.add('hidden');$('#courierView').classList.add('hidden');$('#appView').classList.remove('hidden');
