@@ -1,8 +1,8 @@
 {
-  "name": "hlab-vet-resultados",
+  "name": "labcenter",
   "version": "1.0.0",
   "private": true,
-  "description": "HLab Vet Resultados — gestão de requisições veterinárias, coletas, temperatura e resultados.",
+  "description": "LabCenter — gestão de requisições veterinárias, coletas, temperatura e resultados.",
   "type": "module",
   "scripts": {
     "dev": "wrangler dev --local",
